@@ -1,0 +1,2418 @@
+from __future__ import annotations
+
+from collections import deque
+import json
+import logging
+import logging.handlers
+import math
+from pathlib import Path
+import threading
+import time
+from dataclasses import replace
+from datetime import datetime, timezone
+
+import pandas as pd
+import requests
+
+from mexcbot.calibration import load_trade_calibration, validate_trade_calibration_payload
+from mexcbot.config import LiveConfig, env_bool, env_float, env_int
+from mexcbot.exchange import MexcClient
+from mexcbot.exits import evaluate_trade_action
+from mexcbot.indicators import calc_ema
+from mexcbot.marketdata import fetch_fear_and_greed
+from mexcbot.models import Opportunity, Trade
+from mexcbot.strategies import find_best_opportunity
+from mexcbot.strategies.scalper import resolve_scalper_tp_execution_mode
+from mexcbot.telegram import TelegramClient
+from mexcbot.websocket import PriceMonitor
+
+
+def configure_logging() -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler("trades.log")],
+    )
+    return logging.getLogger("mexcbot")
+
+
+log = configure_logging()
+
+LOSS_STREAK_PAUSE_STRATEGIES = {"TRINITY", "REVERSAL", "GRID"}
+ADAPTIVE_THRESHOLD_STRATEGIES = {"SCALPER", "MOONSHOT"}
+TELEGRAM_ALERT_COOLDOWN_SECONDS = 600
+RECENT_ACTIVITY_LIMIT = 12
+DUST_THRESHOLD = env_float("DUST_THRESHOLD", 3.0)
+CLOSE_RETRY_ATTEMPTS = env_int("CLOSE_RETRY_ATTEMPTS", 5)
+CLOSE_RETRY_DELAY_SECONDS = env_float("CLOSE_RETRY_DELAY_SECONDS", 1.0)
+CLOSE_VERIFY_RATIO = env_float("CLOSE_VERIFY_RATIO", 0.01)
+MAJOR_FILL_THRESHOLD = env_float("MAJOR_FILL_THRESHOLD", 0.85)
+SCALPER_RISK_PER_TRADE = env_float("SCALPER_RISK_PER_TRADE", 0.01)
+KELLY_RISK_CAP = env_float("KELLY_RISK_CAP", 0.028)
+KELLY_MULT_MARGINAL = env_float("KELLY_MULT_MARGINAL", 0.50)
+KELLY_MULT_SOLID = env_float("KELLY_MULT_SOLID", 0.80)
+KELLY_MULT_STANDARD = env_float("KELLY_MULT_STANDARD", 1.00)
+KELLY_MULT_HIGH_CONF = env_float("KELLY_MULT_HIGH_CONF", 1.50)
+DEFENSIVE_EXIT_REASONS = {
+    "STOP_LOSS",
+    "TRAILING_STOP",
+    "TIMEOUT",
+    "FLAT_EXIT",
+    "ROTATION",
+    "VOL_COLLAPSE",
+    "PROTECT_STOP",
+    "MANUAL_CLOSE",
+    "EMERGENCY_CLOSE",
+}
+
+
+def compute_market_regime_multiplier(frame: pd.DataFrame, config: LiveConfig) -> float:
+    try:
+        if frame is None or len(frame) < 50 or not {"high", "low", "close"}.issubset(frame.columns):
+            return 1.0
+        close = frame["close"].astype(float)
+        high = frame["high"].astype(float)
+        low = frame["low"].astype(float)
+        previous_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - previous_close).abs(),
+                (low - previous_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = true_range.ewm(alpha=1.0 / 14.0, adjust=False).mean()
+        atr_ratio = float(atr.iloc[-1] / atr.iloc[-41:-1].mean()) if len(atr) > 40 and float(atr.iloc[-41:-1].mean()) > 0 else 1.0
+        ema50 = calc_ema(close, 50)
+        ema_value = float(ema50.iloc[-1]) if not ema50.empty else 0.0
+        ema_gap = float(close.iloc[-1]) / ema_value - 1.0 if ema_value > 0 else 0.0
+
+        multiplier = 1.0
+        if atr_ratio > config.regime_high_vol_atr_ratio:
+            multiplier *= config.regime_tighten_mult
+        elif atr_ratio < config.regime_low_vol_atr_ratio:
+            multiplier *= config.regime_loosen_mult
+
+        if ema_gap > config.regime_strong_uptrend_gap:
+            multiplier *= config.regime_trend_mult
+        elif ema_gap < config.regime_strong_downtrend_gap:
+            multiplier *= config.regime_tighten_mult
+
+        return max(0.7, min(2.0, multiplier))
+    except Exception as exc:
+        log.debug("Market regime computation failed: %s", exc)
+        return 1.0
+
+
+def _trade_state_payload(trade: Trade) -> dict[str, object]:
+    return {
+        "symbol": trade.symbol,
+        "strategy": trade.strategy,
+        "score": trade.score,
+        "entry_signal": trade.entry_signal,
+        "entry_price": trade.entry_price,
+        "tp_price": trade.tp_price,
+        "sl_price": trade.sl_price,
+        "opened_at": trade.opened_at,
+        "highest_price": trade.highest_price,
+        "last_price": trade.last_price,
+        "breakeven_done": trade.breakeven_done,
+        "trail_active": trade.trail_active,
+        "trail_stop_price": trade.trail_stop_price,
+        "partial_tp_done": trade.partial_tp_done,
+        "partial_tp_price": trade.partial_tp_price,
+        "partial_tp_ratio": trade.partial_tp_ratio,
+        "hard_floor_price": trade.hard_floor_price,
+        "max_hold_minutes": trade.max_hold_minutes,
+        "exit_profile_override": trade.exit_profile_override,
+        "atr_pct": trade.atr_pct,
+        "avg_candle_pct": trade.metadata.get("avg_candle_pct"),
+        "trail_pct": trade.metadata.get("trail_pct"),
+        "sentiment": trade.metadata.get("sentiment"),
+        "social_boost": trade.metadata.get("social_boost"),
+        "last_new_high_at": trade.metadata.get("last_new_high_at", trade.opened_at),
+    }
+
+
+class LiveBotRuntime:
+    def __init__(self, config: LiveConfig, client: MexcClient):
+        self.config = config
+        self.client = client
+        self.telegram = TelegramClient(config.telegram_token, config.telegram_chat_id)
+        self.trade_history: list[dict] = []
+        self.open_trades: list[Trade] = []
+        self.recently_closed: dict[str, float] = {}
+        self.symbol_cooldowns: dict[str, float] = {}
+        self.liquidity_blacklist: dict[str, float] = {}
+        self.liquidity_fail_count: dict[str, int] = {}
+        self.trade_calibration: dict = {}
+        self._last_calibration_refresh_at = 0.0
+        self._win_rate_pause_until = 0.0
+        self._consecutive_losses = 0
+        self._streak_paused_at = 0.0
+        self._session_loss_paused_until = 0.0
+        self._strategy_loss_streaks: dict[str, int] = {}
+        self._strategy_paused_until: dict[str, float] = {}
+        self._moonshot_gate_open = True
+        self._market_regime_mult = 1.0
+        self._fear_greed_index: int | None = None
+        self._adaptive_offsets: dict[str, float] = {}
+        self._last_rebalance_count = 0
+        self._dynamic_scalper_budget: float | None = None
+        self._dynamic_moonshot_budget: float | None = None
+        self._paused = False
+        self._last_telegram_update = 0
+        self._last_heartbeat_at = 0.0
+        self._last_daily_summary_date = ""
+        self._last_dust_sweep_date = ""
+        self._last_weekly_summary_key = ""
+        self._session_anchor_equity: float | None = None
+        self._daily_anchor_equity: float | None = None
+        self._daily_anchor_date = ""
+        self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
+        self._telegram_alert_timestamps: dict[str, float] = {}
+        self._state_path = Path(self.config.state_file) if self.config.state_file else None
+        self._price_monitor = PriceMonitor()
+        self._load_state()
+
+    def _state_payload(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "trade_history": list(self.trade_history),
+            "open_trades": [trade.to_dict() for trade in self.open_trades],
+            "recently_closed": dict(self.recently_closed),
+            "symbol_cooldowns": dict(self.symbol_cooldowns),
+            "liquidity_blacklist": dict(self.liquidity_blacklist),
+            "liquidity_fail_count": dict(self.liquidity_fail_count),
+            "win_rate_pause_until": self._win_rate_pause_until,
+            "consecutive_losses": self._consecutive_losses,
+            "streak_paused_at": self._streak_paused_at,
+            "session_loss_paused_until": self._session_loss_paused_until,
+            "strategy_loss_streaks": dict(self._strategy_loss_streaks),
+            "strategy_paused_until": dict(self._strategy_paused_until),
+            "moonshot_gate_open": self._moonshot_gate_open,
+            "adaptive_offsets": dict(self._adaptive_offsets),
+            "last_rebalance_count": self._last_rebalance_count,
+            "dynamic_scalper_budget": self._dynamic_scalper_budget,
+            "dynamic_moonshot_budget": self._dynamic_moonshot_budget,
+            "paused": self._paused,
+            "last_daily_summary_date": self._last_daily_summary_date,
+            "last_dust_sweep_date": self._last_dust_sweep_date,
+            "last_weekly_summary_key": self._last_weekly_summary_key,
+            "session_anchor_equity": self._session_anchor_equity,
+            "daily_anchor_equity": self._daily_anchor_equity,
+            "daily_anchor_date": self._daily_anchor_date,
+            "recent_activity": list(self._recent_activity),
+        }
+
+    def _save_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            parent = self._state_path.parent
+            if str(parent) not in {"", "."}:
+                parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(json.dumps(self._state_payload(), indent=2), encoding="utf-8")
+        except Exception as exc:
+            log.warning("State save failed: %s", exc)
+
+    def _load_state(self) -> None:
+        if not self.config.state_file:
+            return
+        if self._state_path is None:
+            return
+        if not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("State load failed: %s", exc)
+            return
+
+        try:
+            self.trade_history = list(payload.get("trade_history", []))
+            self.open_trades = [Trade.from_dict(item) for item in payload.get("open_trades", [])]
+            self.recently_closed = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("recently_closed", {})).items()}
+            self.symbol_cooldowns = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("symbol_cooldowns", {})).items()}
+            self.liquidity_blacklist = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("liquidity_blacklist", {})).items()}
+            self.liquidity_fail_count = {str(symbol): int(count) for symbol, count in dict(payload.get("liquidity_fail_count", {})).items()}
+            self._win_rate_pause_until = float(payload.get("win_rate_pause_until", 0.0) or 0.0)
+            self._consecutive_losses = int(payload.get("consecutive_losses", 0) or 0)
+            self._streak_paused_at = float(payload.get("streak_paused_at", 0.0) or 0.0)
+            self._session_loss_paused_until = float(payload.get("session_loss_paused_until", 0.0) or 0.0)
+            self._strategy_loss_streaks = {str(strategy): int(count) for strategy, count in dict(payload.get("strategy_loss_streaks", {})).items()}
+            self._strategy_paused_until = {str(strategy): float(expires_at) for strategy, expires_at in dict(payload.get("strategy_paused_until", {})).items()}
+            self._moonshot_gate_open = bool(payload.get("moonshot_gate_open", True))
+            self._adaptive_offsets = {str(strategy): float(offset) for strategy, offset in dict(payload.get("adaptive_offsets", {})).items()}
+            self._last_rebalance_count = int(payload.get("last_rebalance_count", 0) or 0)
+            self._dynamic_scalper_budget = payload.get("dynamic_scalper_budget")
+            self._dynamic_moonshot_budget = payload.get("dynamic_moonshot_budget")
+            self._paused = bool(payload.get("paused", False))
+            self._last_daily_summary_date = str(payload.get("last_daily_summary_date", "") or "")
+            self._last_dust_sweep_date = str(payload.get("last_dust_sweep_date", "") or "")
+            self._last_weekly_summary_key = str(payload.get("last_weekly_summary_key", "") or "")
+            self._session_anchor_equity = payload.get("session_anchor_equity")
+            self._daily_anchor_equity = payload.get("daily_anchor_equity")
+            self._daily_anchor_date = str(payload.get("daily_anchor_date", "") or "")
+            self._recent_activity = deque((str(item) for item in payload.get("recent_activity", [])), maxlen=RECENT_ACTIVITY_LIMIT)
+        except Exception as exc:
+            log.warning("State restore failed: %s", exc)
+            self.trade_history = []
+            self.open_trades = []
+            self.recently_closed = {}
+            self.symbol_cooldowns = {}
+            self.liquidity_blacklist = {}
+            self.liquidity_fail_count = {}
+            self._win_rate_pause_until = 0.0
+            self._consecutive_losses = 0
+            self._streak_paused_at = 0.0
+            self._session_loss_paused_until = 0.0
+            self._strategy_loss_streaks = {}
+            self._strategy_paused_until = {}
+            self._moonshot_gate_open = True
+            self._adaptive_offsets = {}
+            self._last_rebalance_count = 0
+            self._dynamic_scalper_budget = None
+            self._dynamic_moonshot_budget = None
+            self._paused = False
+            self._last_daily_summary_date = ""
+            self._last_dust_sweep_date = ""
+            self._last_weekly_summary_key = ""
+            self._session_anchor_equity = None
+            self._daily_anchor_equity = None
+            self._daily_anchor_date = ""
+            self._recent_activity = deque(maxlen=RECENT_ACTIVITY_LIMIT)
+            return
+
+        self._purge_cooldowns()
+        if self.open_trades:
+            self._record_activity(f"Restored {len(self.open_trades)} open trade(s) from state")
+
+    def _notify(self, message: str, *, parse_mode: str = "HTML") -> None:
+        self.telegram.send_message(message, parse_mode=parse_mode)
+
+    def _mode_label(self) -> str:
+        return "📝 PAPER" if self.config.paper_trade else "💰 LIVE"
+
+    def _strategy_icon(self, strategy: str) -> str:
+        return {
+            "SCALPER": "🟢",
+            "MOONSHOT": "🌙",
+            "REVERSAL": "🔄",
+            "TRINITY": "🔱",
+            "GRID": "📊",
+            "PRE_BREAKOUT": "🔮",
+        }.get(strategy.upper(), "•")
+
+    def _market_regime_label(self) -> str:
+        mult = self._market_regime_mult
+        if mult > 1.30:
+            return "CRASH"
+        if mult > 1.10:
+            return "BEAR"
+        if mult > 0.95:
+            return "SIDEWAYS"
+        if mult > 0.80:
+            return "BULL"
+        return "STRONG BULL"
+
+    def _fng_label(self) -> str:
+        fng = self._fear_greed_index
+        if fng is None:
+            return "N/A"
+        if fng <= 20:
+            return f"\U0001f631{fng}"
+        if fng <= 35:
+            return f"\U0001f630{fng}"
+        if fng <= 55:
+            return f"\U0001f610{fng}"
+        if fng <= 75:
+            return f"\U0001f600{fng}"
+        return f"\U0001f911{fng}"
+
+    def _update_fear_greed(self) -> None:
+        value = fetch_fear_and_greed()
+        if value is not None:
+            self._fear_greed_index = value
+
+    def _record_activity(self, message: str) -> None:
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self._recent_activity.appendleft(f"{timestamp} {message}")
+
+    def _notify_once(self, key: str, message: str, *, cooldown_seconds: int = TELEGRAM_ALERT_COOLDOWN_SECONDS, parse_mode: str = "HTML") -> None:
+        now_ts = time.time()
+        last_sent = self._telegram_alert_timestamps.get(key, 0.0)
+        if now_ts - last_sent < cooldown_seconds:
+            return
+        self._telegram_alert_timestamps[key] = now_ts
+        self._notify(message, parse_mode=parse_mode)
+
+    def _pause_lines(self) -> list[str]:
+        now_ts = time.time()
+        lines: list[str] = []
+        if self._paused:
+            lines.append("⏸️ Manual pause active")
+        if self._session_loss_paused_until > now_ts:
+            mins_left = max(1, math.ceil((self._session_loss_paused_until - now_ts) / 60.0))
+            lines.append(f"📛 Session loss pause ({mins_left} min)")
+        if self._consecutive_losses >= self.config.max_consecutive_losses:
+            lines.append(f"🛑 Scalper loss streak ({self._consecutive_losses}L)")
+        if self._win_rate_pause_until > now_ts:
+            mins_left = max(1, math.ceil((self._win_rate_pause_until - now_ts) / 60.0))
+            lines.append(f"🛑 Scalper circuit breaker ({mins_left} min)")
+        for strategy in sorted(self._strategy_paused_until):
+            expires_at = self._strategy_paused_until[strategy]
+            if expires_at <= now_ts:
+                continue
+            mins_left = max(1, math.ceil((expires_at - now_ts) / 60.0))
+            lines.append(f"🛑 {strategy} paused ({mins_left} min)")
+        return lines
+
+    def _commands_hint(self) -> str:
+        return "/status /pnl /metrics /config /logs /pause /resume /close /reconcile /resetstreak /restart /ask"
+
+    def _strategy_pnl_lines(self, trades: list[dict]) -> list[str]:
+        lines: list[str] = []
+        for strategy in ("SCALPER", "MOONSHOT", "REVERSAL", "TRINITY", "PRE_BREAKOUT", "GRID"):
+            strategy_trades = [trade for trade in trades if str(trade.get("strategy") or "").upper() == strategy]
+            if not strategy_trades:
+                continue
+            wins = sum(1 for trade in strategy_trades if float(trade.get("pnl_pct", 0.0) or 0.0) > 0)
+            pnl_total = sum(float(trade.get("pnl_usdt", 0.0) or 0.0) for trade in strategy_trades)
+            lines.append(
+                f"  {self._strategy_icon(strategy)} {strategy}: {len(strategy_trades)}t {wins}W ${pnl_total:+.2f}"
+            )
+        return lines
+
+    def _format_hold_time(self, closed_trade: dict[str, object]) -> str | None:
+        opened_raw = closed_trade.get("opened_at")
+        closed_raw = closed_trade.get("closed_at")
+        if not opened_raw or not closed_raw:
+            return None
+        try:
+            opened_at = datetime.fromisoformat(str(opened_raw))
+            closed_at = datetime.fromisoformat(str(closed_raw))
+        except Exception:
+            return None
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+        held_minutes = max(0.0, (closed_at - opened_at).total_seconds() / 60.0)
+        if held_minutes < 120:
+            return f"{held_minutes:.0f}m"
+        return f"{held_minutes / 60.0:.1f}h"
+
+    def _compute_metrics(self) -> dict[str, object]:
+        full_trades = [item for item in self.trade_history if not item.get("is_partial")]
+        if not full_trades:
+            return {}
+
+        pnl_pct = [float(item.get("pnl_pct", 0.0) or 0.0) for item in full_trades]
+        pnl_usdt = [float(item.get("pnl_usdt", 0.0) or 0.0) for item in full_trades]
+        wins_pct = [value for value in pnl_pct if value > 0]
+        losses_pct = [value for value in pnl_pct if value <= 0]
+        wins_usdt = [value for value in pnl_usdt if value > 0]
+        losses_usdt = [value for value in pnl_usdt if value <= 0]
+        equity = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for value in pnl_usdt:
+            equity += value
+            peak = max(peak, equity)
+            max_drawdown = max(max_drawdown, peak - equity)
+
+        average_pct = sum(pnl_pct) / len(pnl_pct)
+        if len(pnl_pct) > 1:
+            variance = sum((value - average_pct) ** 2 for value in pnl_pct) / (len(pnl_pct) - 1)
+            stdev = variance ** 0.5
+            sharpe = (average_pct / stdev * (len(pnl_pct) ** 0.5)) if stdev > 0 else 0.0
+        else:
+            sharpe = 0.0
+
+        hold_minutes: list[float] = []
+        by_reason: dict[str, dict[str, float | int]] = {}
+        by_signal: dict[str, dict[str, float | int]] = {}
+        for trade in full_trades:
+            reason = str(trade.get("exit_reason") or "UNKNOWN")
+            reason_stats = by_reason.setdefault(reason, {"count": 0, "pnl_sum": 0.0, "wins": 0})
+            reason_stats["count"] = int(reason_stats["count"]) + 1
+            reason_stats["pnl_sum"] = float(reason_stats["pnl_sum"]) + float(trade.get("pnl_usdt", 0.0) or 0.0)
+            if float(trade.get("pnl_pct", 0.0) or 0.0) > 0:
+                reason_stats["wins"] = int(reason_stats["wins"]) + 1
+
+            signal = str(trade.get("entry_signal") or "UNKNOWN")
+            signal_stats = by_signal.setdefault(signal, {"count": 0, "pnl_sum": 0.0, "wins": 0})
+            signal_stats["count"] = int(signal_stats["count"]) + 1
+            signal_stats["pnl_sum"] = float(signal_stats["pnl_sum"]) + float(trade.get("pnl_pct", 0.0) or 0.0)
+            if float(trade.get("pnl_pct", 0.0) or 0.0) > 0:
+                signal_stats["wins"] = int(signal_stats["wins"]) + 1
+
+            hold_text = self._format_hold_time(trade)
+            if hold_text:
+                if hold_text.endswith("m"):
+                    hold_minutes.append(float(hold_text[:-1]))
+                elif hold_text.endswith("h"):
+                    hold_minutes.append(float(hold_text[:-1]) * 60.0)
+
+        by_strategy: dict[str, dict[str, float | int]] = {}
+        for strategy in sorted({str(item.get("strategy") or "UNKNOWN").upper() for item in full_trades}):
+            strategy_trades = [item for item in full_trades if str(item.get("strategy") or "").upper() == strategy]
+            strategy_wins = [item for item in strategy_trades if float(item.get("pnl_pct", 0.0) or 0.0) > 0]
+            strategy_losses = [item for item in strategy_trades if float(item.get("pnl_pct", 0.0) or 0.0) <= 0]
+            by_strategy[strategy] = {
+                "total": len(strategy_trades),
+                "win_rate": (len(strategy_wins) / len(strategy_trades) * 100.0) if strategy_trades else 0.0,
+                "total_pnl": sum(float(item.get("pnl_usdt", 0.0) or 0.0) for item in strategy_trades),
+                "avg_win": (
+                    sum(float(item.get("pnl_pct", 0.0) or 0.0) for item in strategy_wins) / len(strategy_wins)
+                    if strategy_wins else 0.0
+                ),
+                "avg_loss": (
+                    sum(float(item.get("pnl_pct", 0.0) or 0.0) for item in strategy_losses) / len(strategy_losses)
+                    if strategy_losses else 0.0
+                ),
+            }
+
+        return {
+            "total": len(full_trades),
+            "wins": len(wins_pct),
+            "losses": len(losses_pct),
+            "win_rate": len(wins_pct) / len(full_trades) * 100.0,
+            "avg_win": sum(wins_pct) / len(wins_pct) if wins_pct else 0.0,
+            "avg_loss": sum(losses_pct) / len(losses_pct) if losses_pct else 0.0,
+            "avg_win_usdt": sum(wins_usdt) / len(wins_usdt) if wins_usdt else 0.0,
+            "avg_loss_usdt": sum(losses_usdt) / len(losses_usdt) if losses_usdt else 0.0,
+            "profit_factor": (sum(wins_pct) / abs(sum(losses_pct))) if losses_pct and sum(losses_pct) != 0 else float("inf"),
+            "total_pnl": sum(pnl_usdt),
+            "max_drawdown": max_drawdown,
+            "sharpe": sharpe,
+            "expectancy": sum(pnl_usdt) / len(pnl_usdt),
+            "avg_hold_min": sum(hold_minutes) / len(hold_minutes) if hold_minutes else 0.0,
+            "best": max(full_trades, key=lambda item: float(item.get("pnl_pct", 0.0) or 0.0)),
+            "worst": min(full_trades, key=lambda item: float(item.get("pnl_pct", 0.0) or 0.0)),
+            "by_strategy": by_strategy,
+            "by_reason": by_reason,
+            "by_signal": by_signal,
+        }
+
+    def _build_logs_message(self) -> str:
+        if not self._recent_activity:
+            return "📜 <b>Recent Activity</b>\n━━━━━━━━━━━━━━━\nNo scanner activity yet."
+        lines = ["📜 <b>Recent Activity</b>", "━━━━━━━━━━━━━━━"]
+        lines.extend(f"<code>{entry}</code>" for entry in self._recent_activity)
+        return "\n".join(lines)[:4000]
+
+    def _reset_runtime_guards(self) -> None:
+        self._paused = False
+        self._win_rate_pause_until = 0.0
+        self._consecutive_losses = 0
+        self._streak_paused_at = 0.0
+        self._session_loss_paused_until = 0.0
+        self._strategy_loss_streaks.clear()
+        self._strategy_paused_until.clear()
+        self._save_state()
+
+    def _scalper_streak_paused(self) -> bool:
+        return self._consecutive_losses >= self.config.max_consecutive_losses
+
+    def _maybe_auto_reset_streak_guard(self) -> None:
+        if not self._scalper_streak_paused() or self._streak_paused_at <= 0:
+            return
+        if any(trade.strategy.upper() == "SCALPER" for trade in self.open_trades):
+            return
+        if time.time() - self._streak_paused_at < self.config.streak_auto_reset_mins * 60:
+            return
+        self._consecutive_losses = 0
+        self._streak_paused_at = 0.0
+        self._record_activity(f"Scalper streak auto-reset after {self.config.streak_auto_reset_mins} min")
+        self._notify(f"✅ <b>Streak auto-reset</b> | {self.config.streak_auto_reset_mins}min idle | entries resumed")
+        self._save_state()
+
+    def _refresh_session_pause(self, *, now_ts: float | None = None) -> None:
+        current = time.time() if now_ts is None else now_ts
+        if self._session_loss_paused_until > current:
+            return
+        snapshot = self._balance_snapshot()
+        session_anchor = float(snapshot.get("total_equity", 0.0) - snapshot.get("session_pnl", 0.0))
+        session_pnl = float(snapshot.get("session_pnl", 0.0) or 0.0)
+        session_loss_limit = -(session_anchor * self.config.session_loss_pause_pct)
+        if session_pnl < session_loss_limit and len(self.trade_history) >= 3:
+            self._session_loss_paused_until = current + self.config.session_loss_pause_mins * 60
+            self._record_activity(f"Session pause {session_pnl:+.2f}")
+            self._notify(
+                f"🛑 <b>Session loss limit</b> | P&L ${session_pnl:.2f}\n"
+                f"All entries paused {self.config.session_loss_pause_mins}min."
+            )
+            self._save_state()
+
+    def _safe_price(self, symbol: str, fallback: float = 0.0) -> float:
+        ws_px = self._price_monitor.get_price(symbol)
+        if ws_px is not None and ws_px > 0:
+            return ws_px
+        try:
+            price = float(self.client.get_price(symbol))
+            if price > 0:
+                return price
+        except Exception as exc:
+            log.debug("Price lookup failed for %s during close: %s", symbol, exc)
+        return float(fallback or 0.0)
+
+    def _mark_trade_closed(
+        self,
+        trade: Trade,
+        *,
+        reason: str,
+        exit_price: float,
+        exit_qty: float,
+        net_proceeds: float,
+        fee_quote_qty: float = 0.0,
+    ) -> dict:
+        entry_cost = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * exit_qty))
+        pnl_usdt = net_proceeds - entry_cost
+        pnl_pct = (pnl_usdt / entry_cost * 100.0) if entry_cost > 0 else 0.0
+        trade.exit_price = exit_price
+        trade.exit_reason = reason
+        trade.closed_at = datetime.now(timezone.utc)
+        trade.exit_fee_usdt = round(fee_quote_qty, 8)
+        trade.pnl_pct = round(pnl_pct, 4)
+        trade.pnl_usdt = round(pnl_usdt, 4)
+        trade.qty = exit_qty
+        trade.remaining_cost_usdt = 0.0
+        closed = trade.to_dict()
+        self.trade_history.append(closed)
+        self._record_symbol_cooldown(trade, reason)
+        self._update_strategy_guards(closed)
+        self._send_close_alert(closed)
+        self._post_trade_analysis(closed)
+        self._log_summary()
+        return closed
+
+    def _try_record_dust_close(self, trade: Trade, *, price: float) -> dict | None:
+        exit_price = float(price or trade.last_price or trade.entry_price or 0.0)
+        if exit_price <= 0:
+            return None
+        remaining_notional = float(trade.qty) * exit_price
+        if remaining_notional >= DUST_THRESHOLD:
+            return None
+        self._record_activity(f"Dust close {trade.symbol} ${remaining_notional:.2f}")
+        self._notify(f"🧹 <b>Dust</b> {trade.strategy} {trade.symbol} | ${remaining_notional:.2f} | auto-closed")
+        return self._mark_trade_closed(
+            trade,
+            reason="DUST",
+            exit_price=exit_price,
+            exit_qty=float(trade.qty),
+            net_proceeds=remaining_notional,
+            fee_quote_qty=0.0,
+        )
+
+    def _position_remaining(self, trade: Trade, *, price_hint: float) -> tuple[float, float]:
+        if self.config.paper_trade:
+            return 0.0, 0.0
+        remaining_qty = float(self.client.get_asset_balance(trade.symbol))
+        mark_price = self._safe_price(trade.symbol, fallback=price_hint)
+        remaining_notional = remaining_qty * mark_price if mark_price > 0 else 0.0
+        return remaining_qty, remaining_notional
+
+    def _record_exchange_partial_fill(self, trade: Trade, order: dict[str, object], *, reason: str, price_hint: float) -> dict | None:
+        qty_before = float(trade.qty)
+        execution = self.client.resolve_order_execution(
+            trade.symbol,
+            "SELL",
+            order,
+            fallback_price=price_hint,
+            fallback_qty=qty_before,
+        )
+        qty_to_close = float(execution.executed_qty or 0.0)
+        if qty_to_close <= 0 or qty_to_close >= qty_before:
+            return None
+        remaining_cost_before = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty))
+        entry_cost_alloc = remaining_cost_before * (qty_to_close / qty_before)
+        exit_price = execution.avg_price if execution.avg_price > 0 else price_hint
+        net_proceeds = execution.net_quote_qty if execution.gross_quote_qty > 0 else (exit_price * qty_to_close - execution.fee_quote_qty)
+        pnl_usdt = net_proceeds - entry_cost_alloc
+        pnl_pct = (pnl_usdt / entry_cost_alloc * 100.0) if entry_cost_alloc > 0 else 0.0
+        closed = {
+            "symbol": trade.symbol,
+            "strategy": trade.strategy,
+            "entry_price": trade.entry_price,
+            "qty": qty_to_close,
+            "entry_signal": trade.entry_signal,
+            "score": trade.score,
+            "opened_at": trade.opened_at.isoformat(),
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "pnl_pct": round(pnl_pct, 4),
+            "pnl_usdt": round(pnl_usdt, 4),
+            "entry_fee_usdt": round(float(trade.entry_fee_usdt or 0.0) * (qty_to_close / qty_before), 8),
+            "exit_fee_usdt": round(execution.fee_quote_qty, 8),
+            "is_partial": True,
+        }
+        trade.qty = round(max(0.0, trade.qty - qty_to_close), 12)
+        trade.remaining_cost_usdt = round(max(0.0, remaining_cost_before - entry_cost_alloc), 8)
+        self.trade_history.append(closed)
+        self._send_close_alert(closed, partial=True, remaining_qty=trade.qty)
+        self._log_summary()
+        self._save_state()
+        return closed
+
+    def _check_exchange_tp_order(self, trade: Trade, *, current_price: float) -> dict[str, object] | None:
+        if self.config.paper_trade or not trade.tp_order_id:
+            return None
+        try:
+            order = self.client.get_order(trade.symbol, trade.tp_order_id)
+        except Exception as exc:
+            log.debug("TP order fetch failed for %s: %s", trade.symbol, exc)
+            return None
+
+        status = str(order.get("status") or "").upper()
+        if status == "FILLED":
+            trade.tp_order_id = None
+            execution = self.client.resolve_order_execution(
+                trade.symbol,
+                "SELL",
+                order,
+                fallback_price=current_price,
+                fallback_qty=float(trade.qty),
+            )
+            qty_before = float(trade.qty)
+            exit_price = execution.avg_price if execution.avg_price > 0 else current_price
+            net_proceeds = execution.net_quote_qty if execution.gross_quote_qty > 0 else (exit_price * qty_before - execution.fee_quote_qty)
+            closed = self._mark_trade_closed(
+                trade,
+                reason="TAKE_PROFIT",
+                exit_price=exit_price,
+                exit_qty=qty_before,
+                net_proceeds=net_proceeds,
+                fee_quote_qty=execution.fee_quote_qty,
+            )
+            self._record_activity(f"TP order filled {trade.symbol}")
+            return {"action": "exchange_closed", "closed": closed}
+
+        if status == "PARTIALLY_FILLED" and trade.strategy == "SCALPER":
+            filled_qty = float(order.get("executedQty", 0.0) or 0.0)
+            if trade.qty > 0 and filled_qty > 0:
+                filled_ratio = filled_qty / float(trade.qty)
+                remaining_qty = max(0.0, float(trade.qty) - filled_qty)
+                remaining_notional = remaining_qty * current_price
+                if filled_ratio >= MAJOR_FILL_THRESHOLD and remaining_notional < DUST_THRESHOLD:
+                    try:
+                        self.client.cancel_order(trade.symbol, trade.tp_order_id)
+                    except Exception as exc:
+                        log.debug("TP cancel failed for %s after major partial fill: %s", trade.symbol, exc)
+                    trade.tp_order_id = None
+                    partial = self._record_exchange_partial_fill(
+                        trade,
+                        order,
+                        reason="MAJOR_PARTIAL_TP",
+                        price_hint=current_price,
+                    )
+                    if partial is None:
+                        return None
+                    final_close = self._try_record_dust_close(trade, price=current_price)
+                    self._record_activity(f"Major partial TP {trade.symbol}")
+                    return {"action": "exchange_closed", "closed": final_close or partial}
+        return None
+
+    def _anthropic_enabled(self) -> bool:
+        return bool(self.config.anthropic_api_key.strip())
+
+    def _ask_trade_assistant(self, question: str) -> str:
+        if not self._anthropic_enabled():
+            return ""
+
+        recent = self.trade_history[-50:] if len(self.trade_history) > 50 else self.trade_history
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        context_lines: list[str] = []
+        for trade in recent:
+            opened_raw = trade.get("opened_at")
+            closed_raw = trade.get("closed_at")
+            held_text = ""
+            if opened_raw and closed_raw:
+                try:
+                    opened_at = datetime.fromisoformat(str(opened_raw))
+                    closed_at = datetime.fromisoformat(str(closed_raw))
+                    held_minutes = round((closed_at - opened_at).total_seconds() / 60)
+                    held_text = f" held={held_minutes}min"
+                except Exception:
+                    held_text = ""
+            context_lines.append(
+                f"{str(trade.get('closed_at') or '?')[:16]} {trade.get('symbol')} [{trade.get('strategy')}] "
+                f"signal={trade.get('entry_signal', '?')} pnl={float(trade.get('pnl_pct', 0.0) or 0.0):+.2f}% "
+                f"reason={trade.get('exit_reason', '?')} score={float(trade.get('score', 0.0) or 0.0):.0f}{held_text}"
+            )
+        open_context: list[str] = []
+        for trade in self.open_trades:
+            pct = self._trade_pct(trade)
+            pct_text = f" {pct:+.2f}%" if pct is not None else ""
+            open_context.append(f"{trade.symbol} [{trade.strategy}] currently{pct_text}")
+
+        system = (
+            "You are a concise crypto trading analyst with access to a live bot's trade history. "
+            "Answer the user's question directly using only the data provided. "
+            "Be specific and honest. Keep answers under 150 words."
+        )
+        prompt = (
+            f"Bot trade history (last {len(context_lines)} closed trades):\n"
+            + "\n".join(context_lines[-30:])
+            + (f"\n\nCurrently open: {', '.join(open_context)}" if open_context else "")
+            + f"\n\nBalance snapshot: {self._balance_snapshot()} | Date: {today}\n\nUser question: {question}"
+        )
+
+        body = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 300,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.config.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if not response.ok:
+                log.warning("/ask HTTP %s: %s", response.status_code, response.text[:200])
+                return ""
+            payload = response.json()
+        except Exception as exc:
+            log.warning("/ask failed: %s", exc)
+            return ""
+
+        for block in payload.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                return str(block.get("text") or "").strip()
+        return ""
+
+    # ── post-trade analysis (Haiku + web search) ──────────────────────
+    def _post_trade_analysis(self, closed: dict) -> None:
+        """Analyse a losing trade in a background thread using Haiku + web search."""
+        pnl_pct = float(closed.get("pnl_pct", 0.0) or 0.0)
+        if pnl_pct >= 0:
+            return
+        if not self._anthropic_enabled():
+            return
+        if not env_bool("WEB_SEARCH_ENABLED", False):
+            return
+
+        def _run() -> None:
+            try:
+                self._do_post_trade_analysis(closed)
+            except Exception as exc:
+                log.debug("Post-trade analysis failed for %s: %s", closed.get("symbol"), exc)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+    def _do_post_trade_analysis(self, closed: dict) -> None:
+        symbol = str(closed.get("symbol") or "")
+        coin = symbol.replace("USDT", "").strip().upper()
+        strategy = str(closed.get("strategy") or "")
+        pnl_pct = float(closed.get("pnl_pct", 0.0) or 0.0)
+        pnl_usdt = float(closed.get("pnl_usdt", 0.0) or 0.0)
+        entry_price = float(closed.get("entry_price", 0.0) or 0.0)
+        exit_price = float(closed.get("exit_price", 0.0) or 0.0)
+        exit_reason = str(closed.get("exit_reason") or "")
+        opened_at = str(closed.get("opened_at") or "")[:16]
+        closed_at = str(closed.get("closed_at") or "")[:16]
+
+        prompt = (
+            f"I just lost money on a {coin} (symbol {symbol}) trade. "
+            f"Strategy: {strategy}. Entry at {entry_price} ({opened_at} UTC), "
+            f"exit at {exit_price} ({closed_at} UTC). "
+            f"Loss: {pnl_pct:+.2f}% (${pnl_usdt:+.2f}). Exit reason: {exit_reason}.\n\n"
+            f"Search for any recent {coin} news, announcements, or social media warnings "
+            f"around {opened_at} UTC that could explain this drop — e.g. token unlocks, "
+            f"delistings, rug pull warnings, whale dumps, negative partnerships, etc.\n\n"
+            "Respond with valid JSON only:\n"
+            '{"found_cause": true/false, "explanation": "<max 2 sentences>", '
+            '"severity": "none|minor|major", "lesson": "<1 sentence actionable advice>"}'
+        )
+
+        body = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 300,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self.config.anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+        if not response.ok:
+            log.debug("Post-trade analysis HTTP %s: %s", response.status_code, response.text[:200])
+            return
+
+        payload = response.json()
+        text = ""
+        for block in payload.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "").strip()
+                break
+
+        if not text:
+            return
+
+        # Parse JSON from response
+        import re as _re
+        stripped = text.replace("```json", "").replace("```", "").strip()
+        parsed = None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            match = _re.search(r"\{.*\}", stripped, _re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+
+        if not parsed:
+            log.debug("Post-trade analysis: could not parse JSON for %s", symbol)
+            return
+
+        found_cause = bool(parsed.get("found_cause", False))
+        explanation = str(parsed.get("explanation") or "No specific cause found.")[:200]
+        severity = str(parsed.get("severity") or "none")
+        lesson = str(parsed.get("lesson") or "")[:150]
+
+        icon = {"major": "🚨", "minor": "⚠️", "none": "📝"}.get(severity, "📝")
+
+        msg_lines = [
+            f"{icon} <b>Post-Trade Analysis</b> — {symbol}",
+            f"Loss: {pnl_pct:+.2f}% (${pnl_usdt:+.2f}) | {strategy} | {exit_reason}",
+        ]
+        if found_cause:
+            msg_lines.append(f"Cause: {explanation}")
+        else:
+            msg_lines.append(f"Finding: {explanation}")
+        if lesson:
+            msg_lines.append(f"💡 {lesson}")
+
+        self._notify("\n".join(msg_lines))
+        log.info("Post-trade analysis for %s: severity=%s found=%s", symbol, severity, found_cause)
+
+    def _balance_snapshot(self, *, force_refresh: bool = False) -> dict[str, float]:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.config.paper_trade:
+            free_usdt = self._available_balance()
+            total_equity = free_usdt + sum(float((trade.last_price or trade.entry_price) * trade.qty) for trade in self.open_trades)
+        else:
+            snapshot = self.client.get_live_account_snapshot(force_refresh=force_refresh)
+            free_usdt = float(snapshot.get("free_usdt", 0.0) or 0.0)
+            total_equity = float(snapshot.get("total_equity", free_usdt) or free_usdt)
+        if self._session_anchor_equity is None:
+            self._session_anchor_equity = total_equity
+        if self._daily_anchor_equity is None or self._daily_anchor_date != today:
+            self._daily_anchor_equity = total_equity
+            self._daily_anchor_date = today
+        session_anchor = self._session_anchor_equity if self._session_anchor_equity is not None else total_equity
+        daily_anchor = self._daily_anchor_equity if self._daily_anchor_equity is not None else total_equity
+        return {
+            "free_usdt": round(free_usdt, 4),
+            "total_equity": round(total_equity, 4),
+            "session_pnl": round(total_equity - session_anchor, 4),
+            "daily_pnl": round(total_equity - daily_anchor, 4),
+        }
+
+    def _trade_pct(self, trade: Trade) -> float | None:
+        last_price = float(trade.last_price or trade.entry_price or 0.0)
+        if trade.entry_price <= 0 or last_price <= 0:
+            return None
+        return (last_price - trade.entry_price) / trade.entry_price * 100.0
+
+    def _build_status_message(self) -> str:
+        snapshot = self._balance_snapshot()
+        lines = [
+            f"📋 <b>Status</b> [{self._mode_label()}]",
+            "━━━━━━━━━━━━━━━",
+            f"Market: <b>{self._market_regime_label()}</b> (×{self._market_regime_mult:.2f}) | F&G {self._fng_label()}",
+            f"Moonshot gate: {'✅ open' if self._moonshot_gate_open else '⛔ closed'} | Paused: {'yes' if self._paused else 'no'}",
+            f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b> | Session: <b>${snapshot['session_pnl']:+.2f}</b>",
+            "━━━━━━━━━━━━━━━",
+        ]
+        lines.extend(self._pause_lines())
+        if lines[-1] != "━━━━━━━━━━━━━━━":
+            lines.append("━━━━━━━━━━━━━━━")
+        if not self.open_trades:
+            lines.append("No open positions.")
+            lines.append(f"<i>{self._commands_hint()}</i>")
+            return "\n".join(lines)
+        for trade in self.open_trades:
+            pct = self._trade_pct(trade)
+            pct_text = f" {pct:+.2f}%" if pct is not None else ""
+            sl_value = trade.trail_stop_price or trade.hard_floor_price or trade.sl_price
+            lines.append(
+                f"{self._strategy_icon(trade.strategy)} {trade.symbol} [{trade.strategy}]"
+                f"{pct_text} | TP {trade.tp_price:.6f} | SL {sl_value:.6f}"
+            )
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append(f"<i>{self._commands_hint()}</i>")
+        return "\n".join(lines)
+
+    def _build_pnl_message(self) -> str:
+        snapshot = self._balance_snapshot(force_refresh=not self.config.paper_trade)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_trades = [
+            item for item in self.trade_history
+            if str(item.get("closed_at") or "")[:10] == today and not item.get("is_partial")
+        ]
+        session_trades = [item for item in self.trade_history if not item.get("is_partial")]
+        today_pnl = sum(float(item.get("pnl_usdt", 0.0) or 0.0) for item in today_trades)
+        open_pnl = 0.0
+        open_lines: list[str] = []
+        for trade in self.open_trades:
+            price = float(trade.last_price or trade.entry_price)
+            unrealized = (price - trade.entry_price) * trade.qty
+            open_pnl += unrealized
+            pct = self._trade_pct(trade)
+            pct_text = f" {pct:+.1f}%" if pct is not None else ""
+            open_lines.append(
+                f"  {self._strategy_icon(trade.strategy)} {trade.strategy}: {trade.symbol}{pct_text} (${unrealized:+.2f})"
+            )
+
+        lines = [
+            f"💰 <b>P&L Report</b> [{self._mode_label()}]",
+            "━━━━━━━━━━━━━━━",
+        ]
+        if today_trades:
+            today_wins = sum(1 for item in today_trades if float(item.get("pnl_pct", 0.0) or 0.0) > 0)
+            best_today = max(today_trades, key=lambda item: float(item.get("pnl_usdt", 0.0) or 0.0))
+            worst_today = min(today_trades, key=lambda item: float(item.get("pnl_usdt", 0.0) or 0.0))
+            lines.append(
+                f"📈 <b>Today</b> ({today})\n"
+                f"  {len(today_trades)} trades | {today_wins}W {len(today_trades) - today_wins}L | <b>${today_pnl:+.2f}</b>"
+            )
+            lines.extend(self._strategy_pnl_lines(today_trades))
+            lines.append(f"  Best: {best_today['symbol']} ${float(best_today.get('pnl_usdt', 0.0) or 0.0):+.2f}")
+            lines.append(f"  Worst: {worst_today['symbol']} ${float(worst_today.get('pnl_usdt', 0.0) or 0.0):+.2f}")
+        else:
+            lines.append(f"📊 <b>Today</b> ({today})\n  No closed trades yet")
+
+        session_wins = sum(1 for item in session_trades if float(item.get("pnl_pct", 0.0) or 0.0) > 0)
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append(
+            f"📈 <b>Session</b> ({len(session_trades)} trades)\n"
+            f"  {session_wins}W {len(session_trades) - session_wins}L | <b>${snapshot['session_pnl']:+.2f}</b>"
+        )
+        lines.extend(self._strategy_pnl_lines(session_trades))
+
+        if open_lines:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append(f"📌 <b>Open</b> (unrealized: <b>${open_pnl:+.2f}</b>)")
+            lines.extend(open_lines)
+
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append(f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b>")
+        return "\n".join(lines)[:4000]
+
+    def _build_metrics_message(self) -> str:
+        metrics = self._compute_metrics()
+        if not metrics:
+            return "📊 <b>Metrics</b>\n━━━━━━━━━━━━━━━\nNo completed trades yet."
+        profit_factor = float(metrics["profit_factor"])
+        pf_text = "∞" if math.isinf(profit_factor) else f"{profit_factor:.2f}"
+        avg_hold_min = float(metrics.get("avg_hold_min", 0.0) or 0.0)
+        hold_text = f"{avg_hold_min:.0f}min" if avg_hold_min < 120 else f"{avg_hold_min / 60.0:.1f}h"
+        lines = [
+            "📊 <b>Performance Metrics</b>",
+            "━━━━━━━━━━━━━━━",
+            f"Trades: <b>{int(metrics['total'])}</b> ({int(metrics['wins'])}W / {int(metrics['losses'])}L)",
+            f"Win rate: <b>{float(metrics['win_rate']):.1f}%</b> | Avg hold: {hold_text}",
+            f"Avg win: <b>+{float(metrics['avg_win']):.2f}%</b> (${float(metrics['avg_win_usdt']):+.2f})",
+            f"Avg loss: <b>{float(metrics['avg_loss']):.2f}%</b> (${float(metrics['avg_loss_usdt']):+.2f})",
+            f"Expectancy: <b>${float(metrics['expectancy']):+.2f}</b>/trade",
+            f"P-factor: <b>{pf_text}</b> | Sharpe: <b>{float(metrics['sharpe']):.2f}</b>",
+            f"Total P&L: <b>${float(metrics['total_pnl']):+.2f}</b> | Max DD: <b>-${float(metrics['max_drawdown']):.2f}</b>",
+            "━━━━━━━━━━━━━━━",
+        ]
+        by_strategy = metrics.get("by_strategy", {})
+        for strategy, data in sorted(by_strategy.items()):
+            lines.append(
+                f"{self._strategy_icon(strategy)} <b>{strategy}</b> {int(data['total'])}t "
+                f"{float(data['win_rate']):.0f}%WR ${float(data['total_pnl']):+.2f} "
+                f"avg +{float(data['avg_win']):.1f}%/{float(data['avg_loss']):.1f}%"
+            )
+        by_reason = metrics.get("by_reason", {})
+        if by_reason:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Exit reasons:")
+            for reason, data in sorted(by_reason.items(), key=lambda item: -int(item[1]["count"])):
+                count = int(data["count"])
+                pnl_sum = float(data["pnl_sum"])
+                wins = int(data["wins"])
+                win_rate = wins / count * 100.0 if count else 0.0
+                avg_pnl = pnl_sum / count if count else 0.0
+                icon = "✅" if avg_pnl > 0 else "⚠️" if win_rate >= 40 else "🔴"
+                lines.append(f"  {icon} {reason}: {count}t {win_rate:.0f}%WR ${pnl_sum:+.2f} (avg ${avg_pnl:+.2f})")
+        by_signal = metrics.get("by_signal", {})
+        signal_lines = []
+        for signal, data in sorted(by_signal.items(), key=lambda item: -int(item[1]["count"])):
+            count = int(data["count"])
+            if count < 2:
+                continue
+            win_rate = int(data["wins"]) / count * 100.0 if count else 0.0
+            avg_pct = float(data["pnl_sum"]) / count if count else 0.0
+            icon = "✅" if win_rate >= 50 else "⚠️" if win_rate >= 30 else "🔴"
+            signal_lines.append(f"  {icon} {signal}: {count}t {win_rate:.0f}%WR avg {avg_pct:+.1f}%")
+        if signal_lines:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Entry signals:")
+            lines.extend(signal_lines)
+        best_trade = metrics["best"]
+        worst_trade = metrics["worst"]
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append(
+            f"Best: {best_trade['symbol']} {float(best_trade.get('pnl_pct', 0.0) or 0.0):+.2f}% ${float(best_trade.get('pnl_usdt', 0.0) or 0.0):+.2f}"
+        )
+        lines.append(
+            f"Worst: {worst_trade['symbol']} {float(worst_trade.get('pnl_pct', 0.0) or 0.0):+.2f}% ${float(worst_trade.get('pnl_usdt', 0.0) or 0.0):+.2f}"
+        )
+        return "\n".join(lines)[:4000]
+
+    def _build_config_message(self) -> str:
+        dead_active = sum(1 for expires_at in self.liquidity_blacklist.values() if expires_at > time.time())
+        return (
+            f"⚙️ <b>Config</b>\n"
+            f"Market {self._market_regime_label()} (×{self._market_regime_mult:.2f}) | Moon {'✅' if self._moonshot_gate_open else '⛔'}\n"
+            f"Strategies: {', '.join(self.config.strategies)}\n"
+            f"Thresholds: S {self._strategy_base_threshold('SCALPER'):.1f} | M {self._strategy_base_threshold('MOONSHOT'):.1f} | T {self._strategy_base_threshold('TRINITY'):.1f} | R {self._strategy_base_threshold('REVERSAL'):.1f}\n"
+            f"Pools S/M/T/G {self.config.scalper_allocation_pct * 100:.0f}/{self.config.moonshot_allocation_pct * 100:.0f}/{self.config.trinity_allocation_pct * 100:.0f}/{self.config.grid_allocation_pct * 100:.0f}\n"
+            f"Trade caps S/M/T/G {self.config.scalper_budget_pct * 100:.1f}/{self.config.moonshot_budget_pct * 100:.1f}/{self.config.trinity_budget_pct * 100:.1f}/{self.config.grid_budget_pct * 100:.1f} | Max positions {self.config.max_open_positions}\n"
+            f"Cooldowns: scalper {self.config.scalper_symbol_cooldown_seconds}s | rotation {self.config.scalper_rotation_cooldown_seconds}s\n"
+            f"Circuit breaker: WR<{self.config.win_rate_cb_threshold * 100:.0f}% over {self.config.win_rate_cb_window} trades | {self.config.win_rate_cb_pause_mins}min\n"
+            f"Moon gate: {self.config.moonshot_btc_ema_gate:+.3f} reopen {self.config.moonshot_btc_gate_reopen:+.3f}\n"
+            f"Adaptive: window {self.config.adaptive_window} | tighten {self.config.adaptive_tighten_step:.1f} | relax {self.config.adaptive_relax_step:.1f}\n"
+            f"☠️ Blacklisted {dead_active} | {'⏸️ PAUSED' if self._paused else '▶️ RUNNING'}"
+        )
+
+    def _flush_telegram_updates(self) -> None:
+        if not self.telegram.configured:
+            return
+        updates = self.telegram.get_updates(limit=100, timeout=0)
+        if not updates:
+            return
+        self._last_telegram_update = max(int(update.get("update_id", 0) or 0) for update in updates)
+        self._record_activity(f"Flushed {len(updates)} stale Telegram update(s)")
+
+    def _send_startup_message(self) -> None:
+        snapshot = self._balance_snapshot(force_refresh=not self.config.paper_trade)
+        self._notify(
+            f"🚀 <b>MEXC Bot Started</b> [{self._mode_label()}]\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Strategies: {', '.join(self.config.strategies)}\n"
+            f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b>\n"
+            f"Budget: <b>${self.config.trade_budget:.2f}</b> | Max positions: <b>{self.config.max_open_positions}</b>\n"
+            f"Thresholds: S {self._strategy_base_threshold('SCALPER'):.1f} | M {self._strategy_base_threshold('MOONSHOT'):.1f} | T {self._strategy_base_threshold('TRINITY'):.1f} | R {self._strategy_base_threshold('REVERSAL'):.1f}\n"
+            f"<i>{self._commands_hint()}</i>"
+        )
+        self._record_activity("Startup notification sent")
+
+    def _send_heartbeat(self) -> None:
+        if not self.telegram.configured:
+            return
+        now_ts = time.time()
+        if now_ts - self._last_heartbeat_at < self.config.heartbeat_seconds:
+            return
+        self._last_heartbeat_at = now_ts
+        heartbeat = self._build_status_message().replace("📋 <b>Status</b>", "💓 <b>Heartbeat</b>")
+        self._notify(heartbeat)
+        self._record_activity("Heartbeat sent")
+
+    def _maybe_convert_dust(self, now: datetime | None = None) -> None:
+        if self.config.paper_trade:
+            return
+        current = now or datetime.now(timezone.utc)
+        today = current.strftime("%Y-%m-%d")
+        if self._last_dust_sweep_date == today or current.hour != 0:
+            return
+        self._last_dust_sweep_date = today
+        try:
+            sweep = self.client.convert_dust()
+        except Exception as exc:
+            log.debug("Dust sweep failed: %s", exc)
+            self._record_activity("Dust sweep failed")
+            return
+        converted = list(sweep.get("converted", []) or [])
+        if not converted:
+            self._record_activity("Dust sweep checked: nothing to convert")
+            return
+        failed = list(sweep.get("failed", []) or [])
+        total_mx = float(sweep.get("total_mx", 0.0) or 0.0)
+        fee_mx = float(sweep.get("fee_mx", 0.0) or 0.0)
+        converted_preview = ", ".join(converted[:10])
+        if len(converted) > 10:
+            converted_preview += "..."
+        self._record_activity(f"Dust swept {len(converted)} asset(s)")
+        if self.telegram.configured:
+            message = (
+                "🧹 <b>Dust Swept</b>\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"Converted: <b>{converted_preview}</b>\n"
+                f"Received: <b>{total_mx:.6f} MX</b>\n"
+                f"Fee: <b>{fee_mx:.6f} MX</b>"
+            )
+            if failed:
+                message += f"\nFailed: {', '.join(failed)}"
+            self._notify(message)
+
+    def _send_daily_summary(self) -> None:
+        if not self.telegram.configured:
+            return
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        if self._last_daily_summary_date == today or now.hour != 0:
+            return
+        self._last_daily_summary_date = today
+        today_trades = [
+            item for item in self.trade_history
+            if str(item.get("closed_at") or "")[:10] == today and not item.get("is_partial")
+        ]
+        if not today_trades:
+            self._notify(f"📅 <b>Daily Summary</b> [{self._mode_label()}]\n━━━━━━━━━━━━━━━\nNo trades today.")
+            self._record_activity("Daily summary sent (no trades)")
+            return
+        total_pnl = sum(float(item.get("pnl_usdt", 0.0) or 0.0) for item in today_trades)
+        wins = sum(1 for item in today_trades if float(item.get("pnl_pct", 0.0) or 0.0) > 0)
+        best_trade = max(today_trades, key=lambda item: float(item.get("pnl_usdt", 0.0) or 0.0))
+        worst_trade = min(today_trades, key=lambda item: float(item.get("pnl_usdt", 0.0) or 0.0))
+        lines = [
+            f"📅 <b>Daily Summary</b> [{self._mode_label()}]",
+            "━━━━━━━━━━━━━━━",
+            f"Trades: <b>{len(today_trades)}</b> | {wins}W {len(today_trades) - wins}L",
+            f"P&L: <b>${total_pnl:+.2f}</b>",
+        ]
+        lines.extend(self._strategy_pnl_lines(today_trades))
+        lines.append(f"Best: {best_trade['symbol']} ${float(best_trade.get('pnl_usdt', 0.0) or 0.0):+.2f}")
+        lines.append(f"Worst: {worst_trade['symbol']} ${float(worst_trade.get('pnl_usdt', 0.0) or 0.0):+.2f}")
+        lines.append(f"Open positions: <b>{len(self.open_trades)}</b>")
+        self._notify("\n".join(lines)[:4000])
+        self._record_activity("Daily summary sent")
+
+    def _send_weekly_summary(self) -> None:
+        if not self.telegram.configured:
+            return
+        now = datetime.now(timezone.utc)
+        week_key = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+        if self._last_weekly_summary_key == week_key or now.weekday() != 0 or now.hour != 0:
+            return
+        self._last_weekly_summary_key = week_key
+        recent_cutoff = datetime.now(timezone.utc).timestamp() - 7 * 86400
+        weekly_trades = [
+            item for item in self.trade_history
+            if item.get("closed_at") and not item.get("is_partial") and datetime.fromisoformat(str(item["closed_at"])).timestamp() >= recent_cutoff
+        ]
+        if not weekly_trades:
+            self._notify(f"📊 <b>Weekly Summary</b> [{self._mode_label()}]\n━━━━━━━━━━━━━━━\nNo completed trades this week.")
+            self._record_activity("Weekly summary sent (no trades)")
+            return
+        total_pnl = sum(float(item.get("pnl_usdt", 0.0) or 0.0) for item in weekly_trades)
+        wins = sum(1 for item in weekly_trades if float(item.get("pnl_pct", 0.0) or 0.0) > 0)
+        best_trade = max(weekly_trades, key=lambda item: float(item.get("pnl_pct", 0.0) or 0.0))
+        worst_trade = min(weekly_trades, key=lambda item: float(item.get("pnl_pct", 0.0) or 0.0))
+        self._notify(
+            f"📊 <b>Weekly Summary</b> [{self._mode_label()}]\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Trades: <b>{len(weekly_trades)}</b> | {wins}W {len(weekly_trades) - wins}L\n"
+            f"P&L: <b>${total_pnl:+.2f}</b>\n"
+            f"Best: {best_trade['symbol']} {float(best_trade.get('pnl_pct', 0.0) or 0.0):+.2f}%\n"
+            f"Worst: {worst_trade['symbol']} {float(worst_trade.get('pnl_pct', 0.0) or 0.0):+.2f}%"
+        )
+        self._record_activity("Weekly summary sent")
+
+    def _send_open_alert(self, trade: Trade) -> None:
+        self._record_activity(f"OPEN {trade.strategy} {trade.symbol} score={trade.score:.1f}")
+        score_line = f"Signal {trade.entry_signal} | Score {trade.score:.2f}"
+        if trade.metadata.get("kelly_mult"):
+            score_line += f" | Kelly {float(trade.metadata['kelly_mult']):.1f}x"
+        self._notify(
+            f"{self._strategy_icon(trade.strategy)} <b>Opened {trade.strategy}</b> {trade.symbol}\n"
+            f"Entry {trade.entry_price:.6f} | Qty {trade.qty:.6f}\n"
+            f"{score_line}\n"
+            f"TP {trade.tp_price:.6f} | SL {trade.sl_price:.6f}"
+        )
+
+    def _send_close_alert(self, closed: dict, *, partial: bool = False, remaining_qty: float | None = None) -> None:
+        prefix = "Partial" if partial else "Closed"
+        remainder = f"\nRemaining qty {remaining_qty:.6f}" if partial and remaining_qty is not None else ""
+        hold_text = self._format_hold_time(closed)
+        hold_line = f"\nHeld {hold_text}" if hold_text else ""
+        self._record_activity(
+            f"{prefix.upper()} {closed.get('symbol')} {float(closed.get('pnl_pct', 0.0) or 0.0):+.2f}% {closed.get('exit_reason')}"
+        )
+        self._notify(
+            f"{self._strategy_icon(str(closed.get('strategy') or ''))} <b>{prefix}</b> {closed.get('symbol')}\n"
+            f"Reason {closed.get('exit_reason')} | P&L {float(closed.get('pnl_pct', 0.0) or 0.0):+.2f}% (${float(closed.get('pnl_usdt', 0.0) or 0.0):+.2f})\n"
+            f"Exit {float(closed.get('exit_price', 0.0) or 0.0):.6f}{remainder}{hold_line}"
+        )
+
+    def _reconcile_open_positions(self, *, notify: bool = False) -> dict[str, int]:
+        if self.config.paper_trade:
+            return {"stale": 0, "untracked": 0, "orphaned": 0}
+        stale = 0
+        untracked = 0
+        orphaned = 0
+        try:
+            account = self.client.private_get("/api/v3/account")
+            balances = {
+                str(balance.get("asset") or ""): float(balance.get("free", 0.0) or 0.0) + float(balance.get("locked", 0.0) or 0.0)
+                for balance in account.get("balances", [])
+            }
+            for trade in list(self.open_trades):
+                asset = trade.symbol[:-4] if trade.symbol.endswith("USDT") else trade.symbol
+                held = float(balances.get(asset, 0.0) or 0.0)
+                if trade.qty > 0 and held < trade.qty * 0.05:
+                    stale += 1
+                    self.open_trades.remove(trade)
+                    offline_closed = {
+                        **trade.to_dict(),
+                        "exit_price": trade.entry_price,
+                        "exit_reason": "UNKNOWN_CLOSED",
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                        "pnl_pct": 0.0,
+                        "pnl_usdt": 0.0,
+                    }
+                    self.trade_history.append(offline_closed)
+            known_assets = {trade.symbol[:-4] if trade.symbol.endswith("USDT") else trade.symbol for trade in self.open_trades}
+            try:
+                prices = self.client.public_get("/api/v3/ticker/price")
+                price_map = {str(item.get("symbol") or ""): float(item.get("price", 0.0) or 0.0) for item in prices if isinstance(item, dict)}
+            except Exception:
+                price_map = {}
+            untracked_assets: list[str] = []
+            for asset, qty in balances.items():
+                if asset in {"USDT", "MX"} or asset in known_assets or qty <= 0:
+                    continue
+                value = qty * float(price_map.get(f"{asset}USDT", 0.0) or 0.0)
+                if value >= 5.0:
+                    untracked += 1
+                    untracked_assets.append(f"{asset}: {qty:.4f} (~${value:.2f})")
+            open_orders = self.client.private_get("/api/v3/openOrders", {})
+            order_rows = open_orders if isinstance(open_orders, list) else []
+            known_symbols = {trade.symbol for trade in self.open_trades}
+            orphaned_symbols = sorted({str(order.get("symbol") or "") for order in order_rows if str(order.get("symbol") or "") not in known_symbols})
+            orphaned = len(orphaned_symbols)
+            if notify and stale:
+                self._record_activity(f"Reconcile stale={stale}")
+                self._notify("⚠️ <b>Positions closed offline</b>\nSome tracked positions were no longer present on exchange balances.")
+            if notify and untracked_assets:
+                self._record_activity(f"Reconcile untracked={len(untracked_assets)}")
+                self._notify("⚠️ <b>Untracked holdings</b>\n" + "\n".join(untracked_assets))
+            if notify and orphaned_symbols:
+                self._record_activity(f"Reconcile orphaned={len(orphaned_symbols)}")
+                self._notify("⚠️ <b>Orphaned orders</b> | " + ", ".join(orphaned_symbols))
+            if stale or untracked or orphaned:
+                self._save_state()
+        except Exception as exc:
+            log.error("Reconcile failed: %s", exc)
+            self._notify_once("reconcile-failed", f"⚠️ <b>Reconcile failed</b>\n{str(exc)[:200]}")
+        return {"stale": stale, "untracked": untracked, "orphaned": orphaned}
+
+    def _handle_telegram_commands(self) -> None:
+        updates = self.telegram.get_updates(
+            offset=self._last_telegram_update + 1 if self._last_telegram_update else None,
+            limit=5,
+            timeout=0,
+        )
+        if not updates:
+            return
+        for update in updates:
+            self._last_telegram_update = max(self._last_telegram_update, int(update.get("update_id", 0) or 0))
+            message = update.get("message", {}) if isinstance(update, dict) else {}
+            chat_id = str(message.get("chat", {}).get("id", ""))
+            if self.config.telegram_chat_id and chat_id != self.config.telegram_chat_id:
+                continue
+            raw_text = str(message.get("text", "") or "").strip()
+            text = raw_text.lower()
+            if text == "/status":
+                self._notify(self._build_status_message())
+            elif text == "/pnl":
+                self._notify(self._build_pnl_message())
+            elif text == "/metrics":
+                self._notify(self._build_metrics_message())
+            elif text in {"/logs", "/log"}:
+                self._notify(self._build_logs_message())
+            elif text == "/config":
+                self._notify(self._build_config_message())
+            elif text in {"/help", "/start"}:
+                self._notify(
+                    f"🤖 <b>Telegram Commands</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"/status — Open positions & balance\n"
+                    f"/pnl — Daily & session P&L\n"
+                    f"/metrics — Win rate, PF, signals\n"
+                    f"/config — Strategy thresholds & pools\n"
+                    f"/logs — Recent activity\n"
+                    f"/pause /resume — Control entries\n"
+                    f"/close — Emergency close all\n"
+                    f"/reconcile — Sync exchange state\n"
+                    f"/resetstreak — Clear loss streaks\n"
+                    f"/restart — Restart bot\n"
+                    f"/ask &lt;question&gt; — AI trade analysis"
+                )
+            elif raw_text.startswith("/ask ") or raw_text.startswith("/ask@"):
+                question = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
+                if not question:
+                    self._notify("🧠 Usage: <code>/ask why am I losing on flat exits?</code>")
+                elif not self._anthropic_enabled():
+                    self._notify("🧠 <b>/ask</b> requires ANTHROPIC_API_KEY to be set.")
+                else:
+                    self._notify("🧠 Thinking...")
+                    answer = self._ask_trade_assistant(question)
+                    if answer:
+                        self._record_activity(f"Ask answered: {question[:40]}")
+                        self._notify(f"🧠 Ask: {question}\n━━━━━━━━━━━━━━━\n{answer}", parse_mode="")
+                    else:
+                        self._notify("🧠 Couldn't get an answer — check logs.")
+            elif text == "/pause":
+                self._paused = True
+                self._record_activity("Manual pause enabled")
+                self._notify("⏸️ <b>Paused.</b> Open positions are still monitored. /resume to restart.")
+                self._save_state()
+            elif text == "/resume":
+                self._paused = False
+                self._record_activity("Manual pause cleared")
+                self._notify("▶️ <b>Resumed.</b> Scanning for new trades.")
+                self._save_state()
+            elif text == "/resetstreak":
+                self._reset_runtime_guards()
+                self._record_activity("Runtime guards reset")
+                self._notify("✅ <b>Streak reset.</b> Losses cleared, entries resumed.")
+            elif text == "/close":
+                self._notify("🚨 <b>Emergency close triggered.</b>")
+                closed = 0
+                failed = 0
+                for trade in list(self.open_trades):
+                    try:
+                        result = self.close_position(trade, "EMERGENCY_CLOSE")
+                        if result is not None:
+                            self.open_trades.remove(trade)
+                            closed += 1
+                            self._save_state()
+                        else:
+                            failed += 1
+                    except Exception as exc:
+                        failed += 1
+                        self._notify_once(
+                            f"close-failed:{trade.symbol}",
+                            f"🚨 <b>Close failed</b> {trade.symbol}\n{str(exc)[:200]}",
+                        )
+                self._record_activity(f"Emergency close closed={closed} failed={failed}")
+                self._notify(f"✅ Closed {closed} position(s)." + (f" Failed: {failed}." if failed else ""))
+            elif text.startswith("/reconcile"):
+                stats = self._reconcile_open_positions(notify=True)
+                self._notify(
+                    f"🔧 <b>Reconcile complete</b>\n"
+                    f"Stale: <b>{stats['stale']}</b>\n"
+                    f"Untracked: <b>{stats['untracked']}</b>\n"
+                    f"Orphaned: <b>{stats['orphaned']}</b>"
+                )
+            elif text == "/restart":
+                self._notify("🔄 <b>Restarting...</b>")
+                raise SystemExit(1)
+
+    def refresh_trade_calibration(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_calibration_refresh_at < self.config.calibration_refresh_seconds:
+            return
+        self._last_calibration_refresh_at = now
+        data, source = load_trade_calibration(
+            redis_url=self.config.redis_url,
+            redis_key=self.config.calibration_redis_key,
+            file_path=self.config.calibration_file,
+        )
+        if not data:
+            return
+        ok, reason = validate_trade_calibration_payload(
+            data,
+            max_age_hours=self.config.calibration_max_age_hours,
+            min_total_trades=self.config.calibration_min_total_trades,
+        )
+        if not ok:
+            if self.trade_calibration:
+                self.trade_calibration = {}
+            log.info("[CALIBRATION] Ignoring crypto calibration from %s: %s", source or "unknown source", reason)
+            return
+        self.trade_calibration = data
+        log.info(
+            "[CALIBRATION] Loaded crypto calibration from %s: %s trades",
+            source or "unknown source",
+            int(data.get("total_trades", 0) or 0),
+        )
+
+    def _open_symbols(self) -> set[str]:
+        return {trade.symbol for trade in self.open_trades}
+
+    def _update_ws_subscriptions(self) -> None:
+        """Keep WebSocket subscriptions in sync with open positions."""
+        self._price_monitor.set_symbols(self._open_symbols())
+
+    def _purge_cooldowns(self) -> None:
+        now_ts = time.time()
+        self.recently_closed = {
+            symbol: expires_at
+            for symbol, expires_at in self.recently_closed.items()
+            if expires_at > now_ts
+        }
+        self.symbol_cooldowns = {
+            symbol: expires_at
+            for symbol, expires_at in self.symbol_cooldowns.items()
+            if expires_at > now_ts
+        }
+        expired_blacklist = [symbol for symbol, expires_at in self.liquidity_blacklist.items() if expires_at <= now_ts]
+        for symbol in expired_blacklist:
+            self.liquidity_blacklist.pop(symbol, None)
+            self.liquidity_fail_count.pop(symbol, None)
+
+    def _excluded_symbols(self) -> set[str]:
+        self._purge_cooldowns()
+        return set(self.recently_closed) | set(self.symbol_cooldowns) | set(self.liquidity_blacklist)
+
+    def _entries_paused(self) -> bool:
+        self._maybe_auto_reset_streak_guard()
+        self._refresh_session_pause()
+        now_ts = time.time()
+        return self._paused or self._win_rate_pause_until > now_ts or self._session_loss_paused_until > now_ts
+
+    def _eligible_strategies(self) -> list[str]:
+        now_ts = time.time()
+        self._strategy_paused_until = {
+            strategy: expires_at
+            for strategy, expires_at in self._strategy_paused_until.items()
+            if expires_at > now_ts
+        }
+        if self._entries_paused():
+            return []
+        eligible = [
+            strategy
+            for strategy in self.config.strategies
+            if self._strategy_paused_until.get(strategy.upper(), 0.0) <= now_ts
+        ]
+        if self._scalper_streak_paused():
+            eligible = [strategy for strategy in eligible if strategy.upper() != "SCALPER"]
+        if not self._moonshot_gate_open:
+            eligible = [strategy for strategy in eligible if strategy.upper() != "MOONSHOT"]
+        if self.config.fear_greed_bear_block_moonshot and self._fear_greed_index is not None and self._fear_greed_index <= self.config.fear_greed_bear_threshold:
+            eligible = [strategy for strategy in eligible if strategy.upper() != "MOONSHOT"]
+        return eligible
+
+    def _update_moonshot_gate(self) -> None:
+        if "MOONSHOT" not in {strategy.upper() for strategy in self.config.strategies}:
+            return
+        previous_state = self._moonshot_gate_open
+        try:
+            frame = self.client.get_klines("BTCUSDT", interval="1h", limit=120)
+        except Exception as exc:
+            log.debug("BTC gate refresh failed: %s", exc)
+            return
+        if frame is None or len(frame) < 50 or "close" not in frame:
+            return
+        close = frame["close"].astype(float)
+        ema50 = calc_ema(close, 50)
+        if ema50.empty:
+            return
+        ema_value = float(ema50.iloc[-1])
+        last_price = float(close.iloc[-1])
+        if ema_value <= 0 or last_price <= 0:
+            return
+        ema_gap = last_price / ema_value - 1.0
+        if self._moonshot_gate_open:
+            if ema_gap < self.config.moonshot_btc_ema_gate:
+                self._moonshot_gate_open = False
+        elif ema_gap >= self.config.moonshot_btc_gate_reopen:
+            self._moonshot_gate_open = True
+        if previous_state != self._moonshot_gate_open:
+            state_text = "opened" if self._moonshot_gate_open else "closed"
+            self._record_activity(f"Moonshot gate {state_text}")
+            self._notify(
+                f"🌙 <b>Moonshot gate {state_text}</b>\n"
+                f"BTC EMA gap {ema_gap:+.3%} | Thresholds {self.config.moonshot_btc_ema_gate:+.3%}/{self.config.moonshot_btc_gate_reopen:+.3%}"
+            )
+
+    def _record_symbol_cooldown(self, trade: Trade, reason: str) -> None:
+        cooldown_seconds = 0
+        if trade.strategy == "SCALPER":
+            cooldown_seconds = self.config.scalper_rotation_cooldown_seconds if reason == "ROTATION" else self.config.scalper_symbol_cooldown_seconds
+        if cooldown_seconds <= 0:
+            return
+        self.symbol_cooldowns[trade.symbol] = time.time() + cooldown_seconds
+
+    def _strategy_base_threshold(self, strategy: str) -> float:
+        resolved = strategy.upper()
+        if resolved == "SCALPER":
+            return self.config.scalper_threshold
+        if resolved == "MOONSHOT":
+            return self.config.moonshot_min_score
+        if resolved == "TRINITY":
+            from mexcbot.strategies.trinity import TRINITY_MIN_SCORE
+            return TRINITY_MIN_SCORE
+        if resolved == "REVERSAL":
+            from mexcbot.strategies.reversal import REVERSAL_MIN_SCORE
+            return REVERSAL_MIN_SCORE
+        return self.config.score_threshold
+
+    def _threshold_overrides(self, strategies: list[str]) -> dict[str, float]:
+        overrides: dict[str, float] = {}
+        for strategy in strategies:
+            resolved = strategy.upper()
+            if resolved not in ADAPTIVE_THRESHOLD_STRATEGIES:
+                continue
+            base_threshold = self._strategy_base_threshold(resolved)
+            offset = self._adaptive_offsets.get(resolved, 0.0)
+            fng_mult = 1.0
+            if self._fear_greed_index is not None and self._fear_greed_index <= self.config.fear_greed_extreme_fear_threshold:
+                fng_mult = self.config.fear_greed_extreme_fear_mult
+            overrides[resolved] = round(max(0.0, (base_threshold + offset) * self._market_regime_mult * fng_mult), 4)
+        return overrides
+
+    def _strategy_budget_multiplier(self, strategy: str) -> float:
+        resolved = strategy.upper()
+        if resolved == "SCALPER":
+            effective_budget = self._dynamic_scalper_budget if self._dynamic_scalper_budget is not None else self.config.scalper_budget_pct
+            return effective_budget / self.config.scalper_budget_pct if self.config.scalper_budget_pct > 0 else 1.0
+        if resolved == "MOONSHOT":
+            effective_budget = self._dynamic_moonshot_budget if self._dynamic_moonshot_budget is not None else self.config.moonshot_budget_pct
+            return effective_budget / self.config.moonshot_budget_pct if self.config.moonshot_budget_pct > 0 else 1.0
+        return 1.0
+
+    def _strategy_pool_key(self, strategy: str) -> str:
+        resolved = strategy.upper()
+        if resolved in {"MOONSHOT", "REVERSAL", "PRE_BREAKOUT"}:
+            return "MOONSHOT"
+        return resolved
+
+    def _strategy_capital_pct(self, strategy: str) -> float:
+        pool = self._strategy_pool_key(strategy)
+        if pool == "SCALPER":
+            return self.config.scalper_allocation_pct
+        if pool == "MOONSHOT":
+            return self.config.moonshot_allocation_pct
+        if pool == "TRINITY":
+            return self.config.trinity_allocation_pct
+        if pool == "GRID":
+            return self.config.grid_allocation_pct
+        return 1.0
+
+    def _used_strategy_capital(self, strategy: str) -> float:
+        pool = self._strategy_pool_key(strategy)
+        total = 0.0
+        for trade in self.open_trades:
+            if self._strategy_pool_key(trade.strategy) != pool:
+                continue
+            total += float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
+        return total
+
+    def _strategy_available_capital(self, strategy: str, *, total_equity: float) -> float:
+        cap = total_equity * self._strategy_capital_pct(strategy)
+        return max(0.0, cap - self._used_strategy_capital(strategy))
+
+    def _kelly_multiplier(self, opportunity: Opportunity) -> float:
+        if opportunity.strategy.upper() != "SCALPER":
+            return 1.0
+        gap = float(opportunity.score) - self._strategy_base_threshold("SCALPER")
+        if gap < 15:
+            return KELLY_MULT_MARGINAL
+        if gap < 30:
+            return KELLY_MULT_SOLID
+        if gap < 45:
+            return KELLY_MULT_STANDARD
+        return KELLY_MULT_HIGH_CONF
+
+    def _allocation_usdt_for_opportunity(self, opportunity: Opportunity, *, available_balance: float) -> float:
+        return self._allocation_usdt_for_opportunity_with_equity(
+            opportunity,
+            available_balance=available_balance,
+            total_equity=available_balance,
+        )
+
+    def _allocation_usdt_for_opportunity_with_equity(self, opportunity: Opportunity, *, available_balance: float, total_equity: float) -> float:
+        allocation_mult = float(opportunity.metadata.get("allocation_mult", 1.0) or 1.0)
+        pool = self._strategy_pool_key(opportunity.strategy)
+        if pool == "TRINITY":
+            per_trade_cap = total_equity * self.config.trinity_allocation_pct * self.config.trinity_budget_pct
+        elif pool == "GRID":
+            per_trade_cap = total_equity * self.config.grid_allocation_pct * self.config.grid_budget_pct
+        else:
+            strategy_mult = self._strategy_budget_multiplier(opportunity.strategy)
+            per_trade_cap = self.config.trade_budget * allocation_mult * strategy_mult
+        available_pool_cap = self._strategy_available_capital(opportunity.strategy, total_equity=total_equity)
+        capped_budget = min(per_trade_cap, available_pool_cap, available_balance)
+        if capped_budget <= 0:
+            return 0.0
+        if opportunity.strategy.upper() != "SCALPER":
+            opportunity.metadata.pop("kelly_mult", None)
+            opportunity.metadata.pop("risk_budget_usdt", None)
+            return capped_budget
+
+        sl_pct = float(opportunity.sl_pct or 0.0)
+        if sl_pct <= 0:
+            opportunity.metadata.pop("kelly_mult", None)
+            opportunity.metadata.pop("risk_budget_usdt", None)
+            return capped_budget
+
+        kelly_mult = self._kelly_multiplier(opportunity)
+        risk_per_trade = min(SCALPER_RISK_PER_TRADE * kelly_mult, KELLY_RISK_CAP)
+        risk_budget = available_balance * risk_per_trade / sl_pct
+        allocation = min(risk_budget, capped_budget)
+        opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
+        opportunity.metadata["risk_budget_usdt"] = round(allocation, 4)
+        return allocation
+
+    def _update_market_regime(self) -> None:
+        previous = self._market_regime_mult
+        try:
+            frame = self.client.get_klines("BTCUSDT", interval="1h", limit=120)
+        except Exception as exc:
+            log.debug("Market regime refresh failed: %s", exc)
+            return
+        self._market_regime_mult = compute_market_regime_multiplier(frame, self.config)
+        if abs(previous - self._market_regime_mult) >= 0.2:
+            self._record_activity(f"Market regime {self._market_regime_label()} x{self._market_regime_mult:.2f}")
+            self._notify(
+                f"🌍 <b>Market regime update</b>\n"
+                f"{self._market_regime_label()} | Multiplier <b>×{self._market_regime_mult:.2f}</b>"
+            )
+
+    def _check_dead_coin(self, symbol: str, *, vol_24h: float, spread: float | None, strategy: str) -> bool:
+        spread_value = float(spread) if spread is not None else 0.0
+        vol_threshold = self.config.dead_coin_vol_scalper if strategy.upper() == "SCALPER" else self.config.dead_coin_vol_moonshot
+        failed = vol_24h < vol_threshold or (spread is not None and spread_value > self.config.dead_coin_spread_max)
+        if failed:
+            count = self.liquidity_fail_count.get(symbol, 0) + 1
+            self.liquidity_fail_count[symbol] = count
+            if count >= self.config.dead_coin_consecutive:
+                self.liquidity_blacklist[symbol] = time.time() + self.config.dead_coin_blacklist_hours * 3600
+                self.liquidity_fail_count.pop(symbol, None)
+                self._record_activity(f"Liquidity blacklist {symbol}")
+                self._notify(
+                    f"🚫 <b>Liquidity blacklist</b> {symbol}\n"
+                    f"Strategy {strategy} | Vol ${vol_24h:,.0f} | Spread {spread_value:.3%}"
+                )
+            return False
+        self.liquidity_fail_count.pop(symbol, None)
+        return True
+
+    def _passes_liquidity_guard(
+        self,
+        opportunity: Opportunity,
+        *,
+        ticker_by_symbol: dict[str, float] | None = None,
+    ) -> bool:
+        symbol = opportunity.symbol
+        ticker_by_symbol = ticker_by_symbol or {}
+        vol_24h = float(ticker_by_symbol.get(symbol, 0.0) or 0.0)
+        if vol_24h <= 0:
+            try:
+                tickers = self.client.get_all_tickers()
+                row = tickers[tickers["symbol"] == symbol]
+                if not row.empty:
+                    vol_24h = float(row.iloc[0]["quoteVolume"])
+            except Exception:
+                vol_24h = 0.0
+        spread = self.client.get_orderbook_spread(symbol)
+        return self._check_dead_coin(symbol, vol_24h=vol_24h, spread=spread, strategy=opportunity.strategy)
+
+    def _update_adaptive_thresholds(self) -> None:
+        min_trades_for_adjust = max(10, self.config.adaptive_window // 2)
+        for strategy in ADAPTIVE_THRESHOLD_STRATEGIES:
+            full_trades = [
+                trade
+                for trade in self.trade_history
+                if not trade.get("is_partial") and str(trade.get("strategy") or "").upper() == strategy
+            ][-self.config.adaptive_window :]
+            if len(full_trades) < min_trades_for_adjust:
+                continue
+
+            pnls = [float(trade.get("pnl_pct", 0.0) or 0.0) for trade in full_trades]
+            win_rate = sum(1 for pnl in pnls if pnl > 0) / len(pnls)
+            mean_pnl = sum(pnls) / len(pnls)
+            old_offset = self._adaptive_offsets.get(strategy, 0.0)
+            decayed_offset = old_offset * (1.0 - self.config.adaptive_decay_rate)
+
+            if win_rate < 0.35 and mean_pnl < 0:
+                new_offset = min(decayed_offset + self.config.adaptive_tighten_step, self.config.adaptive_max_offset)
+            elif win_rate > 0.55 and mean_pnl > 0:
+                new_offset = max(decayed_offset - self.config.adaptive_relax_step, self.config.adaptive_min_offset)
+            else:
+                new_offset = decayed_offset
+
+            rounded_offset = round(new_offset, 1)
+            self._adaptive_offsets[strategy] = rounded_offset
+            if abs(rounded_offset - old_offset) >= 0.09:
+                self._record_activity(f"Adaptive threshold {strategy} {old_offset:+.1f}->{rounded_offset:+.1f}")
+                self._notify(
+                    f"🎚️ <b>Adaptive threshold update</b> {strategy}\n"
+                    f"Offset {old_offset:+.1f} → {rounded_offset:+.1f} | Effective {self._strategy_base_threshold(strategy) + rounded_offset:.1f}"
+                )
+
+    def _rebalance_budgets(self) -> None:
+        full_trades = [trade for trade in self.trade_history if not trade.get("is_partial")]
+        if len(full_trades) < self.config.perf_rebalance_trades or len(full_trades) <= self._last_rebalance_count:
+            return
+        if len(full_trades) - self._last_rebalance_count < self.config.perf_rebalance_trades:
+            return
+        self._last_rebalance_count = len(full_trades)
+
+        min_strategy_trades = 15
+
+        def strategy_score(label: str) -> float | None:
+            strategy_trades = [
+                trade for trade in full_trades if str(trade.get("strategy") or "").upper() == label
+            ][-self.config.perf_rebalance_trades :]
+            if len(strategy_trades) < min_strategy_trades:
+                return None
+            pnls = [float(trade.get("pnl_pct", 0.0) or 0.0) for trade in strategy_trades]
+            wins = sum(1 for pnl in pnls if pnl > 0)
+            win_rate = wins / len(pnls)
+            mean_pnl = sum(pnls) / len(pnls)
+            direction = 1.0 if mean_pnl >= 0 else -1.0
+            return win_rate * direction * (abs(mean_pnl) ** 0.5)
+
+        scalper_score = strategy_score("SCALPER")
+        moonshot_score = strategy_score("MOONSHOT")
+        if scalper_score is None or moonshot_score is None:
+            return
+
+        curr_scalper = self._dynamic_scalper_budget if self._dynamic_scalper_budget is not None else self.config.scalper_budget_pct
+        curr_moonshot = self._dynamic_moonshot_budget if self._dynamic_moonshot_budget is not None else self.config.moonshot_budget_pct
+        revert_rate = 0.10
+        curr_scalper = curr_scalper + (self.config.scalper_budget_pct - curr_scalper) * revert_rate
+        curr_moonshot = curr_moonshot + (self.config.moonshot_budget_pct - curr_moonshot) * revert_rate
+
+        diff = scalper_score - moonshot_score
+        shift = self.config.perf_shift_step * 0.5
+        if diff > 0.3:
+            new_scalper = min(self.config.perf_scalper_ceil, curr_scalper + shift)
+            new_moonshot = max(self.config.perf_moonshot_floor, curr_moonshot - shift)
+        elif diff < -0.3:
+            new_scalper = max(self.config.perf_scalper_floor, curr_scalper - shift)
+            new_moonshot = min(self.config.perf_moonshot_ceil, curr_moonshot + shift)
+        else:
+            new_scalper = curr_scalper
+            new_moonshot = curr_moonshot
+
+        self._dynamic_scalper_budget = round(new_scalper, 4)
+        self._dynamic_moonshot_budget = round(new_moonshot, 4)
+        if abs(self._dynamic_scalper_budget - curr_scalper) >= 0.009 or abs(self._dynamic_moonshot_budget - curr_moonshot) >= 0.009:
+            self._record_activity(
+                f"Budget rebalance S {curr_scalper:.2f}->{self._dynamic_scalper_budget:.2f} M {curr_moonshot:.2f}->{self._dynamic_moonshot_budget:.2f}"
+            )
+            self._notify(
+                f"⚖️ <b>Budget rebalance</b>\n"
+                f"SCALPER {curr_scalper:.2f} → {self._dynamic_scalper_budget:.2f}\n"
+                f"MOONSHOT {curr_moonshot:.2f} → {self._dynamic_moonshot_budget:.2f}"
+            )
+
+    def _update_strategy_guards(self, closed_trade: dict) -> None:
+        if closed_trade.get("is_partial"):
+            return
+
+        strategy = str(closed_trade.get("strategy") or "").upper()
+        pnl_pct = float(closed_trade.get("pnl_pct", 0.0) or 0.0)
+        exit_reason = str(closed_trade.get("exit_reason") or "").upper()
+        manual_close = exit_reason in {"MANUAL_CLOSE", "EMERGENCY_CLOSE"}
+        if strategy == "SCALPER" and not manual_close:
+            if pnl_pct <= 0:
+                self._consecutive_losses += 1
+                if self._consecutive_losses >= self.config.max_consecutive_losses and self._streak_paused_at <= 0:
+                    self._streak_paused_at = time.time()
+                    self._record_activity(f"Scalper loss streak {self._consecutive_losses}")
+                    self._notify(
+                        f"🛑 <b>Loss streak</b> | {self._consecutive_losses} consecutive losses\n"
+                        f"Scalper entries paused. /resetstreak to override."
+                    )
+            else:
+                self._consecutive_losses = 0
+                self._streak_paused_at = 0.0
+        if strategy in LOSS_STREAK_PAUSE_STRATEGIES:
+            if pnl_pct <= 0 and not manual_close:
+                streak = self._strategy_loss_streaks.get(strategy, 0) + 1
+                self._strategy_loss_streaks[strategy] = streak
+                if streak >= self.config.strategy_loss_streak_max:
+                    self._strategy_paused_until[strategy] = time.time() + self.config.strategy_loss_streak_mins * 60
+                    self._record_activity(f"{strategy} paused after {streak} losses")
+                    self._notify(
+                        f"⏸️ <b>{strategy} paused</b>\n"
+                        f"Loss streak {streak} | Cooldown {self.config.strategy_loss_streak_mins} min"
+                    )
+            else:
+                self._strategy_loss_streaks[strategy] = 0
+
+        self._update_adaptive_thresholds()
+        self._rebalance_budgets()
+
+        if strategy != "SCALPER" or self.config.win_rate_cb_window <= 0:
+            return
+
+        recent_full_scalper = [
+            trade
+            for trade in self.trade_history
+            if not trade.get("is_partial") and str(trade.get("strategy") or "").upper() == "SCALPER"
+        ][-self.config.win_rate_cb_window :]
+        if len(recent_full_scalper) < self.config.win_rate_cb_window:
+            return
+        recent_win_rate = sum(1 for trade in recent_full_scalper if float(trade.get("pnl_pct", 0.0) or 0.0) > 0) / len(recent_full_scalper)
+        if recent_win_rate < self.config.win_rate_cb_threshold and self._win_rate_pause_until <= time.time():
+            self._win_rate_pause_until = time.time() + self.config.win_rate_cb_pause_mins * 60
+            self._record_activity(f"Scalper circuit breaker {recent_win_rate * 100:.1f}%")
+            self._notify(
+                f"🛑 <b>Scalper circuit breaker</b>\n"
+                f"Win rate {recent_win_rate * 100:.1f}% over {len(recent_full_scalper)} trades | Pause {self.config.win_rate_cb_pause_mins} min"
+            )
+
+    def _available_balance(self) -> float:
+        if self.config.paper_trade:
+            allocated = sum(trade.entry_price * trade.qty for trade in self.open_trades)
+            return max(0.0, self.config.trade_budget * self.config.max_open_positions - allocated)
+        try:
+            snapshot = self.client.get_live_account_snapshot()
+            return max(0.0, float(snapshot.get("free_usdt", 0.0) or 0.0))
+        except Exception as exc:
+            log.error("Balance fetch error: %s", exc)
+            return 0.0
+
+    def _sellable_qty(self, trade: Trade, requested_qty: float | None = None) -> float:
+        target_qty = float(requested_qty if requested_qty is not None else trade.qty)
+        if self.config.paper_trade:
+            return min(max(0.0, target_qty), float(trade.qty))
+        try:
+            return self.client.get_sellable_qty(
+                trade.symbol,
+                fallback_qty=target_qty,
+                max_qty=target_qty,
+            )
+        except Exception as exc:
+            log.error("Sellable qty fetch error for %s: %s", trade.symbol, exc)
+            return 0.0
+
+    def open_position(self, opportunity: Opportunity, allocation_usdt: float) -> Trade | None:
+        lot = self.client.get_lot_size(opportunity.symbol)
+        step = float(lot.get("stepSize", 0.001))
+        min_qty = float(lot.get("minQty", 0.001))
+        requested_qty = self.client.round_qty(allocation_usdt / opportunity.price, step)
+        if requested_qty < min_qty:
+            log.warning("%s qty %.6f below min %.6f, skipping", opportunity.symbol, requested_qty, min_qty)
+            return None
+
+        use_maker = opportunity.strategy != "REVERSAL"
+        order = self.client.place_buy_order(opportunity.symbol, requested_qty, use_maker=use_maker)
+        if order is None:
+            return None
+        execution = self.client.resolve_order_execution(
+            opportunity.symbol,
+            "BUY",
+            order,
+            fallback_price=opportunity.price,
+            fallback_qty=requested_qty,
+        )
+        filled_qty = execution.net_base_qty if execution.net_base_qty > 0 else requested_qty
+        entry_price = execution.avg_price if execution.avg_price > 0 else opportunity.price
+        entry_cost = execution.gross_quote_qty + execution.fee_quote_qty if execution.gross_quote_qty > 0 else entry_price * filled_qty
+        if filled_qty < min_qty:
+            log.warning("%s filled qty %.6f below min %.6f, skipping", opportunity.symbol, filled_qty, min_qty)
+            return None
+        tp_pct = opportunity.tp_pct if opportunity.tp_pct is not None else self.config.take_profit_pct
+        sl_pct = opportunity.sl_pct if opportunity.sl_pct is not None else self.config.stop_loss_pct
+        tp_price = round(entry_price * (1 + tp_pct), 8)
+        tp_order_id: str | None = None
+        tp_execution_mode = "internal"
+        if opportunity.strategy == "SCALPER":
+            tp_execution_mode = resolve_scalper_tp_execution_mode(
+                opportunity,
+                score_threshold=self._strategy_base_threshold("SCALPER"),
+                market_regime_mult=self._market_regime_mult,
+                open_positions_count=len(self.open_trades),
+            )
+        elif opportunity.strategy in {"TRINITY", "GRID"}:
+            tp_execution_mode = "exchange"
+        if tp_execution_mode == "exchange":
+            tp_order_id = self.client.place_limit_sell(opportunity.symbol, filled_qty, tp_price)
+            if not self.config.paper_trade and tp_order_id is None:
+                self._notify_once(
+                    f"tp-limit-failed:{opportunity.symbol}",
+                    f"⚠️ <b>TP limit failed</b> {opportunity.strategy} {opportunity.symbol} | bot monitoring instead",
+                )
+                tp_execution_mode = "internal"
+        opportunity.metadata["tp_execution_mode"] = tp_execution_mode
+        trade = Trade(
+            symbol=opportunity.symbol,
+            entry_price=entry_price,
+            qty=filled_qty,
+            tp_price=tp_price,
+            sl_price=round(entry_price * (1 - sl_pct), 8),
+            opened_at=datetime.now(timezone.utc),
+            order_id=execution.order_id,
+            score=opportunity.score,
+            entry_signal=opportunity.entry_signal,
+            paper=self.config.paper_trade,
+            strategy=opportunity.strategy,
+            highest_price=entry_price,
+            last_price=entry_price,
+            partial_tp_price=opportunity.metadata.get("partial_tp_price"),
+            partial_tp_ratio=opportunity.metadata.get("partial_tp_ratio"),
+            max_hold_minutes=int(opportunity.metadata.get("max_hold_minutes", 0)) or None,
+            exit_profile_override=opportunity.metadata.get("exit_profile_override"),
+            atr_pct=opportunity.atr_pct,
+            metadata=dict(opportunity.metadata),
+            entry_cost_usdt=round(entry_cost, 8),
+            remaining_cost_usdt=round(entry_cost, 8),
+            entry_fee_usdt=round(execution.fee_quote_qty, 8),
+            tp_order_id=tp_order_id,
+        )
+        log.info(
+            "Opened %s [%s] | Entry %.6f | Qty %.6f | TP %.6f | SL %.6f | signal=%s",
+            trade.symbol,
+            trade.strategy,
+            trade.entry_price,
+            trade.qty,
+            trade.tp_price,
+            trade.sl_price,
+            trade.entry_signal,
+        )
+        return trade
+
+    def _fill_open_slots(self) -> None:
+        self._update_market_regime()
+        self._update_moonshot_gate()
+        self._update_fear_greed()
+        eligible_strategies = self._eligible_strategies()
+        if not eligible_strategies:
+            return
+        self.refresh_trade_calibration()
+        cycle_excluded = self._excluded_symbols()
+        active_config = replace(self.config, strategies=eligible_strategies)
+        threshold_overrides = self._threshold_overrides(eligible_strategies)
+        ticker_by_symbol: dict[str, float] = {}
+        total_equity = float(self._balance_snapshot().get("total_equity", 0.0) or 0.0)
+        try:
+            tickers = self.client.get_all_tickers()
+            ticker_by_symbol = {str(row["symbol"]): float(row["quoteVolume"]) for _, row in tickers.iterrows()}
+        except Exception:
+            ticker_by_symbol = {}
+        while len(self.open_trades) < self.config.max_open_positions:
+            available_balance = self._available_balance()
+            opportunity = find_best_opportunity(
+                self.client,
+                active_config,
+                exclude=cycle_excluded,
+                open_symbols=self._open_symbols(),
+                calibration=self.trade_calibration,
+                threshold_overrides=threshold_overrides,
+            )
+            if opportunity is None:
+                break
+            if not self._passes_liquidity_guard(opportunity, ticker_by_symbol=ticker_by_symbol):
+                cycle_excluded.add(opportunity.symbol)
+                continue
+            allocation_usdt = self._allocation_usdt_for_opportunity_with_equity(
+                opportunity,
+                available_balance=available_balance,
+                total_equity=total_equity or available_balance,
+            )
+            if allocation_usdt <= 0:
+                cycle_excluded.add(opportunity.symbol)
+                continue
+            trade = self.open_position(opportunity, allocation_usdt=allocation_usdt)
+            cycle_excluded.add(opportunity.symbol)
+            if trade is None:
+                continue
+            self.open_trades.append(trade)
+            self._send_open_alert(trade)
+            self._save_state()
+
+    def check_trade_action(self, trade: Trade, *, best_score: float = 0.0) -> dict[str, object]:
+        try:
+            ws_px = self._price_monitor.get_price(trade.symbol)
+            price = ws_px if ws_px is not None else self.client.get_price(trade.symbol)
+        except Exception as exc:
+            log.error("Price fetch error for %s: %s", trade.symbol, exc)
+            self._notify_once(
+                f"price-fetch:{trade.symbol}",
+                f"⚠️ <b>Price fetch failed</b> {trade.symbol}\n{str(exc)[:200]}",
+            )
+            return {"action": "hold", "reason": "", "price": None}
+        trade.last_price = price
+        exchange_tp_action = self._check_exchange_tp_order(trade, current_price=price)
+        if exchange_tp_action is not None:
+            return exchange_tp_action
+        state = _trade_state_payload(trade)
+        action = evaluate_trade_action(
+            state,
+            current_price=price,
+            current_time=datetime.now(timezone.utc),
+            best_score=best_score,
+        )
+        trade.highest_price = float(state.get("highest_price") or trade.highest_price or trade.entry_price)
+        trade.sl_price = float(state.get("sl_price") or trade.sl_price)
+        trade.breakeven_done = bool(state.get("breakeven_done", trade.breakeven_done))
+        trade.trail_active = bool(state.get("trail_active", trade.trail_active))
+        trade.trail_stop_price = state.get("trail_stop_price", trade.trail_stop_price)
+        trade.partial_tp_done = bool(state.get("partial_tp_done", trade.partial_tp_done))
+        trade.partial_tp_price = state.get("partial_tp_price", trade.partial_tp_price)
+        trade.partial_tp_ratio = state.get("partial_tp_ratio", trade.partial_tp_ratio)
+        trade.hard_floor_price = state.get("hard_floor_price", trade.hard_floor_price)
+        trade.atr_pct = float(state.get("atr_pct") or trade.atr_pct or 0.0) or None
+        if state.get("last_new_high_at") is not None:
+            trade.metadata["last_new_high_at"] = state.get("last_new_high_at")
+        pct = (price - trade.entry_price) / trade.entry_price * 100.0
+        if action["action"] == "exit":
+            resolved_price = float(action["price"] if action["price"] is not None else price)
+            log.info("Exit %s: %s [%s] | %+.2f%% | Price %.6f", action["reason"], trade.symbol, trade.strategy, pct, resolved_price)
+            return action
+        if action["action"] == "partial_exit":
+            resolved_price = float(action["price"] if action["price"] is not None else price)
+            log.info("Partial exit %s: %s [%s] | %+.2f%% | Price %.6f", action["reason"], trade.symbol, trade.strategy, pct, resolved_price)
+            return action
+        log.info(
+            "Holding %s [%s] | %+.2f%% | Price %.6f | Peak %.6f | SL %.6f",
+            trade.symbol,
+            trade.strategy,
+            pct,
+            price,
+            trade.highest_price or trade.entry_price,
+            trade.trail_stop_price or trade.sl_price,
+        )
+        return action
+
+    def close_position(self, trade: Trade, reason: str) -> dict | None:
+        price_hint = self._safe_price(trade.symbol, fallback=float(trade.last_price or trade.entry_price))
+        dust_closed = self._try_record_dust_close(trade, price=price_hint)
+        if dust_closed is not None:
+            return dust_closed
+
+        qty_before = float(trade.qty)
+        defensive_exit = reason.upper() in DEFENSIVE_EXIT_REASONS
+        if not self.config.paper_trade and trade.tp_order_id:
+            try:
+                self.client.cancel_order(trade.symbol, trade.tp_order_id)
+            except Exception as exc:
+                log.debug("TP cancel failed for %s before close: %s", trade.symbol, exc)
+            trade.tp_order_id = None
+        if not self.config.paper_trade and defensive_exit:
+            try:
+                self.client.cancel_all_orders(trade.symbol)
+                time.sleep(1.5)
+            except Exception as exc:
+                log.debug("Cancel-all failed for %s before close: %s", trade.symbol, exc)
+
+        last_execution = None
+        for attempt in range(CLOSE_RETRY_ATTEMPTS):
+            sell_qty = self._sellable_qty(trade)
+            if sell_qty <= 0:
+                remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
+                if remaining_notional < DUST_THRESHOLD or remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+                    self._record_activity(f"Verified close {trade.symbol} without sellable qty")
+                    return self._mark_trade_closed(
+                        trade,
+                        reason=reason,
+                        exit_price=price_hint,
+                        exit_qty=qty_before,
+                        net_proceeds=price_hint * qty_before,
+                        fee_quote_qty=0.0,
+                    )
+                break
+
+            try:
+                if not self.config.paper_trade and not defensive_exit:
+                    order = self.client.chase_limit_sell(trade.symbol, sell_qty)
+                    if order is None:
+                        raise RuntimeError("Chase limit sell did not fill")
+                else:
+                    order = self.client.place_order(trade.symbol, "SELL", sell_qty)
+                execution = self.client.resolve_order_execution(
+                    trade.symbol,
+                    "SELL",
+                    order,
+                    fallback_price=price_hint,
+                    fallback_qty=sell_qty,
+                )
+                last_execution = execution
+            except Exception as exc:
+                self._notify_once(
+                    f"sell-retry:{trade.symbol}",
+                    f"🚨 <b>Sell retry</b> {trade.strategy} {trade.symbol} | {attempt + 1}/{CLOSE_RETRY_ATTEMPTS} | {str(exc)[:120]}",
+                )
+                if attempt < CLOSE_RETRY_ATTEMPTS - 1:
+                    time.sleep(CLOSE_RETRY_DELAY_SECONDS * (attempt + 1))
+                continue
+
+            if self.config.paper_trade:
+                exit_qty = execution.executed_qty if execution.executed_qty > 0 else sell_qty
+                exit_price = execution.avg_price if execution.avg_price > 0 else price_hint
+                net_proceeds = execution.net_quote_qty if execution.gross_quote_qty > 0 else (exit_price * exit_qty - execution.fee_quote_qty)
+                return self._mark_trade_closed(
+                    trade,
+                    reason=reason,
+                    exit_price=exit_price,
+                    exit_qty=exit_qty,
+                    net_proceeds=net_proceeds,
+                    fee_quote_qty=execution.fee_quote_qty,
+                )
+
+            time.sleep(CLOSE_RETRY_DELAY_SECONDS)
+            remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
+            gross_quote_qty = execution.gross_quote_qty if execution.gross_quote_qty > 0 else ((execution.avg_price if execution.avg_price > 0 else price_hint) * execution.executed_qty)
+            fee_quote_qty = execution.fee_quote_qty
+            exit_price = execution.avg_price if execution.avg_price > 0 else price_hint
+            net_proceeds = execution.net_quote_qty if execution.gross_quote_qty > 0 else (exit_price * execution.executed_qty - execution.fee_quote_qty)
+
+            if not defensive_exit and 0 < execution.executed_qty < sell_qty and remaining_notional >= DUST_THRESHOLD:
+                self._record_activity(f"Chase partial {trade.symbol}; market fallback")
+                try:
+                    self.client.cancel_all_orders(trade.symbol)
+                    time.sleep(0.5)
+                except Exception as exc:
+                    log.debug("Cancel-all failed for %s after chase partial: %s", trade.symbol, exc)
+                fallback_qty = self._sellable_qty(trade)
+                if fallback_qty > 0:
+                    try:
+                        market_order = self.client.place_order(trade.symbol, "SELL", fallback_qty)
+                        market_execution = self.client.resolve_order_execution(
+                            trade.symbol,
+                            "SELL",
+                            market_order,
+                            fallback_price=price_hint,
+                            fallback_qty=fallback_qty,
+                        )
+                        time.sleep(CLOSE_RETRY_DELAY_SECONDS)
+                        remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
+                        market_gross_quote = market_execution.gross_quote_qty if market_execution.gross_quote_qty > 0 else ((market_execution.avg_price if market_execution.avg_price > 0 else price_hint) * market_execution.executed_qty)
+                        gross_quote_qty += market_gross_quote
+                        fee_quote_qty += market_execution.fee_quote_qty
+                        net_proceeds += market_execution.net_quote_qty if market_execution.gross_quote_qty > 0 else ((market_execution.avg_price if market_execution.avg_price > 0 else price_hint) * market_execution.executed_qty - market_execution.fee_quote_qty)
+                        total_executed = execution.executed_qty + market_execution.executed_qty
+                        exit_price = (gross_quote_qty / total_executed) if total_executed > 0 else price_hint
+                        last_execution = market_execution
+                    except Exception as exc:
+                        self._notify_once(
+                            f"sell-retry:{trade.symbol}",
+                            f"🚨 <b>Sell retry</b> {trade.strategy} {trade.symbol} | market fallback failed | {str(exc)[:120]}",
+                        )
+
+            if remaining_notional < DUST_THRESHOLD or remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+                total_proceeds = net_proceeds + max(0.0, remaining_notional)
+                self._record_activity(f"Verified close {trade.symbol} on attempt {attempt + 1}")
+                return self._mark_trade_closed(
+                    trade,
+                    reason=reason,
+                    exit_price=exit_price,
+                    exit_qty=qty_before,
+                    net_proceeds=total_proceeds,
+                    fee_quote_qty=fee_quote_qty,
+                )
+
+            self._notify_once(
+                f"sell-retry:{trade.symbol}",
+                f"🚨 <b>Sell retry</b> {trade.strategy} {trade.symbol} | {attempt + 1}/{CLOSE_RETRY_ATTEMPTS} | remaining {remaining_qty:.6f}",
+            )
+            if attempt < CLOSE_RETRY_ATTEMPTS - 1:
+                time.sleep(CLOSE_RETRY_DELAY_SECONDS * (attempt + 1))
+
+        remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
+        if remaining_notional < DUST_THRESHOLD or remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+            exit_price = float(getattr(last_execution, "avg_price", price_hint) or price_hint)
+            fee_quote_qty = float(getattr(last_execution, "fee_quote_qty", 0.0) or 0.0)
+            return self._mark_trade_closed(
+                trade,
+                reason=reason,
+                exit_price=exit_price,
+                exit_qty=qty_before,
+                net_proceeds=max(0.0, qty_before * price_hint),
+                fee_quote_qty=fee_quote_qty,
+            )
+
+        self._notify_once(
+            f"close-failed:{trade.symbol}",
+            f"🚨 <b>Close failed!</b> {trade.strategy} {trade.symbol}\n{reason} | {remaining_qty:.6f} (~${remaining_notional:.2f}) remaining",
+        )
+        log.error(
+            "Close verification failed for %s [%s] | reason=%s | remaining_qty=%.6f | remaining_notional=$%.2f",
+            trade.symbol,
+            trade.strategy,
+            reason,
+            remaining_qty,
+            remaining_notional,
+        )
+        return None
+
+    def partial_close_position(self, trade: Trade, reason: str, price: float, qty_ratio: float) -> dict | None:
+        requested_qty = round(trade.qty * qty_ratio, 12)
+        if requested_qty <= 0 or requested_qty >= trade.qty:
+            return None
+        sell_qty = self._sellable_qty(trade, requested_qty=requested_qty)
+        if sell_qty <= 0:
+            return None
+        qty_before = trade.qty
+        remaining_cost_before = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty))
+        order = self.client.place_order(trade.symbol, "SELL", sell_qty)
+        execution = self.client.resolve_order_execution(
+            trade.symbol,
+            "SELL",
+            order,
+            fallback_price=price,
+            fallback_qty=sell_qty,
+        )
+        qty_to_close = execution.executed_qty if execution.executed_qty > 0 else sell_qty
+        if qty_to_close <= 0 or qty_to_close >= qty_before:
+            return None
+        exit_price = execution.avg_price if execution.avg_price > 0 else price
+        net_proceeds = execution.net_quote_qty if execution.gross_quote_qty > 0 else (exit_price * qty_to_close - execution.fee_quote_qty)
+        entry_cost_alloc = remaining_cost_before * (qty_to_close / qty_before)
+        pnl_usdt = net_proceeds - entry_cost_alloc
+        pnl_pct = (pnl_usdt / entry_cost_alloc * 100.0) if entry_cost_alloc > 0 else 0.0
+        closed = {
+            "symbol": trade.symbol,
+            "strategy": trade.strategy,
+            "entry_price": trade.entry_price,
+            "qty": qty_to_close,
+            "entry_signal": trade.entry_signal,
+            "score": trade.score,
+            "opened_at": trade.opened_at.isoformat(),
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "pnl_pct": round(pnl_pct, 4),
+            "pnl_usdt": round(pnl_usdt, 4),
+            "entry_fee_usdt": round(float(trade.entry_fee_usdt or 0.0) * (qty_to_close / qty_before), 8),
+            "exit_fee_usdt": round(execution.fee_quote_qty, 8),
+            "is_partial": True,
+        }
+        trade.qty = round(trade.qty - qty_to_close, 12)
+        trade.remaining_cost_usdt = round(max(0.0, remaining_cost_before - entry_cost_alloc), 8)
+        self.trade_history.append(closed)
+        self._send_close_alert(closed, partial=True, remaining_qty=trade.qty)
+        self._log_summary()
+        self._save_state()
+        return closed
+
+    def _log_summary(self) -> None:
+        if not self.trade_history:
+            return
+        wins = [item for item in self.trade_history if float(item.get("pnl_pct", 0) or 0) > 0]
+        total = len(self.trade_history)
+        win_rate = len(wins) / total * 100.0
+        total_pnl = sum(float(item.get("pnl_usdt", 0) or 0) for item in self.trade_history)
+        log.info("Stats | Trades: %s | Win rate: %.0f%% | Total P&L: $%+.2f", total, win_rate, total_pnl)
+
+    def run(self) -> None:
+        mode = "PAPER TRADING" if self.config.paper_trade else "LIVE TRADING"
+        self.refresh_trade_calibration(force=True)
+        log.info("MEXC bot starting - %s", mode)
+        log.info(
+            "Budget: $%.2f | Max positions: %s | TP: %.2f%% | SL: %.2f%%",
+            self.config.trade_budget,
+            self.config.max_open_positions,
+            self.config.take_profit_pct * 100.0,
+            self.config.stop_loss_pct * 100.0,
+        )
+        self._flush_telegram_updates()
+        self._send_startup_message()
+        if not self.config.paper_trade:
+            self._price_monitor.start()
+
+        while True:
+            try:
+                self._handle_telegram_commands()
+                self._send_heartbeat()
+                self._maybe_convert_dust()
+                self._send_daily_summary()
+                self._send_weekly_summary()
+                self._update_ws_subscriptions()
+                self._fill_open_slots()
+                if not self.open_trades:
+                    if not self.config.paper_trade:
+                        self._reconcile_open_positions()
+                    log.info("No open positions. Retrying in %ss...", self.config.scan_interval)
+                    time.sleep(self.config.scan_interval)
+                    continue
+
+                closed_any = False
+                best_scalper_score = 0.0
+                eligible_strategies = self._eligible_strategies()
+                if any(trade.strategy == "SCALPER" for trade in self.open_trades) and "SCALPER" in eligible_strategies:
+                    try:
+                        rotation_config = replace(self.config, strategies=eligible_strategies)
+                        threshold_overrides = self._threshold_overrides(eligible_strategies)
+                        rotation_candidate = find_best_opportunity(
+                            self.client,
+                            rotation_config,
+                            exclude=self._excluded_symbols(),
+                            open_symbols=self._open_symbols(),
+                            calibration=self.trade_calibration,
+                            threshold_overrides=threshold_overrides,
+                        )
+                        if rotation_candidate is not None and rotation_candidate.strategy == "SCALPER":
+                            best_scalper_score = float(rotation_candidate.score)
+                    except Exception as exc:
+                        log.debug("Rotation rescore failed: %s", exc)
+
+                for trade in list(self.open_trades):
+                    action = self.check_trade_action(
+                        trade,
+                        best_score=best_scalper_score if trade.strategy == "SCALPER" else 0.0,
+                    )
+                    if action["action"] == "hold":
+                        continue
+                    if action["action"] == "exchange_closed":
+                        self.open_trades.remove(trade)
+                        self.recently_closed[trade.symbol] = time.time() + max(self.config.scan_interval, 60)
+                        closed_any = True
+                        self._save_state()
+                        continue
+                    if action["action"] == "partial_exit":
+                        self.partial_close_position(
+                            trade,
+                            str(action["reason"]),
+                            float(action["price"]),
+                            float(action.get("qty_ratio") or 0.0),
+                        )
+                        closed_any = True
+                        if trade.qty <= 0:
+                            self.open_trades.remove(trade)
+                            self.recently_closed[trade.symbol] = time.time() + max(self.config.scan_interval, 60)
+                        self._save_state()
+                        continue
+                    closed_trade = self.close_position(trade, str(action["reason"]))
+                    if closed_trade is not None:
+                        self.open_trades.remove(trade)
+                        self.recently_closed[trade.symbol] = time.time() + max(self.config.scan_interval, 60)
+                        closed_any = True
+                        self._save_state()
+
+                if closed_any:
+                    log.info("Portfolio updated after exits. Rescanning soon...")
+                    time.sleep(5)
+                else:
+                    if not self.config.paper_trade:
+                        self._reconcile_open_positions()
+                    time.sleep(self.config.price_check_interval)
+            except KeyboardInterrupt:
+                log.info("Stopped by user")
+                self._record_activity("Bot stopped by user")
+                self._notify_once("bot-stopped", "🛑 <b>Bot stopped.</b> Check runtime logs.", cooldown_seconds=1)
+                break
+            except Exception as exc:
+                log.error("Unexpected error: %s", exc, exc_info=True)
+                self._record_activity(f"Bot error: {str(exc)[:80]}")
+                self._notify_once("runtime-error", f"⚠️ <b>Bot error:</b> {str(exc)[:200]}\nRetrying in 30s.")
+                time.sleep(30)
+
+
+def run_bot() -> None:
+    config = LiveConfig.from_env()
+    client = MexcClient(config)
+    LiveBotRuntime(config, client).run()

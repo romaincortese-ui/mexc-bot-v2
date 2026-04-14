@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from mexcbot.config import env_float, env_int
+from mexcbot.indicators import calc_atr, calc_ema
+
+
+MATURITY_LOOKBACK = env_int("MATURITY_LOOKBACK", 12)
+MATURITY_THRESHOLD = env_float("MATURITY_THRESHOLD", 0.55)
+MATURITY_MOONSHOT_THRESHOLD = env_float("MATURITY_MOONSHOT_THRESHOLD", 0.68)
+KELTNER_SCORE_BONUS = env_float("KELTNER_SCORE_BONUS", 4.0)
+
+DYNAMIC_SL_ATR_MULT = env_float("DYNAMIC_SL_ATR_MULT", 1.0)
+DYNAMIC_SL_FLOOR = env_float("DYNAMIC_SL_FLOOR", 0.40)
+DYNAMIC_SL_CAP = env_float("DYNAMIC_SL_CAP", 0.40)
+
+
+def compute_dynamic_sl(atr_pct: float) -> float:
+    """Compute SL dynamically from per-trade ATR.
+
+    Wide enough to never trigger on normal moves, but proportional to
+    the coin's actual volatility so low-vol coins get tighter protection.
+    Configurable via env vars: DYNAMIC_SL_ATR_MULT, DYNAMIC_SL_FLOOR,
+    DYNAMIC_SL_CAP.
+    """
+    return max(DYNAMIC_SL_FLOOR, min(DYNAMIC_SL_CAP, atr_pct * DYNAMIC_SL_ATR_MULT))
+
+
+def calc_move_maturity(frame: pd.DataFrame, lookback: int) -> float:
+    if frame is None or frame.empty or len(frame) < max(lookback, 4):
+        return 0.0
+    close = frame["close"].astype(float)
+    start_price = float(close.iloc[-lookback])
+    end_price = float(close.iloc[-1])
+    if start_price <= 0 or end_price <= 0:
+        return 0.0
+    net_move = abs(end_price / start_price - 1.0)
+    if net_move <= 0:
+        return 0.0
+    path = close.pct_change().abs().tail(lookback - 1).sum()
+    if pd.isna(path) or path <= 0:
+        return 0.0
+    efficiency = min(1.0, net_move / float(path))
+    maturity = 1.0 - efficiency
+    return round(max(0.0, min(1.0, maturity)), 4)
+
+
+def maturity_penalty(maturity: float, score: float, threshold: float) -> float:
+    if maturity <= threshold:
+        return 0.0
+    excess = (maturity - threshold) / max(0.001, 1.0 - threshold)
+    max_penalty = max(4.0, min(16.0, score * 0.22))
+    return round(excess * max_penalty, 2)
+
+
+def classify_entry_signal(
+    *,
+    crossed_now: bool,
+    vol_ratio: float,
+    rsi: float,
+    crossover_vol_ratio: float = 1.5,
+    is_new: bool = False,
+    is_trending: bool = False,
+    label: str = "SCALPER",
+) -> str:
+    strategy = label.upper()
+    if strategy == "MOONSHOT":
+        if is_new:
+            return "NEW_LISTING"
+        if is_trending:
+            return "TRENDING_SOCIAL"
+        if crossed_now and vol_ratio >= crossover_vol_ratio:
+            return "MOMENTUM_BREAKOUT"
+        if rsi <= 55 and vol_ratio >= 1.4:
+            return "REBOUND_BURST"
+        return "TREND_CONTINUATION"
+
+    if crossed_now and vol_ratio >= crossover_vol_ratio:
+        return "CROSSOVER"
+    if rsi <= 48:
+        return "OVERSOLD"
+    return "TREND"
+
+
+def calc_vol_zscore(volume: pd.Series, window: int = 20) -> float:
+    if len(volume) < window:
+        return 0.0
+    baseline = volume.iloc[-window:-1]
+    if baseline.empty:
+        return 0.0
+    mean = float(baseline.mean())
+    std = float(baseline.std())
+    if std <= 0:
+        return 0.0
+    return float((float(volume.iloc[-1]) - mean) / std)
+
+
+def compute_bearish_regime(frame: pd.DataFrame, *, lookback: int, short_span: int = 21, long_span: int = 55) -> dict[str, float]:
+    if frame is None or frame.empty:
+        return {
+            "drawdown_pct": 0.0,
+            "bearish_close_ratio": 0.0,
+            "below_long_ema_ratio": 0.0,
+            "ema_gap_pct": 0.0,
+            "ema_slope_pct": 0.0,
+            "reclaim_pct": 0.0,
+            "trend_pressure": 0.0,
+        }
+
+    close = frame["close"].astype(float)
+    opens = frame["open"].astype(float) if "open" in frame.columns else close
+    lows = frame["low"].astype(float) if "low" in frame.columns else close
+    window = min(len(close), max(lookback, long_span + 2, short_span + 2))
+    recent_close = close.tail(window)
+    recent_open = opens.tail(window)
+    recent_low = lows.tail(window)
+
+    price_now = float(recent_close.iloc[-1]) if not recent_close.empty else 0.0
+    swing_high = float(recent_close.max()) if not recent_close.empty else 0.0
+    swing_low = float(recent_low.min()) if not recent_low.empty else 0.0
+    drawdown_pct = ((swing_high - price_now) / swing_high) if swing_high > 0 else 0.0
+    reclaim_pct = ((price_now - swing_low) / swing_low) if swing_low > 0 else 0.0
+
+    bearish_close_ratio = float((recent_close < recent_open).mean()) if not recent_close.empty else 0.0
+
+    ema_short = calc_ema(close, short_span)
+    ema_long = calc_ema(close, long_span)
+    ema_long_now = float(ema_long.iloc[-1]) if not ema_long.empty else 0.0
+    ema_short_now = float(ema_short.iloc[-1]) if not ema_short.empty else 0.0
+    ema_gap_pct = (ema_short_now / ema_long_now - 1.0) if ema_long_now > 0 else 0.0
+
+    ema_long_window = ema_long.tail(min(len(ema_long), max(lookback // 2, 6)))
+    ema_long_start = float(ema_long_window.iloc[0]) if not ema_long_window.empty else ema_long_now
+    ema_slope_pct = (ema_long_now / ema_long_start - 1.0) if ema_long_start > 0 else 0.0
+
+    below_long = 0.0
+    if not ema_long.empty and len(ema_long) >= len(recent_close):
+        aligned = ema_long.tail(len(recent_close))
+        below_long = float((recent_close.values < aligned.values).mean()) if len(aligned) else 0.0
+
+    trend_pressure = (
+        min(1.0, drawdown_pct / 0.12) * 0.35
+        + min(1.0, bearish_close_ratio / 0.70) * 0.20
+        + min(1.0, below_long / 0.85) * 0.25
+        + min(1.0, max(0.0, -ema_gap_pct) / 0.04) * 0.10
+        + min(1.0, max(0.0, -ema_slope_pct) / 0.03) * 0.10
+    )
+
+    return {
+        "drawdown_pct": round(drawdown_pct, 4),
+        "bearish_close_ratio": round(bearish_close_ratio, 4),
+        "below_long_ema_ratio": round(below_long, 4),
+        "ema_gap_pct": round(ema_gap_pct, 4),
+        "ema_slope_pct": round(ema_slope_pct, 4),
+        "reclaim_pct": round(reclaim_pct, 4),
+        "trend_pressure": round(min(1.0, max(0.0, trend_pressure)), 4),
+    }
+
+
+def keltner_breakout(frame: pd.DataFrame, ema_span: int = 20, atr_period: int = 10, atr_mult: float = 1.5) -> bool:
+    if frame is None or len(frame) < max(ema_span + 2, atr_period + 2):
+        return False
+    close = frame["close"].astype(float)
+    ema = calc_ema(close, ema_span)
+    atr = calc_atr(frame, atr_period)
+    if np.isnan(atr) or atr <= 0:
+        return False
+    upper_band = float(ema.iloc[-1]) + atr * atr_mult
+    previous_upper = float(ema.iloc[-2]) + atr * atr_mult
+    return float(close.iloc[-1]) > upper_band and float(close.iloc[-2]) <= previous_upper

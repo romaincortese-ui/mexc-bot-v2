@@ -1,0 +1,35 @@
+.env
+.env.*
+trades.log
+__pycache__/
+*.pyc
+*.py[cod]
+*.egg-info/
+.DS_Store
+Thumbs.db
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+.idea/
+backtest_cache/
+backtest_output/
+backtest_sweeps/
+runtime_state.json
+shared_budget_state.json
+gold_bot_runtime_status.json
+bullish_results.json
+FX-bot/
+Gold-bot/
+
+# Cached macro data
+backtest_macro/
+
+# Backtest output logs
+backtest_*.txt
+
+# Ad-hoc analysis scripts
+_*.py
+
+# Log files
+*.log
