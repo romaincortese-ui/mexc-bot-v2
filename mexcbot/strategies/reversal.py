@@ -324,9 +324,25 @@ def find_reversal_opportunity(
     excluded = {symbol.upper() for symbol in (exclude or set())}
     excluded.update(symbol.upper() for symbol in (open_symbols or set()))
 
+    symbols: list[str] = list(config.reversal_symbols or [])
+    if not symbols:
+        try:
+            tickers = client.get_all_tickers()
+            # Reversal looks for downtrends → focus on coins that dropped
+            tickers = tickers[tickers["quoteVolume"] >= config.min_volume_usdt]
+            tickers = tickers[tickers["priceChangePercent"] < 0]
+            symbols = (
+                tickers.sort_values("quoteVolume", ascending=False)
+                .head(config.candidate_limit)["symbol"]
+                .tolist()
+            )
+        except Exception as exc:
+            log.debug("REVERSAL dynamic universe failed: %s", exc)
+            return None
+
     best: Opportunity | None = None
-    for symbol in config.reversal_symbols:
-        if symbol in excluded:
+    for symbol in symbols:
+        if symbol.upper() in excluded:
             continue
         try:
             frame = client.get_klines(symbol, interval=REVERSAL_INTERVAL, limit=120)

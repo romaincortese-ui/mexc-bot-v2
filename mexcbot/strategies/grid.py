@@ -172,9 +172,26 @@ def find_grid_opportunity(
     excluded.update(symbol.upper() for symbol in (open_symbols or set()))
     params = _grid_params()
 
+    symbols: list[str] = list(config.grid_symbols or [])
+    if not symbols:
+        try:
+            tickers = client.get_all_tickers()
+            # Grid prefers sideways markets → filter by volume, prefer low abs change
+            tickers = tickers[tickers["quoteVolume"] >= config.min_volume_usdt]
+            tickers = tickers.assign(abs_change=tickers["priceChangePercent"].abs())
+            # Take low-volatility candidates first, then by volume
+            symbols = (
+                tickers.sort_values(["abs_change", "quoteVolume"], ascending=[True, False])
+                .head(config.candidate_limit)["symbol"]
+                .tolist()
+            )
+        except Exception as exc:
+            log.debug("GRID dynamic universe failed: %s", exc)
+            return None
+
     best: Opportunity | None = None
-    for symbol in config.grid_symbols:
-        if symbol in excluded:
+    for symbol in symbols:
+        if symbol.upper() in excluded:
             continue
         try:
             frame = client.get_klines(symbol, interval=GRID_INTERVAL, limit=80)
