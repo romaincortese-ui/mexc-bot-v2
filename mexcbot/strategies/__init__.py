@@ -57,24 +57,28 @@ def find_best_opportunity(
 			log.warning("Unknown strategy '%s' in MEXCBOT_STRATEGIES, skipping", strategy_name)
 			continue
 		strategy_threshold = threshold_overrides.get(resolved_name)
-		if resolved_name == "SCALPER":
-			candidate = find_scalper_opportunity(
-				client,
-				config,
-				exclude=excluded,
-				open_symbols=open_symbols or set(),
-				score_threshold=strategy_threshold,
-			)
-		elif resolved_name == "MOONSHOT":
-			candidate = find_moonshot_opportunity(
-				client,
-				config,
-				exclude=excluded,
-				open_symbols=open_symbols or set(),
-				score_threshold=strategy_threshold,
-			)
-		else:
-			candidate = finder(client, config, exclude=excluded, open_symbols=open_symbols or set())
+		try:
+			if resolved_name == "SCALPER":
+				candidate = find_scalper_opportunity(
+					client,
+					config,
+					exclude=excluded,
+					open_symbols=open_symbols or set(),
+					score_threshold=strategy_threshold,
+				)
+			elif resolved_name == "MOONSHOT":
+				candidate = find_moonshot_opportunity(
+					client,
+					config,
+					exclude=excluded,
+					open_symbols=open_symbols or set(),
+					score_threshold=strategy_threshold,
+				)
+			else:
+				candidate = finder(client, config, exclude=excluded, open_symbols=open_symbols or set())
+		except Exception as exc:
+			log.exception("[%s] Strategy finder raised exception: %s", resolved_name, exc)
+			continue
 		if candidate is not None:
 			base_threshold = max(
 				float(strategy_threshold if strategy_threshold is not None else config.score_threshold),

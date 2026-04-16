@@ -487,6 +487,7 @@ def find_moonshot_opportunity(
 
     tickers = client.get_all_tickers()
     if tickers.empty:
+        log.info("[MOONSHOT] Ticker fetch returned empty")
         return None
     universe = tickers.copy()
     params = _moonshot_params()
@@ -497,6 +498,13 @@ def find_moonshot_opportunity(
         universe = universe[universe["symbol"].isin(allowed)]
     universe = universe[~universe["symbol"].isin(excluded)]
     if universe.empty:
+        log.info(
+            "[MOONSHOT] Universe empty after filters (min_vol=%.0f, max_vol=%.0f, allowed=%s, excluded=%d)",
+            params["min_vol_usdt"],
+            max_vol_usdt,
+            ",".join(sorted(config.moonshot_symbols)) if config.moonshot_symbols else "ALL",
+            len(excluded),
+        )
         return None
 
     momentum_universe = universe[universe["priceChangePercent"] > 0]
@@ -505,7 +513,14 @@ def find_moonshot_opportunity(
     recent_listing_symbols = _recent_listing_symbols(client, recent_listing_pool)
     candidate_symbols = list(dict.fromkeys(list(recent_listing_symbols) + momentum_symbols))
     if not candidate_symbols:
+        log.info("[MOONSHOT] No candidate symbols (universe size=%d, momentum=%d)", len(universe), len(momentum_symbols))
         return None
+    log.info(
+        "[MOONSHOT] Evaluating %d candidates (threshold=%.1f): %s",
+        len(candidate_symbols),
+        params["min_score"] if score_threshold is None else float(score_threshold),
+        ", ".join(candidate_symbols[:10]) + ("..." if len(candidate_symbols) > 10 else ""),
+    )
 
     best: Opportunity | None = None
     resolved_threshold = params["min_score"] if score_threshold is None else float(score_threshold)
