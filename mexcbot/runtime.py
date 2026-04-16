@@ -779,16 +779,17 @@ class LiveBotRuntime:
                 timeout=30,
             )
             if not response.ok:
-                log.warning("/ask HTTP %s: %s", response.status_code, response.text[:200])
+                log.warning("/ask HTTP %s: %s", response.status_code, response.text[:500])
                 return ""
             payload = response.json()
         except Exception as exc:
-            log.warning("/ask failed: %s", exc)
+            log.warning("/ask request failed: %s: %s", type(exc).__name__, exc)
             return ""
 
         for block in payload.get("content", []):
             if isinstance(block, dict) and block.get("type") == "text":
                 return str(block.get("text") or "").strip()
+        log.warning("/ask returned no text block. payload=%s", str(payload)[:500])
         return ""
 
     # ── post-trade analysis (Haiku + web search) ──────────────────────
@@ -1372,12 +1373,17 @@ class LiveBotRuntime:
                     self._notify("🧠 <b>/ask</b> requires ANTHROPIC_API_KEY to be set.")
                 else:
                     self._notify("🧠 Thinking...")
-                    answer = self._ask_trade_assistant(question)
+                    try:
+                        answer = self._ask_trade_assistant(question)
+                    except Exception as exc:
+                        log.exception("/ask raised exception")
+                        self._notify(f"🧠 /ask error: {type(exc).__name__}: {str(exc)[:200]}")
+                        answer = ""
                     if answer:
                         self._record_activity(f"Ask answered: {question[:40]}")
                         self._notify(f"🧠 Ask: {question}\n━━━━━━━━━━━━━━━\n{answer}", parse_mode="")
-                    else:
-                        self._notify("🧠 Couldn't get an answer — check logs.")
+                    elif answer == "":
+                        self._notify("🧠 Empty response from Claude — check Railway logs for '/ask' warnings.")
             elif text == "/pause":
                 self._paused = True
                 self._record_activity("Manual pause enabled")

@@ -40,11 +40,11 @@ TRINITY_BREAKOUT_LOOKBACK = 48  # candles to define consolidation high
 TRINITY_MIN_BREAKOUT_PCT = 0.003  # price must be >= 0.3% above consolidation high
 
 # TP / SL
-TRINITY_TP_MIN = env_float("TRINITY_TP_MIN", 0.025)
-TRINITY_TP_MAX = env_float("TRINITY_TP_MAX", 0.050)
+TRINITY_TP_MIN = env_float("TRINITY_TP_MIN", 0.08)
+TRINITY_TP_MAX = env_float("TRINITY_TP_MAX", 0.12)
 TRINITY_TP_ATR_MULT = env_float("TRINITY_TP_ATR_MULT", 3.5)
-TRINITY_SL_MIN = env_float("TRINITY_SL_MIN", 0.008)
-TRINITY_SL_MAX = env_float("TRINITY_SL_MAX", 0.020)
+TRINITY_SL_MIN = env_float("TRINITY_SL_MIN", 0.03)
+TRINITY_SL_MAX = env_float("TRINITY_SL_MAX", 0.05)
 TRINITY_SL_ATR_MULT = env_float("TRINITY_SL_ATR_MULT", 2.5)
 
 TRINITY_MIN_SCORE = env_float("TRINITY_MIN_SCORE", 50.0)
@@ -163,10 +163,10 @@ def score_trinity_from_frame(
     tp_pct = max(TRINITY_TP_MIN, min(TRINITY_TP_MAX, atr_pct * TRINITY_TP_ATR_MULT))
     sl_pct = max(TRINITY_SL_MIN, min(TRINITY_SL_MAX, atr_pct * TRINITY_SL_ATR_MULT))
 
-    # SL anchored to EMA21 (swing support) — use EMA21 distance if it's tighter
+    # SL anchored to EMA21 (swing support) — only tighten if EMA21 distance > SL_MIN
     ema21_sl = (price_now - ema21_now) / price_now
-    if 0 < ema21_sl + 0.003 < sl_pct:
-        sl_pct = round(ema21_sl + 0.003, 6)  # just below EMA21
+    if ema21_sl + 0.005 > TRINITY_SL_MIN and ema21_sl + 0.005 < sl_pct:
+        sl_pct = round(ema21_sl + 0.005, 6)  # buffer below EMA21
         sl_pct = max(sl_pct, TRINITY_SL_MIN)
 
     return Opportunity(

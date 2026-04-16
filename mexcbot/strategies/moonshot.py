@@ -39,10 +39,10 @@ MOONSHOT_MOMENTUM_MIN_RETURN_PCT = 1.2
 MOONSHOT_MOMENTUM_MAX_RETURN_PCT = 2.0
 MOONSHOT_TREND_CONTINUATION_EXTRA_SCORE = 8.0
 MOONSHOT_TREND_CONTINUATION_MAX_MATURITY = 0.45
-MOONSHOT_TP_MIN = 0.040
+MOONSHOT_TP_MIN = env_float("MOONSHOT_TP_MIN", 0.10)
 MOONSHOT_TP_ATR_MULT = 3.5
 MOONSHOT_SL_ATR_MULT = 2.3
-MOONSHOT_SL_CAP = env_float("MOONSHOT_SL_CAP", 0.40)
+MOONSHOT_SL_CAP = env_float("MOONSHOT_SL_CAP", 0.08)
 MOONSHOT_TREND_MIN_VOL_RATIO = 1.50
 MOONSHOT_TREND_MIN_RSI_DELTA = 0.5
 MOONSHOT_TREND_MIN_VOL_ZSCORE = 0.3
@@ -182,7 +182,8 @@ def _moonshot_exit_profile(
 
 
 def _moonshot_social_enabled() -> bool:
-    return bool(env_str("ANTHROPIC_API_KEY", "")) and env_bool("WEB_SEARCH_ENABLED", False)
+    # Disabled: Anthropic API reserved for post-trade loss analysis only
+    return False
 
 
 def _parse_json_object(text: str) -> dict[str, object] | None:
@@ -367,7 +368,7 @@ def score_moonshot_from_frame(
     atr = calc_atr(frame, period=14)
     atr_pct = (atr / price_now) if not np.isnan(atr) and price_now > 0 else 0.012
     tp_pct = max(params["tp_min"], atr_pct * params["tp_atr_mult"])
-    sl_pct = min(MOONSHOT_SL_CAP, compute_dynamic_sl(atr_pct))
+    sl_pct = min(MOONSHOT_SL_CAP, max(0.03, atr_pct * MOONSHOT_SL_ATR_MULT))
 
     entry_signal = classify_entry_signal(
         crossed_now=crossed_up,
