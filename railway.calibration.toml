@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python -m backtest.run_daily_calibration"
+cronSchedule = "0 4 * * *"
+restartPolicyType = "NEVER"
