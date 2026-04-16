@@ -75,7 +75,12 @@ class MexcClient:
             headers={"X-MEXC-APIKEY": self.config.api_key},
             timeout=10,
         )
-        response.raise_for_status()
+        if not response.ok:
+            body = response.text[:500] if response.text else ""
+            raise requests.HTTPError(
+                f"{response.status_code} {response.reason} for {path} | body={body}",
+                response=response,
+            )
         return response.json()
 
     def private_delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -230,7 +235,16 @@ class MexcClient:
         try:
             return self.place_order(symbol, "BUY", qty, "MARKET")
         except Exception as exc:
-            log.error("BUY rejected for %s: %s", symbol, exc)
+            # Try to fetch notional for diagnostic purposes
+            try:
+                last_price = float(self.get_price(symbol))
+                notional = qty * last_price
+                log.error(
+                    "BUY rejected for %s: qty=%s notional≈$%.2f | %s",
+                    symbol, qty, notional, exc,
+                )
+            except Exception:
+                log.error("BUY rejected for %s: qty=%s | %s", symbol, qty, exc)
             return None
 
     def place_limit_sell(self, symbol: str, qty: float, price: float, *, maker: bool | None = None) -> str | None:
