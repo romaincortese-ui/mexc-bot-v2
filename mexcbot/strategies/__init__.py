@@ -81,8 +81,26 @@ def find_best_opportunity(
 				float(STRATEGY_MIN_SCORES.get(resolved_name) or config.score_threshold),
 			)
 			candidate = apply_opportunity_calibration(candidate, calibration, base_threshold=base_threshold)
+		if candidate is None:
+			log.info("[%s] No opportunity found this scan", resolved_name)
+		else:
+			log.info(
+				"[%s] Candidate: %s score=%.2f signal=%s price=%.6f",
+				resolved_name,
+				candidate.symbol,
+				candidate.score,
+				candidate.entry_signal,
+				candidate.price,
+			)
 		if candidate is not None and (best is None or candidate.score > best.score):
 			best = candidate
+	if best is not None:
+		log.info(
+			"[SCAN] Best overall: %s [%s] score=%.2f",
+			best.symbol,
+			best.strategy,
+			best.score,
+		)
 	return best
 
 

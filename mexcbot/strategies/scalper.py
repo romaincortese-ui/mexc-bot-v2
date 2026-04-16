@@ -579,19 +579,43 @@ def find_scalper_opportunity(
             log.debug("Error scoring %s: %s", symbol, exc)
 
     if not scored_candidates:
+        log.info(
+            "[SCALPER] No candidates scored above threshold %.1f (scanned %d symbols: %s)",
+            resolved_threshold,
+            len(candidate_symbols),
+            ", ".join(candidate_symbols[:15]) + ("..." if len(candidate_symbols) > 15 else ""),
+        )
         log.info("No strong signals found this scan.")
         return None
 
     scored_candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+    top_preview = ", ".join(
+        f"{c.symbol}:{c.score:.1f}(RSI{c.rsi:.0f},V{c.vol_ratio:.1f}x)"
+        for c in scored_candidates[:5]
+    )
+    log.info(
+        "[SCALPER] Scored %d/%d candidates above threshold %.1f. Top 5: %s",
+        len(scored_candidates),
+        len(candidate_symbols),
+        resolved_threshold,
+        top_preview,
+    )
     watchlist_size = env_int("SCALPER_WATCHLIST_SIZE", SCALPER_WATCHLIST_SIZE)
     rescore_limit = env_int("SCALPER_RESCORE_LIMIT", SCALPER_RESCORE_LIMIT)
     shortlisted = scored_candidates[:watchlist_size]
+    pre_corr_count = len(shortlisted)
     shortlisted = _filter_correlated_candidates(
         client,
         shortlisted[: max(config.candidate_limit, rescore_limit)],
         open_symbols or set(),
         score_threshold=resolved_threshold,
     )
+    if pre_corr_count != len(shortlisted):
+        log.info(
+            "[SCALPER] Correlation filter: %d -> %d candidates",
+            pre_corr_count,
+            len(shortlisted),
+        )
     best = shortlisted[0] if shortlisted else None
 
     if best is not None:
@@ -604,6 +628,10 @@ def find_scalper_opportunity(
             best.price,
         )
     else:
+        log.info(
+            "[SCALPER] All %d scored candidates rejected by correlation filter",
+            len(scored_candidates),
+        )
         log.info("No strong signals found this scan.")
     return best
 
