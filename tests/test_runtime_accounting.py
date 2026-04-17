@@ -295,6 +295,36 @@ def test_build_status_message_refreshes_fear_and_greed(monkeypatch):
     message = runtime._build_status_message()
 
     assert "F&G 😰21" in message
+    assert "Moonshot: disabled | Gate ✅ open" in message
+
+
+def test_build_status_message_shows_moonshot_fng_block(monkeypatch):
+    monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 21)
+
+    runtime = LiveBotRuntime(_config(strategies=["MOONSHOT"]), StubClient())
+    message = runtime._build_status_message()
+
+    assert "Moonshot: ⛔ F&G blocked (21) | Gate ✅ open" in message
+
+
+def test_build_status_message_includes_btc_trend_windows(monkeypatch):
+    monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 55)
+
+    client = StubClient()
+    client.btc_frame = pd.DataFrame(
+        {
+            "open": [100.0 + index for index in range(120)],
+            "high": [101.0 + index for index in range(120)],
+            "low": [99.0 + index for index in range(120)],
+            "close": [100.0 + index for index in range(120)],
+            "volume": [1000.0] * 120,
+        }
+    )
+    runtime = LiveBotRuntime(_config(), client)
+
+    message = runtime._build_status_message()
+
+    assert "BTC: 1h ▲+0.46% | 24h ▲+12.31%" in message
 
 
 def test_available_balance_uses_free_usdt_not_total_equity():

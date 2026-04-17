@@ -331,6 +331,38 @@ class LiveBotRuntime:
             return f"\U0001f600{fng}"
         return f"\U0001f911{fng}"
 
+    def _moonshot_status_label(self) -> str:
+        if "MOONSHOT" not in {strategy.upper() for strategy in self.config.strategies}:
+            return "disabled"
+        if not self._moonshot_gate_open:
+            return "⛔ BTC gate closed"
+        if (
+            self.config.fear_greed_bear_block_moonshot
+            and self._fear_greed_index is not None
+            and self._fear_greed_index <= self.config.fear_greed_bear_threshold
+        ):
+            return f"⛔ F&G blocked ({self._fear_greed_index})"
+        return "✅ tradable"
+
+    def _btc_trend_line(self) -> str:
+        try:
+            frame = self.client.get_klines("BTCUSDT", interval="1h", limit=120)
+        except Exception:
+            return "BTC: n/a"
+        if frame is None or len(frame) < 25 or "close" not in frame:
+            return "BTC: n/a"
+        close = frame["close"].astype(float)
+        latest = float(close.iloc[-1])
+        prior_1h = float(close.iloc[-2]) if len(close) >= 2 else 0.0
+        prior_24h = float(close.iloc[-25]) if len(close) >= 25 else 0.0
+        if latest <= 0 or prior_1h <= 0 or prior_24h <= 0:
+            return "BTC: n/a"
+        change_1h = latest / prior_1h - 1.0
+        change_24h = latest / prior_24h - 1.0
+        icon_1h = "▲" if change_1h >= 0 else "▼"
+        icon_24h = "▲" if change_24h >= 0 else "▼"
+        return f"BTC: 1h {icon_1h}{change_1h:+.2%} | 24h {icon_24h}{change_24h:+.2%}"
+
     def _update_fear_greed(self) -> None:
         value = fetch_fear_and_greed()
         if value is not None:
@@ -943,7 +975,8 @@ class LiveBotRuntime:
             f"📋 <b>Status</b> [{self._mode_label()}]",
             "━━━━━━━━━━━━━━━",
             f"Market: <b>{self._market_regime_label()}</b> (×{self._market_regime_mult:.2f}) | F&G {self._fng_label()}",
-            f"Moonshot gate: {'✅ open' if self._moonshot_gate_open else '⛔ closed'} | Paused: {'yes' if self._paused else 'no'}",
+            self._btc_trend_line(),
+            f"Moonshot: {self._moonshot_status_label()} | Gate {'✅ open' if self._moonshot_gate_open else '⛔ closed'} | Paused: {'yes' if self._paused else 'no'}",
             f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b> | Session: <b>${snapshot['session_pnl']:+.2f}</b>",
             "━━━━━━━━━━━━━━━",
         ]
