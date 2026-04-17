@@ -204,7 +204,7 @@ class LiveConfig:
             regime_tighten_mult=env_float("REGIME_TIGHTEN_MULT", 1.15),
             regime_loosen_mult=env_float("REGIME_LOOSEN_MULT", 0.92),
             regime_trend_mult=env_float("REGIME_TREND_MULT", 0.92),
-            fear_greed_bear_threshold=env_int("FG_BEAR_THRESHOLD", 30),
+            fear_greed_bear_threshold=env_int("FG_BEAR_THRESHOLD", 15),
             fear_greed_extreme_fear_threshold=env_int("FG_EXTREME_FEAR_THRESHOLD", 20),
             fear_greed_extreme_fear_mult=env_float("FG_EXTREME_FEAR_MULT", 1.40),
             fear_greed_bear_block_moonshot=env_bool("FG_BEAR_BLOCK_MOONSHOT", True),

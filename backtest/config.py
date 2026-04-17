@@ -127,7 +127,7 @@ class BacktestConfig:
     calibration_min_symbol_trades: int = 8
     moonshot_btc_ema_gate: float = -0.02
     moonshot_btc_gate_reopen: float = -0.01
-    fear_greed_bear_threshold: int = 30
+    fear_greed_bear_threshold: int = 15
     fear_greed_extreme_fear_threshold: int = 20
     fear_greed_extreme_fear_mult: float = 1.40
     fear_greed_bear_block_moonshot: bool = True
@@ -223,7 +223,7 @@ class BacktestConfig:
             calibration_min_symbol_trades=env_int("MEXCBOT_CALIBRATION_MIN_SYMBOL_TRADES", 8),
             moonshot_btc_ema_gate=env_float("MOONSHOT_BTC_EMA_GATE", -0.02),
             moonshot_btc_gate_reopen=env_float("MOONSHOT_BTC_GATE_REOPEN", -0.01),
-            fear_greed_bear_threshold=env_int("FG_BEAR_THRESHOLD", 30),
+            fear_greed_bear_threshold=env_int("FG_BEAR_THRESHOLD", 15),
             fear_greed_extreme_fear_threshold=env_int("FG_EXTREME_FEAR_THRESHOLD", 20),
             fear_greed_extreme_fear_mult=env_float("FG_EXTREME_FEAR_MULT", 1.40),
             fear_greed_bear_block_moonshot=env_bool("FG_BEAR_BLOCK_MOONSHOT", True),

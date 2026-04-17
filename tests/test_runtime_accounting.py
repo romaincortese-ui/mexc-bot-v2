@@ -247,7 +247,7 @@ def _config(**overrides) -> LiveConfig:
         regime_tighten_mult=1.15,
         regime_loosen_mult=0.92,
         regime_trend_mult=0.92,
-        fear_greed_bear_threshold=30,
+        fear_greed_bear_threshold=15,
         fear_greed_extreme_fear_threshold=20,
         fear_greed_extreme_fear_mult=1.4,
         fear_greed_bear_block_moonshot=True,
@@ -298,13 +298,13 @@ def test_build_status_message_refreshes_fear_and_greed(monkeypatch):
     assert "Moonshot: disabled | Gate ✅ open" in message
 
 
-def test_build_status_message_shows_moonshot_fng_block(monkeypatch):
+def test_build_status_message_shows_moonshot_allowed_above_fng_block(monkeypatch):
     monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 21)
 
     runtime = LiveBotRuntime(_config(strategies=["MOONSHOT"]), StubClient())
     message = runtime._build_status_message()
 
-    assert "Moonshot: ⛔ F&G blocked (21) | Gate ✅ open" in message
+    assert "Moonshot: ✅ tradable | Gate ✅ open" in message
 
 
 def test_build_status_message_includes_btc_trend_windows(monkeypatch):

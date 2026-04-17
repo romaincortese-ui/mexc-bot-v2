@@ -46,7 +46,7 @@ def test_build_run_summary_includes_effective_window_and_runtime_settings():
         "calibration_redis_key": "mexc_trade_calibration",
         "moonshot_btc_ema_gate": -0.02,
         "moonshot_btc_gate_reopen": -0.01,
-        "fear_greed_bear_threshold": 30,
+        "fear_greed_bear_threshold": 15,
         "fear_greed_extreme_fear_threshold": 20,
         "fear_greed_extreme_fear_mult": 1.4,
     }
