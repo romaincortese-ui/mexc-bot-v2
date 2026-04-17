@@ -1464,6 +1464,16 @@ class LiveBotRuntime:
             f"TP {trade.tp_price:.6f} | SL {trade.sl_price:.6f}"
         )
 
+    def _send_buy_failure_alert(self, opportunity: Opportunity, *, requested_qty: float, allocation_usdt: float) -> None:
+        error_text = str(getattr(self.client, "last_buy_error", "") or "buy order returned no result")[:250]
+        self._record_activity(f"BUY FAIL {opportunity.strategy} {opportunity.symbol} {error_text[:80]}")
+        self._notify(
+            f"⚠️ <b>Buy attempt failed</b> {opportunity.symbol}\n"
+            f"Strategy {opportunity.strategy} | Signal {opportunity.entry_signal} | Score {float(opportunity.score):.2f}\n"
+            f"Qty {requested_qty:.6f} | Budget ${allocation_usdt:.2f}\n"
+            f"Reason: {error_text}"
+        )
+
     def _send_close_alert(self, closed: dict, *, partial: bool = False, remaining_qty: float | None = None) -> None:
         prefix = "Partial" if partial else "Closed"
         remainder = f"\nRemaining qty {remaining_qty:.6f}" if partial and remaining_qty is not None else ""
@@ -2171,6 +2181,7 @@ class LiveBotRuntime:
         use_maker = opportunity.strategy != "REVERSAL"
         order = self.client.place_buy_order(opportunity.symbol, requested_qty, use_maker=use_maker)
         if order is None:
+            self._send_buy_failure_alert(opportunity, requested_qty=requested_qty, allocation_usdt=allocation_usdt)
             return None
         execution = self.client.resolve_order_execution(
             opportunity.symbol,

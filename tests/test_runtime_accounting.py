@@ -20,6 +20,8 @@ class StubClient:
         self.config = type("Config", (), {"paper_trade": False})()
         self.account_snapshot = {"free_usdt": 100.0, "total_equity": 130.0}
         self.sellable_qty = 10.0
+        self.last_buy_error = ""
+        self.buy_order_result = None
         self.asset_balance = 0.0
         self.asset_balance_sequence = []
         self.order_status_by_id = {}
@@ -106,6 +108,10 @@ class StubClient:
 
     def place_buy_order(self, symbol: str, qty: float, *, use_maker: bool | None = None):
         self.buy_order_calls.append((symbol, qty, use_maker))
+        if self.buy_order_result is None and self.last_buy_error:
+            return None
+        if self.buy_order_result is not None:
+            return self.buy_order_result
         return self.place_order(symbol, "BUY", qty)
 
     def place_limit_sell(self, symbol: str, qty: float, price: float, *, maker: bool | None = None):
@@ -425,6 +431,18 @@ def test_handle_telegram_approve_command_applies_supported_suggestion():
     assert runtime.config.moonshot_min_score == 26.5
     assert runtime._approved_review_overrides["MOONSHOT_MIN_SCORE"]["value"] == "26.5"
     assert any("Applied MOONSHOT_MIN_SCORE" in text for text, _mode in runtime.telegram.sent_messages)
+
+
+def test_open_position_notifies_on_buy_failure():
+    client = StubClient()
+    client.last_buy_error = 'qty=10.0 notional≈$6.70 | 400 Bad Request for /api/v3/order | body={"code":700002,"msg":"Signature for this request is not valid."}'
+    runtime = LiveBotRuntime(_config(), client)
+    runtime.telegram = StubTelegram()
+
+    trade = runtime.open_position(_opportunity(symbol="SPACEUSDT"), allocation_usdt=100.0)
+
+    assert trade is None
+    assert any("Buy attempt failed" in text and "SPACEUSDT" in text and "Signature for this request is not valid" in text for text, _mode in runtime.telegram.sent_messages)
 
 
 def test_build_status_message_uses_cached_btc_trend_when_refresh_fails(monkeypatch):

@@ -44,6 +44,7 @@ class MexcClient:
         self.config = config
         self.session = requests.Session()
         self._account_snapshot_cache = {"at": 0.0, "free_usdt": 0.0, "total_equity": 0.0}
+        self.last_buy_error = ""
 
     def _canonical_private_items(self, params: dict[str, Any] | None = None) -> list[tuple[str, str]]:
         payload = [(str(key), str(value)) for key, value in (params or {}).items() if value is not None]
@@ -224,6 +225,7 @@ class MexcClient:
 
     def place_buy_order(self, symbol: str, qty: float, *, use_maker: bool | None = None) -> dict[str, Any] | None:
         maker_enabled = USE_MAKER_ORDERS if use_maker is None else use_maker
+        self.last_buy_error = ""
         if self.config.paper_trade:
             return self.place_order(symbol, "BUY", qty, "MARKET")
 
@@ -260,17 +262,21 @@ class MexcClient:
                 log.debug("Maker buy failed for %s: %s", symbol, exc)
 
         try:
-            return self.place_order(symbol, "BUY", qty, "MARKET")
+            order = self.place_order(symbol, "BUY", qty, "MARKET")
+            self.last_buy_error = ""
+            return order
         except Exception as exc:
             # Try to fetch notional for diagnostic purposes
             try:
                 last_price = float(self.get_price(symbol))
                 notional = qty * last_price
+                self.last_buy_error = f"qty={qty} notional≈${notional:.2f} | {exc}"
                 log.error(
                     "BUY rejected for %s: qty=%s notional≈$%.2f | %s",
                     symbol, qty, notional, exc,
                 )
             except Exception:
+                self.last_buy_error = f"qty={qty} | {exc}"
                 log.error("BUY rejected for %s: qty=%s | %s", symbol, qty, exc)
             return None
 
