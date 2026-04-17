@@ -1,6 +1,8 @@
+from types import SimpleNamespace
+
 import pandas as pd
 
-from mexcbot.strategies.grid import score_grid_from_frame
+from mexcbot.strategies.grid import _build_grid_universe, _grid_params, score_grid_from_frame
 
 
 def test_score_grid_from_frame_returns_mean_reversion_setup():
@@ -30,3 +32,30 @@ def test_score_grid_from_frame_returns_mean_reversion_setup():
     assert result.strategy == "GRID"
     assert result.entry_signal == "GRID_MEAN_REVERT"
     assert result.tp_pct is not None and result.tp_pct > result.sl_pct > 0
+
+
+def test_build_grid_universe_excludes_proxy_assets_and_uses_universe_limit(monkeypatch):
+    monkeypatch.setenv("GRID_UNIVERSE_MIN_ABS_CHANGE_PCT", "0.003")
+    monkeypatch.setenv("GRID_UNIVERSE_MAX_ABS_CHANGE_PCT", "0.08")
+
+    tickers = pd.DataFrame(
+        {
+            "symbol": [
+                "USDCUSDT",
+                "BTCUSDT",
+                "ETHUSDT",
+                "SOLUSDT",
+                "GOLD(PAXG)USDT",
+                "USD1USDT",
+                "DOGEUSDT",
+                "PEPEUSDT",
+            ],
+            "quoteVolume": [50_000_000, 20_000_000, 18_000_000, 12_000_000, 11_000_000, 10_000_000, 9_000_000, 8_000_000],
+            "priceChangePercent": [0.0001, 0.006, 0.009, 0.025, 0.004, 0.0002, 0.11, 0.002],
+        }
+    )
+    config = SimpleNamespace(min_volume_usdt=500_000.0, candidate_limit=1, universe_limit=3)
+
+    symbols = _build_grid_universe(tickers, config, _grid_params())
+
+    assert symbols == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]

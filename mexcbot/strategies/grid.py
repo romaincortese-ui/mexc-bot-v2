@@ -32,6 +32,23 @@ GRID_SL_CAP = env_float("GRID_SL_CAP", 0.40)
 GRID_SL_MAX = 0.016
 GRID_MIN_SCORE = 55.0
 GRID_SPREAD_MAX = 0.002
+GRID_UNIVERSE_MIN_ABS_CHANGE_PCT = 0.003
+GRID_UNIVERSE_MAX_ABS_CHANGE_PCT = 0.08
+
+GRID_EXCLUDED_BASE_ASSETS = {
+    "EUR",
+    "EURC",
+    "FDUSD",
+    "PAXG",
+    "TUSD",
+    "USDC",
+    "USDE",
+    "USDP",
+    "USD1",
+    "WBTC",
+    "WETH",
+    "XAUT",
+}
 
 
 def _grid_params() -> dict[str, float]:
@@ -51,7 +68,41 @@ def _grid_params() -> dict[str, float]:
         "sl_max": env_float("GRID_SL_MAX", GRID_SL_MAX),
         "min_score": env_float("GRID_MIN_SCORE", GRID_MIN_SCORE),
         "spread_max": env_float("GRID_SPREAD_MAX", GRID_SPREAD_MAX),
+        "universe_min_abs_change_pct": env_float("GRID_UNIVERSE_MIN_ABS_CHANGE_PCT", GRID_UNIVERSE_MIN_ABS_CHANGE_PCT),
+        "universe_max_abs_change_pct": env_float("GRID_UNIVERSE_MAX_ABS_CHANGE_PCT", GRID_UNIVERSE_MAX_ABS_CHANGE_PCT),
     }
+
+
+def _grid_base_asset(symbol: str) -> str:
+    upper_symbol = symbol.upper()
+    return upper_symbol[:-4] if upper_symbol.endswith("USDT") else upper_symbol
+
+
+def _is_grid_tradeable_symbol(symbol: str) -> bool:
+    base_asset = _grid_base_asset(symbol)
+    if not base_asset or "(" in base_asset or ")" in base_asset:
+        return False
+    return base_asset not in GRID_EXCLUDED_BASE_ASSETS
+
+
+def _build_grid_universe(tickers: pd.DataFrame, config: LiveConfig, params: dict[str, float]) -> list[str]:
+    if tickers is None or tickers.empty:
+        return []
+
+    eligible = tickers[tickers["quoteVolume"] >= config.min_volume_usdt].copy()
+    eligible = eligible[eligible["symbol"].map(_is_grid_tradeable_symbol)]
+    if eligible.empty:
+        return []
+
+    eligible = eligible.assign(abs_change=eligible["priceChangePercent"].abs())
+    min_abs_change = max(0.0, float(params["universe_min_abs_change_pct"]))
+    max_abs_change = max(min_abs_change, float(params["universe_max_abs_change_pct"]))
+    ranged = eligible[(eligible["abs_change"] >= min_abs_change) & (eligible["abs_change"] <= max_abs_change)]
+    if ranged.empty:
+        ranged = eligible
+
+    ranked = ranged.sort_values(["quoteVolume", "abs_change"], ascending=[False, True])
+    return ranked.head(config.universe_limit)["symbol"].tolist()
 
 
 def score_grid_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: float = GRID_MIN_SCORE) -> Opportunity | None:
@@ -176,15 +227,9 @@ def find_grid_opportunity(
     if not symbols:
         try:
             tickers = client.get_all_tickers()
-            # Grid prefers sideways markets → filter by volume, prefer low abs change
-            tickers = tickers[tickers["quoteVolume"] >= config.min_volume_usdt]
-            tickers = tickers.assign(abs_change=tickers["priceChangePercent"].abs())
-            # Take low-volatility candidates first, then by volume
-            symbols = (
-                tickers.sort_values(["abs_change", "quoteVolume"], ascending=[True, False])
-                .head(config.candidate_limit)["symbol"]
-                .tolist()
-            )
+            symbols = _build_grid_universe(tickers, config, params)
+            if symbols:
+                log.debug("[GRID] dynamic universe=%s", ", ".join(symbols[:12]))
         except Exception as exc:
             log.debug("GRID dynamic universe failed: %s", exc)
             return None
