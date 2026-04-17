@@ -937,6 +937,7 @@ class LiveBotRuntime:
         return (last_price - trade.entry_price) / trade.entry_price * 100.0
 
     def _build_status_message(self) -> str:
+        self._update_fear_greed()
         snapshot = self._balance_snapshot()
         lines = [
             f"📋 <b>Status</b> [{self._mode_label()}]",

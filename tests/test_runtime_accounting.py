@@ -2,6 +2,7 @@ import pandas as pd
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import mexcbot.runtime as runtime_module
 
 from mexcbot.config import LiveConfig
 from mexcbot.models import Trade
@@ -285,6 +286,15 @@ def test_close_position_uses_fill_notional_instead_of_ticker_snapshot():
     assert closed["exit_fee_usdt"] == 0.095
     assert round(closed["pnl_usdt"], 4) == -5.195
     assert round(closed["pnl_pct"], 4) == round((-5.195 / 100.1) * 100.0, 4)
+
+
+def test_build_status_message_refreshes_fear_and_greed(monkeypatch):
+    monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 21)
+
+    runtime = LiveBotRuntime(_config(), StubClient())
+    message = runtime._build_status_message()
+
+    assert "F&G 😰21" in message
 
 
 def test_available_balance_uses_free_usdt_not_total_equity():
