@@ -5,6 +5,7 @@ import json
 import logging
 import logging.handlers
 import math
+import os
 from pathlib import Path
 import threading
 import time
@@ -16,6 +17,7 @@ import requests
 
 from mexcbot.calibration import load_trade_calibration, validate_trade_calibration_payload
 from mexcbot.config import LiveConfig, env_bool, env_float, env_int
+from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
 from mexcbot.exchange import MexcClient
 from mexcbot.exits import evaluate_trade_action
 from mexcbot.indicators import calc_ema
@@ -63,6 +65,15 @@ DEFENSIVE_EXIT_REASONS = {
     "PROTECT_STOP",
     "MANUAL_CLOSE",
     "EMERGENCY_CLOSE",
+}
+REVIEW_RUNTIME_OVERRIDE_SPECS: dict[str, dict[str, object]] = {
+    "SCALPER_THRESHOLD": {"attr": "scalper_threshold", "type": "float", "min": 0.0, "max": 100.0},
+    "SCALPER_BUDGET_PCT": {"attr": "scalper_budget_pct", "type": "float", "min": 0.01, "max": 1.0},
+    "MOONSHOT_MIN_SCORE": {"attr": "moonshot_min_score", "type": "float", "min": 0.0, "max": 100.0},
+    "MOONSHOT_BUDGET_PCT": {"attr": "moonshot_budget_pct", "type": "float", "min": 0.005, "max": 1.0},
+    "GRID_BUDGET_PCT": {"attr": "grid_budget_pct", "type": "float", "min": 0.01, "max": 1.0},
+    "FG_BEAR_THRESHOLD": {"attr": "fear_greed_bear_threshold", "type": "int", "min": 0, "max": 100},
+    "MOONSHOT_BTC_EMA_GATE": {"attr": "moonshot_btc_ema_gate", "type": "float", "min": -0.20, "max": 0.05},
 }
 
 
@@ -147,7 +158,9 @@ class LiveBotRuntime:
         self.liquidity_blacklist: dict[str, float] = {}
         self.liquidity_fail_count: dict[str, int] = {}
         self.trade_calibration: dict = {}
+        self.daily_review: dict = {}
         self._last_calibration_refresh_at = 0.0
+        self._last_daily_review_refresh_at = 0.0
         self._win_rate_pause_until = 0.0
         self._consecutive_losses = 0
         self._streak_paused_at = 0.0
@@ -171,6 +184,8 @@ class LiveBotRuntime:
         self._daily_anchor_equity: float | None = None
         self._daily_anchor_date = ""
         self._btc_1h_frame_cache: pd.DataFrame | None = None
+        self._last_daily_review_notified_at = ""
+        self._approved_review_overrides: dict[str, dict[str, object]] = {}
         self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
         self._telegram_alert_timestamps: dict[str, float] = {}
         self._state_path = Path(self.config.state_file) if self.config.state_file else None
@@ -204,6 +219,7 @@ class LiveBotRuntime:
             "session_anchor_equity": self._session_anchor_equity,
             "daily_anchor_equity": self._daily_anchor_equity,
             "daily_anchor_date": self._daily_anchor_date,
+            "approved_review_overrides": dict(self._approved_review_overrides),
             "recent_activity": list(self._recent_activity),
         }
 
@@ -256,6 +272,9 @@ class LiveBotRuntime:
             self._session_anchor_equity = payload.get("session_anchor_equity")
             self._daily_anchor_equity = payload.get("daily_anchor_equity")
             self._daily_anchor_date = str(payload.get("daily_anchor_date", "") or "")
+            self._approved_review_overrides = {
+                str(key): dict(value) for key, value in dict(payload.get("approved_review_overrides", {})).items()
+            }
             self._recent_activity = deque((str(item) for item in payload.get("recent_activity", [])), maxlen=RECENT_ACTIVITY_LIMIT)
         except Exception as exc:
             log.warning("State restore failed: %s", exc)
@@ -283,12 +302,14 @@ class LiveBotRuntime:
             self._session_anchor_equity = None
             self._daily_anchor_equity = None
             self._daily_anchor_date = ""
+            self._approved_review_overrides = {}
             self._recent_activity = deque(maxlen=RECENT_ACTIVITY_LIMIT)
             return
 
         self._purge_cooldowns()
         if self.open_trades:
             self._record_activity(f"Restored {len(self.open_trades)} open trade(s) from state")
+            self._restore_approved_review_overrides()
 
     def _notify(self, message: str, *, parse_mode: str = "HTML") -> None:
         self.telegram.send_message(message, parse_mode=parse_mode)
@@ -413,7 +434,155 @@ class LiveBotRuntime:
         return lines
 
     def _commands_hint(self) -> str:
-        return "/status /pnl /metrics /config /logs /pause /resume /close /reconcile /resetstreak /restart /ask"
+        return "/status /pnl /metrics /config /logs /review /approve /pause /resume /close /reconcile /resetstreak /restart /ask"
+
+    def _review_suggestions(self) -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        deterministic = list(self.daily_review.get("parameter_suggestions", []) or []) if self.daily_review else []
+        ai_summary = self.daily_review.get("ai_summary", {}) or {} if self.daily_review else {}
+        ai_env = list(ai_summary.get("env_suggestions", []) or []) if isinstance(ai_summary, dict) else []
+        for source, items in (("review", deterministic), ("ai", ai_env)):
+            for item in items:
+                env_var = str(item.get("env_var") or "").upper()
+                suggested_delta = str(item.get("suggested_delta") or "")
+                if not env_var or not suggested_delta:
+                    continue
+                merged.append(
+                    {
+                        **dict(item),
+                        "env_var": env_var,
+                        "suggested_delta": suggested_delta,
+                        "source": source,
+                        "supported": env_var in REVIEW_RUNTIME_OVERRIDE_SPECS,
+                    }
+                )
+        deduped: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in merged:
+            key = (str(item["env_var"]), str(item["suggested_delta"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        for index, item in enumerate(deduped, start=1):
+            item["id"] = index
+        return deduped
+
+    def _approved_overrides_lines(self) -> list[str]:
+        lines: list[str] = []
+        for env_var, payload in sorted(self._approved_review_overrides.items()):
+            lines.append(f"{env_var}={payload.get('value')}")
+        return lines
+
+    def _current_override_value(self, env_var: str) -> float:
+        spec = REVIEW_RUNTIME_OVERRIDE_SPECS[env_var]
+        attr = str(spec["attr"])
+        return float(getattr(self.config, attr))
+
+    def _format_override_value(self, env_var: str, value: float) -> str:
+        spec = REVIEW_RUNTIME_OVERRIDE_SPECS[env_var]
+        if str(spec["type"]) == "int":
+            return str(int(round(value)))
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+
+    def _restore_approved_review_overrides(self) -> None:
+        for env_var, payload in list(self._approved_review_overrides.items()):
+            spec = REVIEW_RUNTIME_OVERRIDE_SPECS.get(env_var)
+            if spec is None:
+                continue
+            raw_value = payload.get("value")
+            try:
+                parsed = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if str(spec["type"]) == "int":
+                parsed = int(round(parsed))
+            setattr(self.config, str(spec["attr"]), parsed)
+            os.environ[env_var] = self._format_override_value(env_var, float(parsed))
+
+    def _apply_approved_suggestion(self, suggestion_id: int) -> tuple[bool, str]:
+        suggestions = self._review_suggestions()
+        suggestion = next((item for item in suggestions if int(item.get("id", 0) or 0) == suggestion_id), None)
+        if suggestion is None:
+            return False, f"Unknown suggestion #{suggestion_id}. Use /review first."
+        env_var = str(suggestion.get("env_var") or "")
+        if env_var not in REVIEW_RUNTIME_OVERRIDE_SPECS:
+            return False, f"{env_var} is suggestion-only and cannot be applied live."
+        current_value = self._current_override_value(env_var)
+        delta_text = str(suggestion.get("suggested_delta") or "")
+        try:
+            if delta_text.startswith(("+", "-")):
+                new_value = current_value + float(delta_text)
+            else:
+                new_value = float(delta_text)
+        except ValueError:
+            return False, f"Could not parse delta for {env_var}: {delta_text}"
+        spec = REVIEW_RUNTIME_OVERRIDE_SPECS[env_var]
+        new_value = max(float(spec["min"]), min(float(spec["max"]), new_value))
+        if str(spec["type"]) == "int":
+            new_value = int(round(new_value))
+        attr = str(spec["attr"])
+        setattr(self.config, attr, new_value)
+        os.environ[env_var] = self._format_override_value(env_var, float(new_value))
+        self._approved_review_overrides[env_var] = {
+            "value": os.environ[env_var],
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+            "review_generated_at": str(self.daily_review.get("generated_at") or ""),
+            "reason": str(suggestion.get("reason") or ""),
+            "suggestion_id": suggestion_id,
+        }
+        self._record_activity(f"Approved {env_var} -> {os.environ[env_var]}")
+        self._save_state()
+        return True, f"Applied {env_var}: {self._format_override_value(env_var, current_value)} -> {os.environ[env_var]}"
+
+    def _build_review_message(self) -> str:
+        if not self.daily_review:
+            return "🧠 <b>Daily Review</b>\n━━━━━━━━━━━━━━━\nNo daily review loaded yet."
+        overview = self.daily_review.get("overview", {}) or {}
+        lines = [
+            "🧠 <b>Daily Review</b>",
+            "━━━━━━━━━━━━━━━",
+            f"Window: <b>{self.daily_review.get('review_window_label', 'n/a')}</b> | Trades: <b>{int(self.daily_review.get('total_trades', 0) or 0)}</b>",
+        ]
+        for line in list(overview.get("lines", []) or [])[:3]:
+            lines.append(str(line))
+        best = list(self.daily_review.get("best_opportunities", []) or [])[:3]
+        if best:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Best opportunities:")
+            for item in best:
+                lines.append(
+                    f"• {item['symbol']} [{item['strategy']}/{item['entry_signal']}] ${float(item['total_pnl']):+.2f} | PF {float(item['profit_factor']):.2f}"
+                )
+        suggestions = self._review_suggestions()
+        if suggestions:
+
+            self._restore_approved_review_overrides()
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Suggested variable changes:")
+            for item in suggestions[:5]:
+                env_var = str(item.get("env_var") or "?")
+                delta = str(item.get("suggested_delta") or "?")
+                reason = str(item.get("reason") or "")[:90]
+                marker = "approve" if bool(item.get("supported")) else "manual"
+                lines.append(f"{int(item.get('id', 0) or 0)}. {env_var} {delta} [{marker}] — {reason}")
+            lines.append("Use /approve <n> to apply a supported suggestion live.")
+        approved_lines = self._approved_overrides_lines()
+        if approved_lines:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Approved runtime overrides:")
+            lines.extend(f"• {line}" for line in approved_lines[:5])
+        return "\n".join(lines)[:4000]
+
+    def _maybe_notify_daily_review(self) -> None:
+        if not self.config.daily_review_notify or not self.daily_review:
+            return
+        generated_at = str(self.daily_review.get("generated_at") or "")
+        if not generated_at or generated_at == self._last_daily_review_notified_at:
+            return
+        self._last_daily_review_notified_at = generated_at
+        self._record_activity("Daily review loaded")
+        self._notify(self._build_review_message())
 
     def _strategy_pnl_lines(self, trades: list[dict]) -> list[str]:
         lines: list[str] = []
@@ -1132,7 +1301,7 @@ class LiveBotRuntime:
 
     def _build_config_message(self) -> str:
         dead_active = sum(1 for expires_at in self.liquidity_blacklist.values() if expires_at > time.time())
-        return (
+        body = (
             f"⚙️ <b>Config</b>\n"
             f"Market {self._market_regime_label()} (×{self._market_regime_mult:.2f}) | Moon {'✅' if self._moonshot_gate_open else '⛔'}\n"
             f"Strategies: {', '.join(self.config.strategies)}\n"
@@ -1145,7 +1314,10 @@ class LiveBotRuntime:
             f"Adaptive: window {self.config.adaptive_window} | tighten {self.config.adaptive_tighten_step:.1f} | relax {self.config.adaptive_relax_step:.1f}\n"
             f"☠️ Blacklisted {dead_active} | {'⏸️ PAUSED' if self._paused else '▶️ RUNNING'}"
         )
-
+        approved = self._approved_overrides_lines()
+        if approved:
+            body += "\nOverrides: " + ", ".join(approved[:4])
+        return body
     def _flush_telegram_updates(self) -> None:
         if not self.telegram.configured:
             return
@@ -1392,6 +1564,17 @@ class LiveBotRuntime:
                 self._notify(self._build_metrics_message())
             elif text in {"/logs", "/log"}:
                 self._notify(self._build_logs_message())
+            elif text == "/review":
+                self.refresh_daily_review(force=True)
+                self._notify(self._build_review_message())
+            elif raw_text.startswith("/approve ") or raw_text.startswith("/approve@"):
+                choice_text = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
+                if not choice_text.isdigit():
+                    self._notify("🧠 Usage: <code>/approve 1</code>")
+                else:
+                    ok, message = self._apply_approved_suggestion(int(choice_text))
+                    prefix = "✅" if ok else "⚠️"
+                    self._notify(f"{prefix} <b>Review approval</b>\n━━━━━━━━━━━━━━━\n{message}")
             elif text == "/config":
                 self._notify(self._build_config_message())
             elif text in {"/help", "/start"}:
@@ -1403,6 +1586,8 @@ class LiveBotRuntime:
                     f"/metrics — Win rate, PF, signals\n"
                     f"/config — Strategy thresholds & pools\n"
                     f"/logs — Recent activity\n"
+                    f"/review — Daily AI review & suggestions\n"
+                    f"/approve &lt;n&gt; — Apply suggestion n live\n"
                     f"/pause /resume — Control entries\n"
                     f"/close — Emergency close all\n"
                     f"/reconcile — Sync exchange state\n"
@@ -1504,6 +1689,36 @@ class LiveBotRuntime:
             source or "unknown source",
             int(data.get("total_trades", 0) or 0),
         )
+
+    def refresh_daily_review(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_daily_review_refresh_at < self.config.daily_review_refresh_seconds:
+            return
+        self._last_daily_review_refresh_at = now
+        data, source = load_daily_review(
+            redis_url=self.config.redis_url,
+            redis_key=self.config.daily_review_redis_key,
+            file_path=self.config.daily_review_file,
+        )
+        if not data:
+            return
+        ok, reason = validate_daily_review_payload(
+            data,
+            max_age_hours=self.config.daily_review_max_age_hours,
+            min_total_trades=self.config.daily_review_min_total_trades,
+        )
+        if not ok:
+            if self.daily_review:
+                self.daily_review = {}
+            log.info("[DAILY_REVIEW] Ignoring daily review from %s: %s", source or "unknown source", reason)
+            return
+        self.daily_review = data
+        log.info(
+            "[DAILY_REVIEW] Loaded daily review from %s: %s trades",
+            source or "unknown source",
+            int(data.get("total_trades", 0) or 0),
+        )
+        self._maybe_notify_daily_review()
 
     def _open_symbols(self) -> set[str]:
         return {trade.symbol for trade in self.open_trades}
@@ -2356,6 +2571,7 @@ class LiveBotRuntime:
     def run(self) -> None:
         mode = "PAPER TRADING" if self.config.paper_trade else "LIVE TRADING"
         self.refresh_trade_calibration(force=True)
+        self.refresh_daily_review(force=True)
         log.info("MEXC bot starting - %s", mode)
         log.info(
             "Budget: $%.2f | Max positions: %s | TP: %.2f%% | SL: %.2f%%",
@@ -2372,6 +2588,7 @@ class LiveBotRuntime:
         while True:
             try:
                 self._handle_telegram_commands()
+                self.refresh_daily_review()
                 self._send_heartbeat()
                 self._maybe_convert_dust()
                 self._send_daily_summary()

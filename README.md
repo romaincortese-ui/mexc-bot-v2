@@ -135,13 +135,18 @@ The backtest now supports strategy-specific datasets. That matters most for `SCA
 
 Each backtest run now also writes a crypto calibration payload to `backtest_output/calibration.json`. If `REDIS_URL` is set, it also publishes that payload to `MEXCBOT_CALIBRATION_REDIS_KEY` so the live bot can consume the same dataset.
 
-For scheduled calibration refreshes, use:
+For scheduled calibration refreshes and the daily missed-opportunity review, use:
 
 ```bash
 python -m backtest.run_daily_calibration
 ```
 
-That entrypoint always ignores `BACKTEST_START` and `BACKTEST_END`, so a cron job cannot accidentally keep replaying a stale fixed window.
+That entrypoint always ignores `BACKTEST_START` and `BACKTEST_END`, so a cron job cannot accidentally keep replaying a stale fixed window. It now does two things in one run:
+
+- reruns the rolling-window calibration and republishes it to file / Redis
+- runs a separate last-24h review pass, writes `backtest_output/daily_review.json`, and publishes the review to `MEXCBOT_DAILY_REVIEW_REDIS_KEY`
+
+If `ANTHROPIC_API_KEY` is set, the review is AI-assisted. If not, it falls back to deterministic summaries and parameter suggestions.
 
 For interactive parameter comparisons, use:
 
@@ -164,6 +169,8 @@ The live runtime uses that calibration in three places:
 - entry gating: tighten, relax, or block strategy/pair setups based on backtest results
 - sizing: scale allocation per strategy/pair using the calibrated risk multiplier
 - exits: overlay calibrated trail, breakeven, partial-take-profit, and flat-time adjustments on top of the default exit profile
+
+The live runtime can also load the daily review payload and expose it over Telegram with `/review`, including suggested env-var changes such as threshold tightening or loosening when the last-24h review supports it. Supported suggestions can be applied live with `/approve <n>`, which updates the running bot and persists the override across restarts.
 
 Artifacts are written to `backtest_output/`:
 
@@ -241,9 +248,11 @@ Use a separate Railway cron service for the calibration refresh instead of tying
 - Required environment:
    - same `REDIS_URL` as the live bot
    - same `MEXCBOT_CALIBRATION_REDIS_KEY`
+   - same `MEXCBOT_DAILY_REVIEW_REDIS_KEY`
    - rolling-window vars such as `BACKTEST_ROLLING_DAYS`, `BACKTEST_INTERVAL`, and the strategy symbol universes
+   - optional: `ANTHROPIC_API_KEY` for AI-written operator summaries
 
-This keeps the workflow dynamic: the cron job just reruns the rolling window, publishes a fresh calibration payload, and the live bot keeps reloading it on its normal refresh cadence.
+This keeps the workflow dynamic: the cron job reruns the rolling calibration, generates a last-24h review of the best and worst opportunity lanes, publishes both payloads, and the live bot keeps reloading them on its normal refresh cadence.
 
 For fast manual exploration, use a shorter rolling window such as `BACKTEST_ROLLING_DAYS=3` or `7` with reduced strategy symbol lists. For the scheduled Railway job, keep the broader strategy universes and your normal rolling horizon.
 

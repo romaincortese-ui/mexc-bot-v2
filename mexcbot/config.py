@@ -69,6 +69,12 @@ class LiveConfig:
     calibration_refresh_seconds: int
     calibration_max_age_hours: float
     calibration_min_total_trades: int
+    daily_review_redis_key: str
+    daily_review_file: str
+    daily_review_refresh_seconds: int
+    daily_review_max_age_hours: float
+    daily_review_min_total_trades: int
+    daily_review_notify: bool
     anthropic_api_key: str
     telegram_token: str
     telegram_chat_id: str
@@ -155,6 +161,12 @@ class LiveConfig:
             calibration_refresh_seconds=env_int("MEXCBOT_CALIBRATION_REFRESH_SECONDS", 300),
             calibration_max_age_hours=env_float("MEXCBOT_CALIBRATION_MAX_AGE_HOURS", 72.0),
             calibration_min_total_trades=env_int("MEXCBOT_CALIBRATION_MIN_TOTAL_TRADES", 50),
+            daily_review_redis_key=env_str("MEXCBOT_DAILY_REVIEW_REDIS_KEY", "mexc_daily_review"),
+            daily_review_file=env_str("MEXCBOT_DAILY_REVIEW_FILE", "backtest_output/daily_review.json"),
+            daily_review_refresh_seconds=env_int("MEXCBOT_DAILY_REVIEW_REFRESH_SECONDS", 900),
+            daily_review_max_age_hours=env_float("MEXCBOT_DAILY_REVIEW_MAX_AGE_HOURS", 36.0),
+            daily_review_min_total_trades=env_int("MEXCBOT_DAILY_REVIEW_MIN_TOTAL_TRADES", 3),
+            daily_review_notify=env_bool("MEXCBOT_DAILY_REVIEW_NOTIFY", True),
             anthropic_api_key=env_str("ANTHROPIC_API_KEY", ""),
             telegram_token=env_str("TELEGRAM_TOKEN", ""),
             telegram_chat_id=env_str("TELEGRAM_CHAT_ID", ""),

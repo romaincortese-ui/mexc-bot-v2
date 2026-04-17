@@ -202,6 +202,12 @@ def _config(**overrides) -> LiveConfig:
         calibration_refresh_seconds=300,
         calibration_max_age_hours=72.0,
         calibration_min_total_trades=50,
+        daily_review_redis_key="mexc_daily_review",
+        daily_review_file="backtest_output/daily_review.json",
+        daily_review_refresh_seconds=900,
+        daily_review_max_age_hours=36.0,
+        daily_review_min_total_trades=3,
+        daily_review_notify=True,
         anthropic_api_key="",
         telegram_token="",
         telegram_chat_id="",
@@ -329,6 +335,96 @@ def test_build_status_message_includes_btc_trend_windows(monkeypatch):
     message = runtime._build_status_message()
 
     assert "BTC: 1h ▲+0.46% | 24h ▲+12.31%" in message
+
+
+def test_build_review_message_shows_daily_review_suggestions():
+    runtime = LiveBotRuntime(_config(), StubClient())
+    runtime.daily_review = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "review_window_label": "1d",
+        "total_trades": 7,
+        "overview": {"lines": ["Window 1d: 7 trades | PnL $+4.20 | PF 1.31"]},
+        "best_opportunities": [
+            {
+                "symbol": "ENAUSDT",
+                "strategy": "MOONSHOT",
+                "entry_signal": "REBOUND_BURST",
+                "total_pnl": 3.5,
+                "profit_factor": 1.8,
+            }
+        ],
+        "parameter_suggestions": [
+            {
+                "env_var": "MOONSHOT_MIN_SCORE",
+                "suggested_delta": "-1.0",
+                "reason": "Moonshot quality was strong.",
+            }
+        ],
+    }
+
+    message = runtime._build_review_message()
+
+    assert "Daily Review" in message
+    assert "ENAUSDT [MOONSHOT/REBOUND_BURST]" in message
+    assert "1. MOONSHOT_MIN_SCORE -1.0 [approve]" in message
+    assert "/approve <n>" in message
+
+
+def test_handle_telegram_review_command_sends_daily_review(monkeypatch):
+    runtime = LiveBotRuntime(_config(telegram_chat_id="12345"), StubClient())
+    runtime.daily_review = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "review_window_label": "1d",
+        "total_trades": 5,
+        "overview": {"lines": ["Window 1d: 5 trades | PnL $+1.00 | PF 1.10"]},
+        "best_opportunities": [],
+        "parameter_suggestions": [],
+    }
+    runtime.telegram = StubTelegram(
+        updates=[
+            {
+                "update_id": 1,
+                "message": {"chat": {"id": "12345"}, "text": "/review"},
+            }
+        ]
+    )
+    monkeypatch.setattr(runtime, "refresh_daily_review", lambda force=False: None)
+
+    runtime._handle_telegram_commands()
+
+    assert any("Daily Review" in text for text, _mode in runtime.telegram.sent_messages)
+
+
+def test_handle_telegram_approve_command_applies_supported_suggestion():
+    runtime = LiveBotRuntime(_config(telegram_chat_id="12345", moonshot_min_score=28.0), StubClient())
+    runtime.daily_review = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "review_window_label": "1d",
+        "total_trades": 5,
+        "overview": {"lines": ["Window 1d: 5 trades | PnL $+1.00 | PF 1.10"]},
+        "best_opportunities": [],
+        "parameter_suggestions": [
+            {
+                "env_var": "MOONSHOT_MIN_SCORE",
+                "suggested_delta": "-1.5",
+                "reason": "Moonshot quality was strong.",
+            }
+        ],
+    }
+    runtime.telegram = StubTelegram(
+        updates=[
+            {
+                "update_id": 1,
+                "message": {"chat": {"id": "12345"}, "text": "/approve 1"},
+            }
+        ]
+    )
+
+    runtime._handle_telegram_commands()
+
+    assert runtime.config.moonshot_min_score == 26.5
+    assert runtime._approved_review_overrides["MOONSHOT_MIN_SCORE"]["value"] == "26.5"
+    assert any("Applied MOONSHOT_MIN_SCORE" in text for text, _mode in runtime.telegram.sent_messages)
 
 
 def test_build_status_message_uses_cached_btc_trend_when_refresh_fails(monkeypatch):
