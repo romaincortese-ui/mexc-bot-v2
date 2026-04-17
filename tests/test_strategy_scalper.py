@@ -220,6 +220,7 @@ class _ScalperStubConfig:
     candidate_limit = 2
     min_abs_change_pct = 0.5
     score_threshold = 20.0
+    scalper_threshold = 33.0
 
 
 class _ScalperStubClient:
@@ -413,3 +414,33 @@ def test_find_scalper_opportunity_blocks_all_candidates_when_all_are_too_correla
     result = find_scalper_opportunity(client, _ScalperStubConfig(), exclude=set(), open_symbols={"OPENUSDT"})
 
     assert result is None
+
+
+def test_find_scalper_opportunity_uses_scalper_threshold_by_default(monkeypatch):
+    _reset_scalper_env(monkeypatch)
+    monkeypatch.setattr("mexcbot.strategies.scalper.time.sleep", lambda *_args, **_kwargs: None)
+    captured = {}
+
+    def fake_score(symbol: str, frame: pd.DataFrame, score_threshold: float = 20.0):
+        captured[symbol] = score_threshold
+        return Opportunity(symbol=symbol, score=40.0, price=1.0, rsi=40.0, rsi_score=5.0, ma_score=10.0, vol_score=15.0, vol_ratio=2.0, entry_signal="TREND")
+
+    monkeypatch.setattr("mexcbot.strategies.scalper.score_symbol_from_frame", fake_score)
+    tickers = pd.DataFrame(
+        {
+            "symbol": ["VOL1USDT"],
+            "quoteVolume": [5_000_000.0],
+            "priceChangePercent": [1.0],
+            "lastPrice": [1.0],
+        }
+    )
+    dummy_frame = pd.DataFrame({"close": [1.0] * 25})
+    client = _ScalperStubClient(tickers, {"VOL1USDT": dummy_frame})
+    config = _ScalperStubConfig()
+    config.score_threshold = 20.0
+    config.scalper_threshold = 33.0
+
+    result = find_scalper_opportunity(client, config, exclude=set(), open_symbols=set())
+
+    assert result is not None
+    assert captured["VOL1USDT"] == 33.0

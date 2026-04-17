@@ -445,6 +445,28 @@ def test_open_position_notifies_on_buy_failure():
     assert any("Buy attempt failed" in text and "SPACEUSDT" in text and "Signature for this request is not valid" in text for text, _mode in runtime.telegram.sent_messages)
 
 
+def test_refresh_trade_calibration_clears_cached_value_when_source_is_missing(monkeypatch):
+    runtime = LiveBotRuntime(_config(), StubClient())
+    runtime.trade_calibration = {"total_trades": 100}
+
+    monkeypatch.setattr(runtime_module, "load_trade_calibration", lambda **kwargs: (None, None))
+
+    runtime.refresh_trade_calibration(force=True)
+
+    assert runtime.trade_calibration == {}
+
+
+def test_refresh_daily_review_clears_cached_value_when_source_is_missing(monkeypatch):
+    runtime = LiveBotRuntime(_config(), StubClient())
+    runtime.daily_review = {"total_trades": 5}
+
+    monkeypatch.setattr(runtime_module, "load_daily_review", lambda **kwargs: (None, None))
+
+    runtime.refresh_daily_review(force=True)
+
+    assert runtime.daily_review == {}
+
+
 def test_build_status_message_uses_cached_btc_trend_when_refresh_fails(monkeypatch):
     monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 55)
 
@@ -1113,6 +1135,31 @@ def test_check_trade_action_records_major_partial_tp_and_dust_closes_remainder()
     assert client.cancel_order_calls == [("DOGEUSDT", "TP1")]
     assert runtime.trade_history[-2]["exit_reason"] == "MAJOR_PARTIAL_TP"
     assert runtime.trade_history[-2]["is_partial"] is True
+    assert runtime.trade_history[-1]["exit_reason"] == "DUST"
+
+
+def test_check_trade_action_records_major_partial_tp_for_grid_trade():
+    client = StubClient()
+    client.order_status_by_id["TP1"] = {
+        "orderId": "TP1",
+        "status": "PARTIALLY_FILLED",
+        "executedQty": "8.8",
+        "cummulativeQuoteQty": "96.8",
+        "fills": [{"price": "11", "qty": "8.8", "commission": "0.0968", "commissionAsset": "USDT"}],
+    }
+    client.price_by_symbol["DOGEUSDT"] = 2.0
+    runtime = LiveBotRuntime(_config(), client)
+
+    trade = runtime.open_position(_opportunity(strategy="GRID"), allocation_usdt=100.0)
+    assert trade is not None
+    trade.tp_order_id = "TP1"
+
+    action = runtime.check_trade_action(trade)
+
+    assert action["action"] == "exchange_closed"
+    assert trade.tp_order_id is None
+    assert client.cancel_order_calls == [("DOGEUSDT", "TP1")]
+    assert runtime.trade_history[-2]["exit_reason"] == "MAJOR_PARTIAL_TP"
     assert runtime.trade_history[-1]["exit_reason"] == "DUST"
 
 

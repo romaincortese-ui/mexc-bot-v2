@@ -588,7 +588,7 @@ def find_scalper_opportunity(
     )
 
     scored_candidates: list[Opportunity] = []
-    resolved_threshold = config.score_threshold if score_threshold is None else float(score_threshold)
+    resolved_threshold = config.scalper_threshold if score_threshold is None else float(score_threshold)
     for symbol in candidate_symbols:
         try:
             frame = client.get_klines(symbol, interval=SCALPER_INTERVAL, limit=60)

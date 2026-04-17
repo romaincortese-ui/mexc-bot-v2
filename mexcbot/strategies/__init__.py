@@ -56,7 +56,8 @@ def find_best_opportunity(
 		if finder is None:
 			log.warning("Unknown strategy '%s' in MEXCBOT_STRATEGIES, skipping", strategy_name)
 			continue
-		strategy_threshold = threshold_overrides.get(resolved_name)
+		default_threshold = config.scalper_threshold if resolved_name == "SCALPER" else config.score_threshold
+		strategy_threshold = threshold_overrides.get(resolved_name, default_threshold)
 		try:
 			if resolved_name == "SCALPER":
 				candidate = find_scalper_opportunity(
@@ -81,7 +82,7 @@ def find_best_opportunity(
 			continue
 		if candidate is not None:
 			base_threshold = max(
-				float(strategy_threshold if strategy_threshold is not None else config.score_threshold),
+				float(strategy_threshold),
 				float(STRATEGY_MIN_SCORES.get(resolved_name) or config.score_threshold),
 			)
 			candidate = apply_opportunity_calibration(candidate, calibration, base_threshold=base_threshold)

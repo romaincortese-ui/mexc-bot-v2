@@ -903,7 +903,7 @@ class LiveBotRuntime:
             self._record_activity(f"TP order filled {trade.symbol}")
             return {"action": "exchange_closed", "closed": closed}
 
-        if status == "PARTIALLY_FILLED" and trade.strategy == "SCALPER":
+        if status == "PARTIALLY_FILLED":
             filled_qty = float(order.get("executedQty", 0.0) or 0.0)
             if trade.qty > 0 and filled_qty > 0:
                 filled_ratio = filled_qty / float(trade.qty)
@@ -1682,6 +1682,9 @@ class LiveBotRuntime:
             file_path=self.config.calibration_file,
         )
         if not data:
+            if self.trade_calibration:
+                self.trade_calibration = {}
+                log.info("[CALIBRATION] Clearing cached crypto calibration because no source data is available")
             return
         ok, reason = validate_trade_calibration_payload(
             data,
@@ -1711,6 +1714,9 @@ class LiveBotRuntime:
             file_path=self.config.daily_review_file,
         )
         if not data:
+            if self.daily_review:
+                self.daily_review = {}
+                log.info("[DAILY_REVIEW] Clearing cached daily review because no source data is available")
             return
         ok, reason = validate_daily_review_payload(
             data,
