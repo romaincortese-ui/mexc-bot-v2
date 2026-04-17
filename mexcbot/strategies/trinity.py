@@ -203,14 +203,18 @@ def find_trinity_opportunity(
 ) -> Opportunity | None:
     excluded = {symbol.upper() for symbol in (exclude or set())}
     excluded.update(symbol.upper() for symbol in (open_symbols or set()))
+    symbols = [symbol.upper() for symbol in (config.trinity_symbols or TRINITY_SYMBOLS)]
 
     best: Opportunity | None = None
-    for symbol in TRINITY_SYMBOLS:
+    for symbol in symbols:
         if symbol in excluded:
             continue
         try:
             frame = client.get_klines(symbol, interval=TRINITY_INTERVAL, limit=120)
-            candidate = score_trinity_from_frame(symbol, frame, score_threshold=TRINITY_MIN_SCORE)
+            if frame is None or len(frame) < 61:
+                continue
+            # The latest 15m bar from the exchange can still be forming; score the last closed candle instead.
+            candidate = score_trinity_from_frame(symbol, frame.iloc[:-1].copy(), score_threshold=TRINITY_MIN_SCORE)
             if candidate is not None and (best is None or candidate.score > best.score):
                 best = candidate
         except Exception as exc:
