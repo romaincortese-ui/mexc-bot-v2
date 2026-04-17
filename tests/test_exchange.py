@@ -1,3 +1,9 @@
+import hashlib
+import hmac
+from urllib.parse import urlencode
+
+import pytest
+
 from mexcbot.exchange import MexcClient
 
 
@@ -62,6 +68,54 @@ def test_get_orderbook_spread_returns_normalized_spread(monkeypatch):
     spread = client.get_orderbook_spread("DOGEUSDT")
 
     assert spread == 0.02
+
+
+def test_private_post_uses_canonical_param_order_for_signature(monkeypatch):
+    client = MexcClient(DummyConfig())
+    captured = {}
+
+    class _Response:
+        ok = True
+
+        def json(self):
+            return {"status": "ok"}
+
+    monkeypatch.setattr("mexcbot.exchange.time.time", lambda: 1700000000.0)
+
+    def fake_request(method, url, params=None, headers=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["params"] = params
+        captured["headers"] = headers
+        return _Response()
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    result = client.private_post(
+        "/api/v3/order",
+        {"symbol": "DOGEUSDT", "side": "BUY", "type": "MARKET", "quantity": "5"},
+    )
+
+    assert result == {"status": "ok"}
+    assert captured["method"] == "post"
+    assert isinstance(captured["params"], list)
+    unsigned = captured["params"][:-1]
+    assert [key for key, _value in unsigned] == sorted(key for key, _value in unsigned)
+    expected_query = urlencode(unsigned)
+    expected_signature = hmac.new(DummyConfig.api_secret.encode(), expected_query.encode(), hashlib.sha256).hexdigest()
+    assert captured["params"][-1] == ("signature", expected_signature)
+
+
+def test_get_private_request_diagnostics_masks_key_and_omits_secret(monkeypatch):
+    client = MexcClient(DummyConfig())
+    monkeypatch.setattr("mexcbot.exchange.time.time", lambda: 1700000000.0)
+
+    diagnostics = client.get_private_request_diagnostics("/api/v3/account", {"symbol": "DOGEUSDT"})
+
+    assert diagnostics["api_key"].startswith("****") is False
+    assert diagnostics["path"] == "/api/v3/account"
+    assert "secret" not in str(diagnostics).lower()
+    assert diagnostics["signature_prefix"]
 
 
 def test_get_live_account_snapshot_counts_locked_balances_and_marks_non_usdt_assets(monkeypatch):

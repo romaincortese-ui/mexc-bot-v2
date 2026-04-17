@@ -87,6 +87,8 @@ SCALPER_TP_AUTO_OVERSOLD_BLOCK = True
 SCALPER_SL_CAP = env_float("SCALPER_SL_CAP", 0.12)
 SCALPER_SL_FLOOR = env_float("SCALPER_SL_FLOOR", 0.05)
 SCALPER_SL_ATR_MULT = env_float("SCALPER_SL_ATR_MULT", 3.0)
+SCALPER_VOLUME_UNIVERSE_LIMIT = 120
+SCALPER_CANDIDATE_LIMIT = 80
 
 SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
     "CROSSOVER": {
@@ -496,11 +498,17 @@ def _candidate_symbols(tickers: pd.DataFrame, config: LiveConfig) -> list[str]:
     if filtered.empty:
         return []
 
-    volume_symbols = filtered.sort_values("quoteVolume", ascending=False).head(config.universe_limit)["symbol"].tolist()
-    surge_symbols = filtered.sort_values("abs_change", ascending=False).head(env_int("SCALPER_SURGE_SIZE", SCALPER_SURGE_SIZE))["symbol"].tolist()
-    combined = list(dict.fromkeys(surge_symbols + volume_symbols))
+    volume_limit = env_int("SCALPER_VOLUME_UNIVERSE_LIMIT", max(config.universe_limit, SCALPER_VOLUME_UNIVERSE_LIMIT))
+    surge_limit = env_int("SCALPER_SURGE_SIZE", SCALPER_SURGE_SIZE)
     watchlist_size = env_int("SCALPER_WATCHLIST_SIZE", SCALPER_WATCHLIST_SIZE)
-    return combined[: max(config.candidate_limit, watchlist_size)]
+    candidate_limit = env_int(
+        "SCALPER_CANDIDATE_LIMIT",
+        max(config.candidate_limit, watchlist_size, SCALPER_CANDIDATE_LIMIT),
+    )
+    volume_symbols = filtered.sort_values("quoteVolume", ascending=False).head(volume_limit)["symbol"].tolist()
+    surge_symbols = filtered.sort_values("abs_change", ascending=False).head(surge_limit)["symbol"].tolist()
+    combined = list(dict.fromkeys(surge_symbols + volume_symbols))
+    return combined[:candidate_limit]
 
 
 def _recent_returns(frame: pd.DataFrame, lookback: int = 20) -> pd.Series:
@@ -569,6 +577,15 @@ def find_scalper_opportunity(
     if not candidate_symbols:
         log.info("No strong signals found this scan.")
         return None
+
+    log.info(
+        "[SCALPER] Candidate universe: %d filtered tickers -> %d symbols (volume_limit=%d surge_limit=%d candidate_limit=%d)",
+        len(tickers),
+        len(candidate_symbols),
+        env_int("SCALPER_VOLUME_UNIVERSE_LIMIT", max(config.universe_limit, SCALPER_VOLUME_UNIVERSE_LIMIT)),
+        env_int("SCALPER_SURGE_SIZE", SCALPER_SURGE_SIZE),
+        env_int("SCALPER_CANDIDATE_LIMIT", max(config.candidate_limit, env_int("SCALPER_WATCHLIST_SIZE", SCALPER_WATCHLIST_SIZE), SCALPER_CANDIDATE_LIMIT)),
+    )
 
     scored_candidates: list[Opportunity] = []
     resolved_threshold = config.score_threshold if score_threshold is None else float(score_threshold)

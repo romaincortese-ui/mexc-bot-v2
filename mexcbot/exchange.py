@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
@@ -22,6 +23,7 @@ CHASE_LIMIT_TIMEOUT = env_float("CHASE_LIMIT_TIMEOUT", 2.5)
 CHASE_LIMIT_RETRIES = env_int("CHASE_LIMIT_RETRIES", 3)
 USE_MAKER_ORDERS = env_bool("USE_MAKER_ORDERS", True)
 MAKER_ORDER_TIMEOUT_SEC = env_float("MAKER_ORDER_TIMEOUT_SEC", 2.5)
+MEXC_RECV_WINDOW_MS = env_int("MEXC_RECV_WINDOW_MS", 5000)
 
 
 @dataclass(slots=True)
@@ -43,33 +45,45 @@ class MexcClient:
         self.session = requests.Session()
         self._account_snapshot_cache = {"at": 0.0, "free_usdt": 0.0, "total_equity": 0.0}
 
-    def _sign(self, params: dict[str, Any]) -> str:
-        query = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+    def _canonical_private_items(self, params: dict[str, Any] | None = None) -> list[tuple[str, str]]:
+        payload = [(str(key), str(value)) for key, value in (params or {}).items() if value is not None]
+        payload.append(("timestamp", str(int(time.time() * 1000))))
+        if MEXC_RECV_WINDOW_MS > 0:
+            payload.append(("recvWindow", str(MEXC_RECV_WINDOW_MS)))
+        return sorted(payload)
+
+    def _private_query(self, items: list[tuple[str, str]]) -> str:
+        return urlencode(items)
+
+    def _sign(self, items: list[tuple[str, str]]) -> str:
+        query = self._private_query(items)
         return hmac.new(self.config.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-    def public_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = self.session.get(self.config.base_url + path, params=params or {}, timeout=10)
-        response.raise_for_status()
-        return response.json()
+    def _masked_api_key(self) -> str:
+        key = self.config.api_key.strip()
+        if len(key) <= 8:
+            return "*" * len(key)
+        return f"{key[:4]}...{key[-4:]}"
 
-    def private_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        payload = dict(params or {})
-        payload["timestamp"] = int(time.time() * 1000)
-        payload["signature"] = self._sign(payload)
-        response = self.session.get(
-            self.config.base_url + path,
-            params=payload,
-            headers={"X-MEXC-APIKEY": self.config.api_key},
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
+    def get_private_request_diagnostics(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        items = self._canonical_private_items(params)
+        diagnostics = {
+            "path": path,
+            "base_url": self.config.base_url,
+            "api_key": self._masked_api_key(),
+            "param_keys": [key for key, _value in items],
+            "timestamp": int(dict(items).get("timestamp", "0")),
+            "recv_window_ms": MEXC_RECV_WINDOW_MS,
+            "query": self._private_query(items),
+            "signature_prefix": self._sign(items)[:12],
+        }
+        return diagnostics
 
-    def private_post(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        payload = dict(params or {})
-        payload["timestamp"] = int(time.time() * 1000)
-        payload["signature"] = self._sign(payload)
-        response = self.session.post(
+    def _request_private(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
+        items = self._canonical_private_items(params)
+        payload = items + [("signature", self._sign(items))]
+        response = self.session.request(
+            method,
             self.config.base_url + path,
             params=payload,
             headers={"X-MEXC-APIKEY": self.config.api_key},
@@ -77,24 +91,37 @@ class MexcClient:
         )
         if not response.ok:
             body = response.text[:500] if response.text else ""
+            diagnostics = self.get_private_request_diagnostics(path, params)
+            diagnostics.pop("query", None)
+            log.error("MEXC private %s failed: %s | body=%s | diag=%s", method.upper(), path, body, diagnostics)
             raise requests.HTTPError(
-                f"{response.status_code} {response.reason} for {path} | body={body}",
+                f"{response.status_code} {response.reason} for {path} | body={body} | diag={diagnostics}",
                 response=response,
             )
         return response.json()
 
-    def private_delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        payload = dict(params or {})
-        payload["timestamp"] = int(time.time() * 1000)
-        payload["signature"] = self._sign(payload)
-        response = self.session.delete(
-            self.config.base_url + path,
-            params=payload,
-            headers={"X-MEXC-APIKEY": self.config.api_key},
-            timeout=10,
-        )
+    def public_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        response = self.session.get(self.config.base_url + path, params=params or {}, timeout=10)
         response.raise_for_status()
         return response.json()
+
+    def get_server_time(self) -> int:
+        data = self.public_get("/api/v3/time")
+        return int(data.get("serverTime", 0))
+
+    def get_server_time_offset_ms(self) -> int:
+        server_time = self.get_server_time()
+        local_time = int(time.time() * 1000)
+        return server_time - local_time
+
+    def private_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request_private("get", path, params)
+
+    def private_post(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request_private("post", path, params)
+
+    def private_delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        return self._request_private("delete", path, params)
 
     def get_all_tickers(self) -> pd.DataFrame:
         data = self.public_get("/api/v3/ticker/24hr")

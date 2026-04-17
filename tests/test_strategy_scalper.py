@@ -13,6 +13,9 @@ def _reset_scalper_env(monkeypatch) -> None:
     monkeypatch.delenv("SCALPER_MIN_CROSSOVER_VOL_RATIO", raising=False)
     monkeypatch.delenv("SCALPER_MIN_OVERSOLD_VOL_RATIO", raising=False)
     monkeypatch.delenv("SCALPER_TP_EXECUTION_MODE", raising=False)
+    monkeypatch.delenv("SCALPER_VOLUME_UNIVERSE_LIMIT", raising=False)
+    monkeypatch.delenv("SCALPER_CANDIDATE_LIMIT", raising=False)
+    monkeypatch.delenv("SCALPER_SURGE_SIZE", raising=False)
 
 
 def test_score_symbol_from_frame_returns_opportunity_for_strong_setup(monkeypatch):
@@ -302,6 +305,31 @@ def test_find_scalper_opportunity_includes_surge_candidates_beyond_volume_cutoff
 
     assert result is not None
     assert result.symbol == "SURGEUSDT"
+
+
+def test_candidate_symbols_expand_beyond_global_candidate_limit_with_scalper_override(monkeypatch):
+    _reset_scalper_env(monkeypatch)
+    monkeypatch.setenv("SCALPER_VOLUME_UNIVERSE_LIMIT", "6")
+    monkeypatch.setenv("SCALPER_CANDIDATE_LIMIT", "5")
+    monkeypatch.setenv("SCALPER_SURGE_SIZE", "2")
+    tickers = pd.DataFrame(
+        {
+            "symbol": ["VOL1USDT", "VOL2USDT", "VOL3USDT", "VOL4USDT", "SURGEUSDT", "TAILUSDT"],
+            "quoteVolume": [9_000_000.0, 8_000_000.0, 7_000_000.0, 6_000_000.0, 500_000.0, 400_000.0],
+            "priceChangePercent": [1.0, 0.9, 0.8, 0.7, 9.5, 0.6],
+            "lastPrice": [1.0] * 6,
+        }
+    )
+    config = _ScalperStubConfig()
+    config.universe_limit = 2
+    config.candidate_limit = 2
+    config.min_abs_change_pct = 0.5
+
+    symbols = _candidate_symbols(tickers, config)
+
+    assert len(symbols) == 5
+    assert "SURGEUSDT" in symbols
+    assert "VOL4USDT" in symbols
 
 
 def test_find_scalper_opportunity_filters_highly_correlated_open_positions(monkeypatch):
