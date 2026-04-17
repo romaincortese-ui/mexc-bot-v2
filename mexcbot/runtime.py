@@ -170,6 +170,7 @@ class LiveBotRuntime:
         self._session_anchor_equity: float | None = None
         self._daily_anchor_equity: float | None = None
         self._daily_anchor_date = ""
+        self._btc_1h_frame_cache: pd.DataFrame | None = None
         self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
         self._telegram_alert_timestamps: dict[str, float] = {}
         self._state_path = Path(self.config.state_file) if self.config.state_file else None
@@ -344,11 +345,21 @@ class LiveBotRuntime:
             return f"⛔ F&G blocked ({self._fear_greed_index})"
         return "✅ tradable"
 
-    def _btc_trend_line(self) -> str:
+    def _get_btc_1h_frame(self) -> pd.DataFrame | None:
         try:
             frame = self.client.get_klines("BTCUSDT", interval="1h", limit=120)
-        except Exception:
-            return "BTC: n/a"
+        except Exception as exc:
+            log.debug("BTC 1h fetch failed: %s", exc)
+            frame = None
+        if frame is not None and not frame.empty and "close" in frame:
+            self._btc_1h_frame_cache = frame.copy()
+            return frame
+        if self._btc_1h_frame_cache is not None and not self._btc_1h_frame_cache.empty and "close" in self._btc_1h_frame_cache:
+            return self._btc_1h_frame_cache.copy()
+        return None
+
+    def _btc_trend_line(self) -> str:
+        frame = self._get_btc_1h_frame()
         if frame is None or len(frame) < 25 or "close" not in frame:
             return "BTC: n/a"
         close = frame["close"].astype(float)
@@ -1554,11 +1565,7 @@ class LiveBotRuntime:
         if "MOONSHOT" not in {strategy.upper() for strategy in self.config.strategies}:
             return
         previous_state = self._moonshot_gate_open
-        try:
-            frame = self.client.get_klines("BTCUSDT", interval="1h", limit=120)
-        except Exception as exc:
-            log.debug("BTC gate refresh failed: %s", exc)
-            return
+        frame = self._get_btc_1h_frame()
         if frame is None or len(frame) < 50 or "close" not in frame:
             return
         close = frame["close"].astype(float)
@@ -1714,10 +1721,8 @@ class LiveBotRuntime:
 
     def _update_market_regime(self) -> None:
         previous = self._market_regime_mult
-        try:
-            frame = self.client.get_klines("BTCUSDT", interval="1h", limit=120)
-        except Exception as exc:
-            log.debug("Market regime refresh failed: %s", exc)
+        frame = self._get_btc_1h_frame()
+        if frame is None:
             return
         self._market_regime_mult = compute_market_regime_multiplier(frame, self.config)
         if abs(previous - self._market_regime_mult) >= 0.2:
