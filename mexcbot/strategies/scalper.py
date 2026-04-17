@@ -488,7 +488,11 @@ def score_symbol_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: f
 def _candidate_symbols(tickers: pd.DataFrame, config: LiveConfig) -> list[str]:
     filtered = tickers.copy()
     filtered["abs_change"] = filtered["priceChangePercent"].abs()
-    filtered = filtered[filtered["abs_change"] >= config.min_abs_change_pct]
+    min_abs_change = float(config.min_abs_change_pct)
+    # Accept both ratio-style inputs (0.005 = 0.5%) and percent-style inputs (0.5 = 0.5%).
+    if min_abs_change >= 0.1:
+        min_abs_change /= 100.0
+    filtered = filtered[filtered["abs_change"] >= min_abs_change]
     if filtered.empty:
         return []
 

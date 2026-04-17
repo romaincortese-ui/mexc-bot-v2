@@ -2,7 +2,7 @@ import pandas as pd
 
 from mexcbot.models import Opportunity
 from mexcbot.strategies.common import classify_entry_signal
-from mexcbot.strategies.scalper import find_scalper_opportunity, score_symbol_from_frame
+from mexcbot.strategies.scalper import _candidate_symbols, find_scalper_opportunity, score_symbol_from_frame
 
 
 def _reset_scalper_env(monkeypatch) -> None:
@@ -229,6 +229,46 @@ class _ScalperStubClient:
 
     def get_klines(self, symbol: str, interval: str = "5m", limit: int = 60) -> pd.DataFrame:
         return self._frames[symbol].copy()
+
+
+def test_candidate_symbols_accepts_percent_style_min_abs_change():
+    tickers = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT", "MICROUSDT"],
+            "quoteVolume": [10_000_000.0, 1_000_000.0],
+            "priceChangePercent": [0.0481, 0.8],
+            "lastPrice": [1.0, 1.0],
+        }
+    )
+    config = _ScalperStubConfig()
+    config.universe_limit = 5
+    config.candidate_limit = 5
+    config.min_abs_change_pct = 0.5
+
+    symbols = _candidate_symbols(tickers, config)
+
+    assert "BTCUSDT" in symbols
+    assert "MICROUSDT" in symbols
+
+
+def test_candidate_symbols_accepts_ratio_style_min_abs_change():
+    tickers = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT", "LOWMOVEUSDT"],
+            "quoteVolume": [10_000_000.0, 1_000_000.0],
+            "priceChangePercent": [0.0481, 0.003],
+            "lastPrice": [1.0, 1.0],
+        }
+    )
+    config = _ScalperStubConfig()
+    config.universe_limit = 5
+    config.candidate_limit = 5
+    config.min_abs_change_pct = 0.005
+
+    symbols = _candidate_symbols(tickers, config)
+
+    assert "BTCUSDT" in symbols
+    assert "LOWMOVEUSDT" not in symbols
 
 
 def test_find_scalper_opportunity_includes_surge_candidates_beyond_volume_cutoff(monkeypatch):
