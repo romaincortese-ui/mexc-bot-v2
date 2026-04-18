@@ -66,6 +66,10 @@ The runtime now sends Telegram notifications for:
 Supported Telegram commands:
 
 - `/status`
+- `/pnl`
+- `/logs`
+- `/pause`
+- `/resume`
 - `/close`
 - `/help`
 

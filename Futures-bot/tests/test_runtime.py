@@ -133,13 +133,55 @@ def test_force_close_position_closes_paper_trade_and_records_history(tmp_path):
     assert "Closed paper LONG BTC_USDT" in message
     assert runtime.open_position is None
     assert runtime.trade_history[-1]["exit_reason"] == "MANUAL_CLOSE"
+    assert any("Manual close" in line for line in runtime._recent_activity)
+
+
+def test_build_pnl_message_includes_realized_and_open_pnl(tmp_path):
+    runtime = FuturesRuntime(_config(tmp_path), StubClient())
+    runtime.open_position = FuturesPosition(
+        symbol="BTC_USDT",
+        side="LONG",
+        entry_price=90000.0,
+        contracts=1,
+        contract_size=0.01,
+        leverage=25,
+        margin_usdt=36.0,
+        tp_price=93000.0,
+        sl_price=88800.0,
+        position_id="paper",
+        order_id="paper",
+        opened_at=datetime(2026, 4, 18, tzinfo=timezone.utc),
+        score=65.0,
+        certainty=0.8,
+        entry_signal="COIL_BREAKOUT_LONG",
+    )
+    runtime.trade_history.append({"symbol": "BTC_USDT", "exit_reason": "TAKE_PROFIT", "pnl_usdt": 24.5, "pnl_pct": 8.1, "exit_time": datetime.now(timezone.utc).isoformat()})
+
+    message = runtime._build_pnl_message(price=91500.0)
+
+    assert "💰 <b>Futures P&L</b>" in message
+    assert "Today: <b>$+24.50</b> | Closed trades: <b>1</b>" in message
+    assert "Session: <b>$+24.50</b> | 1W 0L" in message
+    assert "Open P&L: <b>$+15.00</b>" in message
+
+
+def test_build_logs_message_uses_recent_activity(tmp_path):
+    runtime = FuturesRuntime(_config(tmp_path), StubClient())
+    runtime._record_activity("Loaded calibration")
+    runtime._record_activity("Opened LONG BTC_USDT")
+
+    message = runtime._build_logs_message()
+
+    assert "🧾 <b>Recent Activity</b>" in message
+    assert "Loaded calibration" in message
+    assert "Opened LONG BTC_USDT" in message
 
 
 def test_handle_telegram_commands_supports_status_and_close(tmp_path):
     runtime = FuturesRuntime(replace(_config(tmp_path), telegram_token="token", telegram_chat_id="1"), StubClient())
     runtime.telegram.get_updates = lambda **kwargs: [
-        {"message": {"chat": {"id": "1"}, "text": "/status"}},
-        {"message": {"chat": {"id": "1"}, "text": "/close"}},
+        {"update_id": 1, "message": {"chat": {"id": "1"}, "text": "/status"}},
+        {"update_id": 2, "message": {"chat": {"id": "1"}, "text": "/close"}},
     ]
     sent_messages: list[str] = []
     runtime._notify = lambda message, parse_mode="HTML": sent_messages.append(message)
@@ -166,3 +208,24 @@ def test_handle_telegram_commands_supports_status_and_close(tmp_path):
     assert any("📋 <b>Status</b>" in message for message in sent_messages)
     assert any("🚨 <b>Futures Close</b>" in message for message in sent_messages)
     assert runtime.open_position is None
+
+
+def test_handle_telegram_commands_supports_pnl_logs_and_pause_resume(tmp_path):
+    runtime = FuturesRuntime(replace(_config(tmp_path), telegram_token="token", telegram_chat_id="1"), StubClient())
+    runtime.telegram.get_updates = lambda **kwargs: [
+        {"update_id": 3, "message": {"chat": {"id": "1"}, "text": "/pnl"}},
+        {"update_id": 4, "message": {"chat": {"id": "1"}, "text": "/logs"}},
+        {"update_id": 5, "message": {"chat": {"id": "1"}, "text": "/pause"}},
+        {"update_id": 6, "message": {"chat": {"id": "1"}, "text": "/resume"}},
+    ]
+    sent_messages: list[str] = []
+    runtime._notify = lambda message, parse_mode="HTML": sent_messages.append(message)
+
+    runtime._handle_telegram_commands()
+
+    assert any("💰 <b>Futures P&L</b>" in message for message in sent_messages)
+    assert any("🧾 <b>Recent Activity</b>" in message for message in sent_messages)
+    assert any("⏸️ <b>Futures entries paused.</b>" in message for message in sent_messages)
+    assert any("▶️ <b>Futures entries resumed.</b>" in message for message in sent_messages)
+    assert runtime._paused is False
+    assert runtime._last_telegram_update == 6

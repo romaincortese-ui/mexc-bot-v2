@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import html
 import json
 import logging
@@ -29,6 +30,7 @@ from futuresbot.calibration import apply_signal_calibration
 
 log = logging.getLogger(__name__)
 TELEGRAM_ALERT_COOLDOWN_SECONDS = 600
+RECENT_ACTIVITY_LIMIT = 12
 
 
 class FuturesRuntime:
@@ -44,9 +46,16 @@ class FuturesRuntime:
         self._last_calibration_refresh_at = 0.0
         self._last_review_refresh_at = 0.0
         self._last_heartbeat_at = 0.0
+        self._last_telegram_update = 0
         self._telegram_alert_timestamps: dict[str, float] = {}
         self._btc_trend_cache: dict[str, float] = {"1h": 0.0, "24h": 0.0}
+        self._paused = False
+        self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
         self._load_state()
+
+    def _record_activity(self, message: str) -> None:
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self._recent_activity.appendleft(f"{timestamp} {message}")
 
     def _notify(self, message: str, *, parse_mode: str = "HTML") -> None:
         self.telegram.send_message(message, parse_mode=parse_mode)
@@ -195,6 +204,7 @@ class FuturesRuntime:
             f"Symbol: <b>{html.escape(self.config.symbol)}</b> | Price: <b>${self._format_price(current_price or 0.0)}</b>",
             self._btc_trend_line(),
             f"Calibration: {'✅ loaded' if self.calibration else '⛔ none'} | Review: {'✅ loaded' if self.daily_review else '⛔ none'}",
+            f"Entries: {'⏸️ paused' if self._paused else '▶️ active'}",
             f"Avail: <b>${snapshot['available_usdt']:.2f}</b> | Equity: <b>${snapshot['equity_usdt']:.2f}</b> | Trades: <b>{len(self.trade_history)}</b>",
             "━━━━━━━━━━━━━━━",
         ]
@@ -222,6 +232,47 @@ class FuturesRuntime:
         if last_trade:
             lines.append("━━━━━━━━━━━━━━━")
             lines.append(last_trade)
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append(f"<i>{self._commands_hint()}</i>")
+        return "\n".join(lines)
+
+    def _build_pnl_message(self, *, price: float | None = None) -> str:
+        current_price = price if price and price > 0 else self._get_reference_price()
+        snapshot = self._account_snapshot(current_price)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        closed_trades = list(self.trade_history)
+        today_trades = [trade for trade in closed_trades if str(trade.get("exit_time") or "")[:10] == today]
+        total_realized = sum(float(trade.get("pnl_usdt", 0.0) or 0.0) for trade in closed_trades)
+        today_realized = sum(float(trade.get("pnl_usdt", 0.0) or 0.0) for trade in today_trades)
+        unrealized = snapshot["unrealized_pnl_usdt"]
+        wins = sum(1 for trade in closed_trades if float(trade.get("pnl_usdt", 0.0) or 0.0) > 0)
+        losses = sum(1 for trade in closed_trades if float(trade.get("pnl_usdt", 0.0) or 0.0) < 0)
+        lines = [
+            f"💰 <b>Futures P&L</b> [{self._mode_label()}]",
+            "━━━━━━━━━━━━━━━",
+            f"Today: <b>${today_realized:+.2f}</b> | Closed trades: <b>{len(today_trades)}</b>",
+            f"Session: <b>${total_realized:+.2f}</b> | {wins}W {losses}L",
+            f"Open P&L: <b>${unrealized:+.2f}</b> | Equity: <b>${snapshot['equity_usdt']:.2f}</b>",
+        ]
+        if self.open_position is not None:
+            pnl_pct = self._position_pnl_pct(self.open_position, current_price)
+            pct_text = f" ({pnl_pct:+.2f}%)" if pnl_pct is not None else ""
+            lines.append(
+                f"Open: <b>{html.escape(self.open_position.side)}</b> {html.escape(self.open_position.symbol)} | "
+                f"entry ${self._format_price(self.open_position.entry_price)} | unrealized <b>${unrealized:+.2f}</b>{pct_text}"
+            )
+        last_trade = self._last_trade_line()
+        if last_trade:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append(last_trade)
+        return "\n".join(lines)
+
+    def _build_logs_message(self) -> str:
+        lines = ["🧾 <b>Recent Activity</b>", "━━━━━━━━━━━━━━━"]
+        if not self._recent_activity:
+            lines.append("No recent activity.")
+        else:
+            lines.extend(self._recent_activity)
         return "\n".join(lines)
 
     def _entry_message(self, position: FuturesPosition) -> str:
@@ -266,13 +317,17 @@ class FuturesRuntime:
         self._notify(self._build_status_message(price=price, signal=signal, heartbeat=True))
 
     def _commands_hint(self) -> str:
-        return "/status /close /help"
+        return "/status /pnl /logs /pause /resume /close /help"
 
     def _build_help_message(self) -> str:
         return (
             "🤖 <b>Futures Telegram Commands</b>\n"
             "━━━━━━━━━━━━━━━\n"
             "/status — Futures status and open position\n"
+            "/pnl — Realized and open futures P&L\n"
+            "/logs — Recent runtime activity\n"
+            "/pause — Pause new entries\n"
+            "/resume — Resume new entries\n"
             "/close — Close the current BTC futures position\n"
             "/help — Show this command list"
         )
@@ -289,6 +344,7 @@ class FuturesRuntime:
             self._close_history_trade(position, exit_price=current_price, reason=reason)
             self.open_position = None
             self._save_state()
+            self._record_activity(f"Manual close: {position.side} {position.symbol} @ {current_price:,.2f}")
             return True, f"Closed paper {position.side} {position.symbol} at ${current_price:,.2f}."
         try:
             self.client.cancel_all_tpsl(position_id=position.position_id, symbol=position.symbol)
@@ -310,15 +366,21 @@ class FuturesRuntime:
         self._close_history_trade(position, exit_price=exit_price, reason=reason)
         self.open_position = None
         self._save_state()
+        self._record_activity(f"Manual close: {position.side} {position.symbol} @ {exit_price:,.2f}")
         return True, f"Closed live {position.side} {position.symbol} at ${exit_price:,.2f}."
 
     def _handle_telegram_commands(self) -> None:
         if not self.telegram.configured:
             return
-        updates = self.telegram.get_updates(limit=5, timeout=0)
+        updates = self.telegram.get_updates(
+            offset=self._last_telegram_update + 1 if self._last_telegram_update else None,
+            limit=5,
+            timeout=0,
+        )
         if not updates:
             return
         for update in updates:
+            self._last_telegram_update = max(self._last_telegram_update, int(update.get("update_id", 0) or 0))
             message = update.get("message", {}) if isinstance(update, dict) else {}
             chat_id = str(message.get("chat", {}).get("id", ""))
             if self.config.telegram_chat_id and chat_id != self.config.telegram_chat_id:
@@ -327,12 +389,31 @@ class FuturesRuntime:
             text = raw_text.lower()
             if text == "/status":
                 self._notify(self._build_status_message(price=self._get_reference_price()))
+                self._record_activity("Telegram: /status")
+            elif text == "/pnl":
+                self._notify(self._build_pnl_message())
+                self._record_activity("Telegram: /pnl")
+            elif text in {"/logs", "/log"}:
+                self._notify(self._build_logs_message())
+                self._record_activity("Telegram: /logs")
+            elif text == "/pause":
+                self._paused = True
+                self._save_state()
+                self._record_activity("Telegram: entries paused")
+                self._notify("⏸️ <b>Futures entries paused.</b> Open position management stays active.")
+            elif text == "/resume":
+                self._paused = False
+                self._save_state()
+                self._record_activity("Telegram: entries resumed")
+                self._notify("▶️ <b>Futures entries resumed.</b>")
             elif text == "/close":
                 ok, message_text = self._force_close_position(reason="MANUAL_CLOSE")
                 prefix = "🚨" if ok else "⚠️"
                 self._notify(f"{prefix} <b>Futures Close</b>\n━━━━━━━━━━━━━━━\n{html.escape(message_text)}")
+                self._record_activity(f"Telegram: /close ({'ok' if ok else 'noop'})")
             elif text in {"/help", "/start"}:
                 self._notify(self._build_help_message())
+                self._record_activity("Telegram: /help")
 
     def _get_reference_price(self) -> float:
         try:
@@ -363,12 +444,16 @@ class FuturesRuntime:
         if isinstance(trade_payload, dict):
             self.open_position = FuturesPosition.from_dict(trade_payload)
         self.trade_history = list(payload.get("trade_history", []) or [])
+        self._paused = bool(payload.get("paused", False))
+        self._recent_activity = deque((str(item) for item in payload.get("recent_activity", [])), maxlen=RECENT_ACTIVITY_LIMIT)
 
     def _save_state(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "open_position": self.open_position.to_dict() if self.open_position is not None else None,
             "trade_history": self.trade_history[-200:],
+            "paused": self._paused,
+            "recent_activity": list(self._recent_activity),
         }
         self._state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -393,6 +478,7 @@ class FuturesRuntime:
         self.calibration = data if valid else None
         if valid:
             log.info("Loaded futures calibration from %s", source or self.config.calibration_file)
+            self._record_activity("Calibration loaded")
 
     def refresh_daily_review(self, *, force: bool = False) -> None:
         now_ts = time.time()
@@ -401,6 +487,8 @@ class FuturesRuntime:
         data, _source = load_daily_review(redis_url="", redis_key=self.config.review_redis_key, file_path=self.config.review_file)
         self._last_review_refresh_at = now_ts
         self.daily_review = data
+        if data:
+            self._record_activity("Daily review loaded")
 
     def _status_payload(self, *, signal: dict[str, Any] | None = None, price: float | None = None) -> dict[str, Any]:
         return {
@@ -474,6 +562,7 @@ class FuturesRuntime:
         )
         self.trade_history.append(trade)
         self._notify(self._close_message(trade))
+        self._record_activity(f"Closed {position.side} {position.symbol}: {reason} ${pnl:+.2f}")
 
     def _reconcile_closed_position(self) -> None:
         if self.open_position is None or self.config.paper_trade:
@@ -582,6 +671,7 @@ class FuturesRuntime:
                 metadata=dict(signal_payload.get("metadata", {}) or {}),
             )
             self._notify(self._entry_message(self.open_position))
+            self._record_activity(f"Opened {side_name} {self.config.symbol} x{leverage} (paper)")
             self._save_state()
             return
         try:
@@ -623,11 +713,13 @@ class FuturesRuntime:
             metadata=dict(signal_payload.get("metadata", {}) or {}),
         )
         self._notify(self._entry_message(self.open_position))
+        self._record_activity(f"Opened {side_name} {self.config.symbol} x{leverage} (live)")
         self._save_state()
 
     def run(self) -> None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
         self._send_startup_message()
+        self._record_activity("Runtime started")
         while True:
             try:
                 self._handle_telegram_commands()
@@ -641,13 +733,14 @@ class FuturesRuntime:
                     self._hourly_exit(self.open_position, current_price)
                     self._write_status(price=current_price)
                 else:
-                    signal = self._fetch_signal()
+                    signal = None if self._paused else self._fetch_signal()
                     self._write_status(signal=signal, price=current_price)
                     if signal is not None:
                         self._enter_trade(signal)
                 self._send_heartbeat(price=current_price, signal=signal)
             except Exception as exc:
                 log.exception("Futures runtime loop failed: %s", exc)
+                self._record_activity(f"Runtime error: {type(exc).__name__}")
                 self._notify_once(
                     "futures_runtime_loop_error",
                     f"⚠️ <b>Futures Runtime Error</b> [{self._mode_label()}]\n"
