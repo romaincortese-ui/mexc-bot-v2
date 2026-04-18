@@ -13,11 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-if str(WORKSPACE_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_ROOT))
-
-from mexcbot.telegram import TelegramClient
+from futuresbot.telegram import TelegramClient
 
 from futuresbot.calibration import load_trade_calibration, validate_trade_calibration_payload
 from futuresbot.config import FuturesConfig

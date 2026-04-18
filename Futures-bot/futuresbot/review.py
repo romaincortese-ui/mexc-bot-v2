@@ -1,22 +1,121 @@
 from __future__ import annotations
 
-import sys
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+import requests
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-if str(WORKSPACE_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_ROOT))
+try:
+    import redis
+except ImportError:
+    redis = None  # type: ignore
 
-from mexcbot.daily_review import (
-    enrich_daily_review_with_ai,
-    load_daily_review,
-    publish_daily_review,
-    validate_daily_review_payload,
-    write_daily_review,
-)
+
+def enrich_daily_review_with_ai(review: Mapping[str, Any], *, anthropic_api_key: str) -> dict[str, Any]:
+    if not anthropic_api_key.strip():
+        return dict(review)
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 500,
+        "system": (
+            "You are a concise crypto trading operations analyst. "
+            "Given a bot daily review payload, produce compact JSON with a summary and operator suggestions. "
+            "Do not invent metrics. Keep recommendations cautious and actionable."
+        ),
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Review this bot performance payload and return valid JSON only with keys: "
+                    "summary_lines (array of max 3 strings), operator_actions (array of max 3 strings), "
+                    "env_suggestions (array of objects with env_var, suggested_delta, reason).\n\n"
+                    + json.dumps(review, indent=2)
+                ),
+            }
+        ],
+    }
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+        if not response.ok:
+            return dict(review)
+        payload = response.json()
+        text = ""
+        for block in payload.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "").strip()
+                break
+        if not text:
+            return dict(review)
+        parsed = json.loads(text.replace("```json", "").replace("```", "").strip())
+    except Exception:
+        return dict(review)
+    enriched = dict(review)
+    enriched["ai_summary"] = {
+        "summary_lines": list(parsed.get("summary_lines", []) or [])[:3],
+        "operator_actions": list(parsed.get("operator_actions", []) or [])[:3],
+        "env_suggestions": list(parsed.get("env_suggestions", []) or [])[:5],
+    }
+    return enriched
+
+
+def write_daily_review(file_path: str, review: Mapping[str, Any]) -> None:
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(review, indent=2), encoding="utf-8")
+
+
+def publish_daily_review(redis_url: str, redis_key: str, review: Mapping[str, Any]) -> bool:
+    if not redis_url or not redis_key or redis is None:
+        return False
+    client = redis.from_url(redis_url)
+    client.set(redis_key, json.dumps(review))
+    return True
+
+
+def load_daily_review(*, redis_url: str, redis_key: str, file_path: str) -> tuple[dict[str, Any] | None, str | None]:
+    if redis_url and redis_key and redis is not None:
+        try:
+            client = redis.from_url(redis_url)
+            raw = client.get(redis_key)
+            if raw:
+                return json.loads(raw), f"Redis key {redis_key}"
+        except Exception:
+            pass
+    path = Path(file_path)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8")), str(path)
+        except Exception:
+            return None, None
+    return None, None
+
+
+def validate_daily_review_payload(data: Mapping[str, Any], *, max_age_hours: float, min_total_trades: int) -> tuple[bool, str | None]:
+    total_trades = int(data.get("total_trades", 0) or 0)
+    if total_trades < min_total_trades:
+        return False, f"insufficient sample ({total_trades} trades < {min_total_trades})"
+    generated_at = data.get("generated_at")
+    if not generated_at:
+        return False, "missing generated_at"
+    try:
+        created = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return False, "invalid generated_at"
+    age_hours = (_utc_now() - created).total_seconds() / 3600.0
+    if age_hours > max_age_hours:
+        return False, f"stale review ({age_hours:.1f}h > {max_age_hours:.1f}h)"
+    return True, None
 
 
 def _utc_now() -> datetime:
