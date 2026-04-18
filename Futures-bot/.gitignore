@@ -1,0 +1,6 @@
+backtest_cache/
+backtest_output/
+trades.log
+__pycache__/
+futuresbot/__pycache__/
+tests/__pycache__/
