@@ -1366,6 +1366,53 @@ def test_runtime_state_save_updates_after_partial_close(tmp_path):
     assert restored.trade_history[-1]["exit_reason"] == "PARTIAL_TP"
 
 
+def test_partial_close_triggers_post_trade_analysis_for_grid_loss(monkeypatch):
+    runtime = LiveBotRuntime(_config(anthropic_api_key="test-key"), StubClient())
+    captured = []
+    monkeypatch.setattr(runtime_module, "env_bool", lambda name, default=False: True if name == "WEB_SEARCH_ENABLED" else default)
+    monkeypatch.setattr(runtime, "_post_trade_analysis", lambda closed: captured.append(closed))
+
+    trade = runtime.open_position(_opportunity(strategy="GRID"), allocation_usdt=100.0)
+
+    assert trade is not None
+
+    closed = runtime.partial_close_position(trade, "STOP_LOSS", price=9.5, qty_ratio=0.5)
+
+    assert closed is not None
+    assert closed["strategy"] == "GRID"
+    assert closed["pnl_pct"] < 0
+    assert captured and captured[-1]["strategy"] == "GRID"
+
+
+def test_exchange_partial_fill_triggers_post_trade_analysis_for_reversal_loss(monkeypatch):
+    runtime = LiveBotRuntime(_config(anthropic_api_key="test-key"), StubClient())
+    captured = []
+    monkeypatch.setattr(runtime_module, "env_bool", lambda name, default=False: True if name == "WEB_SEARCH_ENABLED" else default)
+    monkeypatch.setattr(runtime, "_post_trade_analysis", lambda closed: captured.append(closed))
+
+    trade = runtime.open_position(_opportunity(strategy="REVERSAL"), allocation_usdt=100.0)
+
+    assert trade is not None
+
+    closed = runtime._record_exchange_partial_fill(
+        trade,
+        {
+            "orderId": "SELL-PARTIAL",
+            "status": "PARTIALLY_FILLED",
+            "executedQty": "5",
+            "cummulativeQuoteQty": "45",
+            "fills": [{"price": "9.0", "qty": "5", "commission": "0.045", "commissionAsset": "USDT"}],
+        },
+        reason="STOP_LOSS",
+        price_hint=9.0,
+    )
+
+    assert closed is not None
+    assert closed["strategy"] == "REVERSAL"
+    assert closed["pnl_pct"] < 0
+    assert captured and captured[-1]["strategy"] == "REVERSAL"
+
+
 def test_reconcile_reconstructs_untracked_holding_into_open_trades():
     client = StubClient()
     runtime = LiveBotRuntime(_config(), client)

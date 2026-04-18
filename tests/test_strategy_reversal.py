@@ -33,6 +33,7 @@ def test_score_reversal_from_frame_returns_capitulation_bounce_setup():
     assert result.strategy == "REVERSAL"
     assert result.entry_signal in {"MULTI_REVERSAL", "DIVERGENCE_CLIMAX", "DIVERGENCE_HAMMER", "CLIMAX_HAMMER"}
     assert result.tp_pct is not None and result.sl_pct is not None
+    assert 0.08 <= result.sl_pct <= 0.10
     assert result.metadata.get("bounce_pct", 0.0) > 0
 
 

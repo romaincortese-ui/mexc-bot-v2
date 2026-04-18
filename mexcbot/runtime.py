@@ -928,6 +928,7 @@ class LiveBotRuntime:
         trade.remaining_cost_usdt = round(max(0.0, remaining_cost_before - entry_cost_alloc), 8)
         self.trade_history.append(closed)
         self._send_close_alert(closed, partial=True, remaining_qty=trade.qty)
+        self._post_trade_analysis(closed)
         self._log_summary()
         self._save_state()
         return closed
@@ -2705,6 +2706,7 @@ class LiveBotRuntime:
         trade.remaining_cost_usdt = round(max(0.0, remaining_cost_before - entry_cost_alloc), 8)
         self.trade_history.append(closed)
         self._send_close_alert(closed, partial=True, remaining_qty=trade.qty)
+        self._post_trade_analysis(closed)
         self._log_summary()
         self._save_state()
         return closed

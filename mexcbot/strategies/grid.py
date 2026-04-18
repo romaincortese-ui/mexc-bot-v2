@@ -27,9 +27,10 @@ GRID_ENTRY_BB_ZONE = 0.20
 GRID_TP_BB_ZONE = 0.72
 GRID_TP_MIN = 0.010
 GRID_TP_MAX = 0.028
-GRID_SL_MIN = 0.007
-GRID_SL_CAP = env_float("GRID_SL_CAP", 0.40)
-GRID_SL_MAX = 0.016
+GRID_SL_MIN = env_float("GRID_SL_MIN", 0.08)
+GRID_SL_CAP = env_float("GRID_SL_CAP", 0.10)
+GRID_SL_MAX = env_float("GRID_SL_MAX", 0.10)
+GRID_MIN_REWARD_RISK = env_float("GRID_MIN_REWARD_RISK", 0.12)
 GRID_MIN_SCORE = 55.0
 GRID_SPREAD_MAX = 0.002
 GRID_UNIVERSE_MIN_ABS_CHANGE_PCT = 0.003
@@ -66,6 +67,7 @@ def _grid_params() -> dict[str, float]:
         "tp_max": env_float("GRID_TP_MAX", GRID_TP_MAX),
         "sl_min": env_float("GRID_SL_MIN", GRID_SL_MIN),
         "sl_max": env_float("GRID_SL_MAX", GRID_SL_MAX),
+        "min_reward_risk": env_float("GRID_MIN_REWARD_RISK", GRID_MIN_REWARD_RISK),
         "min_score": env_float("GRID_MIN_SCORE", GRID_MIN_SCORE),
         "spread_max": env_float("GRID_SPREAD_MAX", GRID_SPREAD_MAX),
         "universe_min_abs_change_pct": env_float("GRID_UNIVERSE_MIN_ABS_CHANGE_PCT", GRID_UNIVERSE_MIN_ABS_CHANGE_PCT),
@@ -187,7 +189,7 @@ def score_grid_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: flo
     tp_pct = max(params["tp_min"], min(params["tp_max"], (tp_price_target / price_now) - 1))
     sl_price_target = lower * (1 - bb_width)
     sl_pct = min(GRID_SL_CAP, max(params["sl_min"], min(params["sl_max"], (price_now - sl_price_target) / price_now)))
-    if sl_pct <= 0 or tp_pct / sl_pct < 1.5:
+    if sl_pct <= 0 or tp_pct / sl_pct < params["min_reward_risk"]:
         return None
 
     return Opportunity(

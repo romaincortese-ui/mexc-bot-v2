@@ -48,9 +48,10 @@ REVERSAL_MIN_GREENS = 1           # at least 1 of last 3 candles green
 REVERSAL_TP_MIN = env_float("REVERSAL_TP_MIN", 0.030)
 REVERSAL_TP_MAX = env_float("REVERSAL_TP_MAX", 0.060)
 REVERSAL_TP_ATR_MULT = env_float("REVERSAL_TP_ATR_MULT", 3.0)
-REVERSAL_SL_MIN = env_float("REVERSAL_SL_MIN", 0.012)
-REVERSAL_SL_MAX = env_float("REVERSAL_SL_MAX", 0.020)
+REVERSAL_SL_MIN = env_float("REVERSAL_SL_MIN", 0.08)
+REVERSAL_SL_MAX = env_float("REVERSAL_SL_MAX", 0.10)
 REVERSAL_SL_ATR_MULT = env_float("REVERSAL_SL_ATR_MULT", 1.5)
+REVERSAL_MIN_REWARD_RISK = env_float("REVERSAL_MIN_REWARD_RISK", 0.30)
 
 REVERSAL_MIN_SCORE = env_float("REVERSAL_MIN_SCORE", 45.0)
 
@@ -285,7 +286,7 @@ def score_reversal_from_frame(
     sl_pct = max(REVERSAL_SL_MIN, min(REVERSAL_SL_MAX, atr_pct * REVERSAL_SL_ATR_MULT))
 
     # R:R gate — require at least 1.5:1 reward:risk
-    if tp_pct / sl_pct < 1.5:
+    if tp_pct / sl_pct < REVERSAL_MIN_REWARD_RISK:
         return None
 
     return Opportunity(

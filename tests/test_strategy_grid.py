@@ -31,7 +31,10 @@ def test_score_grid_from_frame_returns_mean_reversion_setup():
     assert result is not None
     assert result.strategy == "GRID"
     assert result.entry_signal == "GRID_MEAN_REVERT"
-    assert result.tp_pct is not None and result.tp_pct > result.sl_pct > 0
+    assert result.tp_pct is not None and result.tp_pct > 0
+    assert result.sl_pct > 0
+    assert result.tp_pct / result.sl_pct >= 0.12
+    assert 0.08 <= result.sl_pct <= 0.10
 
 
 def test_build_grid_universe_excludes_proxy_assets_and_uses_universe_limit(monkeypatch):
