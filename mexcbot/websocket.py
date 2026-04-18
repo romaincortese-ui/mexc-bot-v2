@@ -63,6 +63,35 @@ class PriceMonitor:
         with self._wanted_lock:
             self._wanted = set(symbols)
 
+    @staticmethod
+    def _is_clean_close(exc: Exception) -> bool:
+        return type(exc).__name__ == "ConnectionClosedOK"
+
+    @classmethod
+    def _reconnect_delay(cls, exc: Exception, backoff: int) -> int:
+        if cls._is_clean_close(exc):
+            return 2
+        return backoff
+
+    @classmethod
+    def _next_backoff(cls, exc: Exception, backoff: int) -> int:
+        if cls._is_clean_close(exc):
+            return 2
+        return min(backoff * 2, 60)
+
+    @classmethod
+    def _log_reconnect(cls, exc: Exception, delay: int) -> None:
+        if cls._is_clean_close(exc):
+            log.info(
+                "WS closed cleanly (%s: %s) — reconnect in %ss",
+                type(exc).__name__, exc, delay,
+            )
+            return
+        log.warning(
+            "WS error (%s: %s) — reconnect in %ss",
+            type(exc).__name__, exc, delay,
+        )
+
     # ── Internal ────────────────────────────────────────────────
 
     def _run_loop(self) -> None:
@@ -163,9 +192,9 @@ class PriceMonitor:
                                 self._prices[sym] = (float(px), time.time())
 
             except Exception as exc:
-                log.warning(
-                    "WS error (%s: %s) — reconnect in %ss",
-                    type(exc).__name__, exc, backoff,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                if not self._running:
+                    break
+                delay = self._reconnect_delay(exc, backoff)
+                self._log_reconnect(exc, delay)
+                await asyncio.sleep(delay)
+                backoff = self._next_backoff(exc, backoff)
