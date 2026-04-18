@@ -185,6 +185,7 @@ class LiveBotRuntime:
         self._daily_anchor_equity: float | None = None
         self._daily_anchor_date = ""
         self._btc_1h_frame_cache: pd.DataFrame | None = None
+        self._btc_trend_cache: dict[str, float] = {"1h": 0.0, "24h": 0.0}
         self._last_daily_review_notified_at = ""
         self._approved_review_overrides: dict[str, dict[str, object]] = {}
         self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
@@ -380,18 +381,78 @@ class LiveBotRuntime:
             return self._btc_1h_frame_cache.copy()
         return None
 
+    def _get_btc_5m_frame(self) -> pd.DataFrame | None:
+        try:
+            frame = self.client.get_klines("BTCUSDT", interval="5m", limit=289)
+        except Exception as exc:
+            log.debug("BTC 5m fetch failed: %s", exc)
+            return None
+        if frame is not None and not frame.empty and "close" in frame:
+            return frame
+        return None
+
+    def _compute_change(self, latest: float | None, prior: float | None) -> float | None:
+        if latest is None or prior is None or latest <= 0 or prior <= 0:
+            return None
+        return latest / prior - 1.0
+
+    def _get_btc_latest_price(self, frame: pd.DataFrame | None = None) -> float | None:
+        try:
+            price = float(self.client.get_price("BTCUSDT"))
+            if price > 0:
+                return price
+        except Exception as exc:
+            log.debug("BTC price fetch failed: %s", exc)
+        if frame is not None and not frame.empty and "close" in frame:
+            try:
+                price = float(frame["close"].astype(float).iloc[-1])
+                if price > 0:
+                    return price
+            except Exception:
+                return None
+        return None
+
+    def _cache_btc_change(self, key: str, value: float | None) -> float:
+        if value is not None:
+            self._btc_trend_cache[key] = value
+            return value
+        return float(self._btc_trend_cache.get(key, 0.0) or 0.0)
+
+    def _btc_trend_changes(self) -> tuple[float, float]:
+        frame_1h = self._get_btc_1h_frame()
+        latest_price = self._get_btc_latest_price(frame_1h if frame_1h is None else None)
+        change_1h: float | None = None
+        change_24h: float | None = None
+
+        if frame_1h is not None and len(frame_1h) >= 2 and "close" in frame_1h:
+            close = frame_1h["close"].astype(float)
+            latest = float(close.iloc[-1])
+            change_1h = self._compute_change(latest, float(close.iloc[-2]))
+            if len(close) >= 25:
+                change_24h = self._compute_change(latest, float(close.iloc[-25]))
+
+        if change_1h is None or change_24h is None:
+            frame_5m = self._get_btc_5m_frame()
+            if frame_5m is not None and len(frame_5m) >= 13 and "close" in frame_5m:
+                close = frame_5m["close"].astype(float)
+                latest = latest_price if latest_price is not None else float(close.iloc[-1])
+                if change_1h is None:
+                    change_1h = self._compute_change(latest, float(close.iloc[-13]))
+                if change_24h is None and len(close) >= 289:
+                    change_24h = self._compute_change(latest, float(close.iloc[-289]))
+
+        if change_24h is None:
+            try:
+                ticker = self.client.public_get("/api/v3/ticker/24hr", {"symbol": "BTCUSDT"})
+                if isinstance(ticker, dict):
+                    change_24h = float(ticker.get("priceChangePercent", 0.0) or 0.0) / 100.0
+            except Exception as exc:
+                log.debug("BTC 24h ticker fetch failed: %s", exc)
+
+        return self._cache_btc_change("1h", change_1h), self._cache_btc_change("24h", change_24h)
+
     def _btc_trend_line(self) -> str:
-        frame = self._get_btc_1h_frame()
-        if frame is None or len(frame) < 25 or "close" not in frame:
-            return "BTC: n/a"
-        close = frame["close"].astype(float)
-        latest = float(close.iloc[-1])
-        prior_1h = float(close.iloc[-2]) if len(close) >= 2 else 0.0
-        prior_24h = float(close.iloc[-25]) if len(close) >= 25 else 0.0
-        if latest <= 0 or prior_1h <= 0 or prior_24h <= 0:
-            return "BTC: n/a"
-        change_1h = latest / prior_1h - 1.0
-        change_24h = latest / prior_24h - 1.0
+        change_1h, change_24h = self._btc_trend_changes()
         icon_1h = "▲" if change_1h >= 0 else "▼"
         icon_24h = "▲" if change_24h >= 0 else "▼"
         return f"BTC: 1h {icon_1h}{change_1h:+.2%} | 24h {icon_24h}{change_24h:+.2%}"

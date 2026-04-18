@@ -30,6 +30,7 @@ class StubClient:
         self.convert_dust_calls = []
         self.chase_limit_result = None
         self.btc_klines_failures = 0
+        self.btc_24h_change_percent = 1.0
         self.btc_frame = pd.DataFrame(
             {
                 "open": [100.0] * 120,
@@ -37,6 +38,15 @@ class StubClient:
                 "low": [99.0] * 120,
                 "close": [100.0] * 120,
                 "volume": [1000.0] * 120,
+            }
+        )
+        self.btc_5m_frame = pd.DataFrame(
+            {
+                "open": [100.0] * 289,
+                "high": [101.0] * 289,
+                "low": [99.0] * 289,
+                "close": [100.0] * 289,
+                "volume": [1000.0] * 289,
             }
         )
 
@@ -153,7 +163,14 @@ class StubClient:
                 self.btc_klines_failures -= 1
                 raise RuntimeError("BTC fetch failed")
             return self.btc_frame.copy()
+        if symbol == "BTCUSDT" and interval == "5m":
+            return self.btc_5m_frame.copy()
         raise KeyError(symbol)
+
+    def public_get(self, path: str, params=None):
+        if path == "/api/v3/ticker/24hr" and (params or {}).get("symbol") == "BTCUSDT":
+            return {"symbol": "BTCUSDT", "priceChangePercent": str(self.btc_24h_change_percent)}
+        raise KeyError(path)
 
 
 class StubTelegram:
@@ -489,6 +506,30 @@ def test_build_status_message_uses_cached_btc_trend_when_refresh_fails(monkeypat
     assert "BTC: 1h ▲+0.46% | 24h ▲+12.31%" in first_message
     assert "BTC: 1h ▲+0.46% | 24h ▲+12.31%" in second_message
     assert "BTC: n/a" not in second_message
+
+
+def test_build_status_message_uses_btc_fallback_sources_when_1h_refresh_fails(monkeypatch):
+    monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 55)
+
+    client = StubClient()
+    client.btc_klines_failures = 1
+    client.price_by_symbol["BTCUSDT"] = 113.0
+    client.btc_24h_change_percent = 12.31
+    client.btc_5m_frame = pd.DataFrame(
+        {
+            "open": [110.0] * 13,
+            "high": [111.0] * 13,
+            "low": [109.0] * 13,
+            "close": [110.0] * 13,
+            "volume": [1000.0] * 13,
+        }
+    )
+    runtime = LiveBotRuntime(_config(), client)
+
+    message = runtime._build_status_message()
+
+    assert "BTC: 1h ▲+2.73% | 24h ▲+12.31%" in message
+    assert "BTC: n/a" not in message
 
 
 def test_available_balance_uses_free_usdt_not_total_equity():
