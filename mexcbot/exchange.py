@@ -61,6 +61,22 @@ class MexcClient:
                 return filter_row
         return {}
 
+    def _fallback_lot_size(self, symbol: str) -> dict[str, Any]:
+        item = self._symbol_info(symbol)
+        base_size_precision = str(item.get("baseSizePrecision") or "").strip()
+        if base_size_precision and base_size_precision not in {"0", "0.0"}:
+            return {"minQty": base_size_precision, "stepSize": base_size_precision}
+
+        base_precision = item.get("baseAssetPrecision")
+        try:
+            precision_int = int(base_precision)
+        except (TypeError, ValueError):
+            precision_int = 3
+        precision_int = max(0, precision_int)
+        derived_step = Decimal("1").scaleb(-precision_int)
+        step_text = format(derived_step.normalize(), "f")
+        return {"minQty": step_text, "stepSize": step_text}
+
     def _normalize_qty(self, qty: float, step: str | float, min_qty: str | float) -> float:
         step_decimal = Decimal(str(step or "0.001"))
         min_decimal = Decimal(str(min_qty or "0.001"))
@@ -81,9 +97,9 @@ class MexcClient:
 
     def _order_qty_payload(self, symbol: str, qty: float, *, order_type: str) -> tuple[float, str]:
         filter_type = "MARKET_LOT_SIZE" if order_type.upper() == "MARKET" else "LOT_SIZE"
-        size_filter = self._symbol_filter(symbol, filter_type) or self._symbol_filter(symbol, "LOT_SIZE")
+        size_filter = self._symbol_filter(symbol, filter_type) or self._symbol_filter(symbol, "LOT_SIZE") or self._fallback_lot_size(symbol)
         step_size = size_filter.get("stepSize", "0.001")
-        min_qty = size_filter.get("minQty", "0.001")
+        min_qty = size_filter.get("minQty", step_size)
         normalized_qty = self._normalize_qty(qty, step_size, min_qty)
         return normalized_qty, self._format_decimal_str(normalized_qty, step_size)
 
@@ -203,7 +219,7 @@ class MexcClient:
         filter_row = self._symbol_filter(symbol, "LOT_SIZE")
         if filter_row:
             return filter_row
-        return {"minQty": "0.001", "stepSize": "0.001"}
+        return self._fallback_lot_size(symbol)
 
     def get_price_filter(self, symbol: str) -> dict[str, Any]:
         filter_row = self._symbol_filter(symbol, "PRICE_FILTER")

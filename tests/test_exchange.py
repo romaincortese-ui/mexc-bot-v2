@@ -293,6 +293,66 @@ def test_place_order_formats_market_quantity_from_market_lot_size(monkeypatch):
     assert captured["params"]["quantity"] == "30.2"
 
 
+def test_get_lot_size_falls_back_to_symbol_base_size_precision(monkeypatch):
+    client = MexcClient(DummyConfig())
+
+    monkeypatch.setattr(
+        client,
+        "_symbol_info",
+        lambda symbol: {
+            "symbol": symbol,
+            "baseAssetPrecision": 2,
+            "baseSizePrecision": "1",
+            "filters": [],
+        },
+    )
+
+    lot = client.get_lot_size("DOGEUSDT")
+
+    assert lot == {"minQty": "1", "stepSize": "1"}
+
+
+def test_place_order_formats_quantity_from_symbol_precision_when_lot_filters_missing(monkeypatch):
+    client = MexcClient(DummyConfig())
+    captured = {}
+
+    monkeypatch.setattr(
+        client,
+        "_symbol_info",
+        lambda symbol: {
+            "symbol": symbol,
+            "baseAssetPrecision": 2,
+            "baseSizePrecision": "1",
+            "filters": [],
+        },
+    )
+    monkeypatch.setattr(client, "private_post", lambda path, params=None: captured.setdefault("params", params) or {"status": "ok"})
+
+    client.place_order("DOGEUSDT", "BUY", 30.263, "MARKET")
+
+    assert captured["params"]["quantity"] == "30"
+
+
+def test_place_order_uses_base_asset_precision_if_base_size_precision_missing(monkeypatch):
+    client = MexcClient(DummyConfig())
+    captured = {}
+
+    monkeypatch.setattr(
+        client,
+        "_symbol_info",
+        lambda symbol: {
+            "symbol": symbol,
+            "baseAssetPrecision": 4,
+            "filters": [],
+        },
+    )
+    monkeypatch.setattr(client, "private_post", lambda path, params=None: captured.setdefault("params", params) or {"status": "ok"})
+
+    client.place_order("TESTUSDT", "BUY", 1.234567, "MARKET")
+
+    assert captured["params"]["quantity"] == "1.2345"
+
+
 def test_place_limit_sell_returns_order_id(monkeypatch):
     client = MexcClient(DummyConfig())
 
