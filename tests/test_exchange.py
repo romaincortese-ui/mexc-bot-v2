@@ -252,6 +252,47 @@ def test_place_buy_order_falls_back_to_market_after_timeout(monkeypatch):
     assert calls[-1] == ("DOGEUSDT", "BUY", 5.0, "MARKET", None, None, False)
 
 
+def test_place_buy_order_returns_partial_fill_after_cancel_refresh(monkeypatch):
+    client = MexcClient(DummyConfig())
+
+    monkeypatch.setattr(client, "public_get", lambda path, params=None: {"asks": [["10.1234", "5"]]})
+    monkeypatch.setattr(client, "get_price_filter", lambda symbol: {"tickSize": "0.001"})
+    monkeypatch.setattr(
+        client,
+        "place_order",
+        lambda symbol, side, qty, order_type="MARKET", price=None, time_in_force=None, post_only=False: {"orderId": "maker-buy", "status": "NEW"},
+    )
+    times = iter([0.0, 3.0])
+    statuses = iter([
+        {"orderId": "maker-buy", "status": "PARTIALLY_FILLED", "executedQty": "2.6", "cummulativeQuoteQty": "26.3"},
+    ])
+    monkeypatch.setattr("mexcbot.exchange.time.time", lambda: next(times))
+    monkeypatch.setattr(client, "get_order", lambda symbol, order_id: next(statuses))
+    monkeypatch.setattr(client, "cancel_order", lambda symbol, order_id: {"orderId": order_id, "status": "CANCELED"})
+
+    result = client.place_buy_order("DOGEUSDT", 5.0, use_maker=True)
+
+    assert result is not None
+    assert result["status"] == "PARTIALLY_FILLED"
+    assert result["executedQty"] == "2.6"
+
+
+def test_place_order_formats_market_quantity_from_market_lot_size(monkeypatch):
+    client = MexcClient(DummyConfig())
+    captured = {}
+
+    monkeypatch.setattr(
+        client,
+        "_symbol_filter",
+        lambda symbol, filter_type: {"minQty": "0.1", "stepSize": "0.1"} if filter_type in {"MARKET_LOT_SIZE", "LOT_SIZE"} else {},
+    )
+    monkeypatch.setattr(client, "private_post", lambda path, params=None: captured.setdefault("params", params) or {"status": "ok"})
+
+    client.place_order("TIAUSDT", "BUY", 30.263, "MARKET")
+
+    assert captured["params"]["quantity"] == "30.2"
+
+
 def test_place_limit_sell_returns_order_id(monkeypatch):
     client = MexcClient(DummyConfig())
 

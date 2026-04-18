@@ -1323,3 +1323,57 @@ def test_runtime_state_save_updates_after_partial_close(tmp_path):
     assert len(restored.open_trades) == 1
     assert restored.open_trades[0].qty == 5.0
     assert restored.trade_history[-1]["exit_reason"] == "PARTIAL_TP"
+
+
+def test_reconcile_reconstructs_untracked_holding_into_open_trades():
+    client = StubClient()
+    runtime = LiveBotRuntime(_config(), client)
+    runtime.telegram = StubTelegram()
+
+    def fake_private_get(path, params=None):
+        if path == "/api/v3/account":
+            return {"balances": [{"asset": "USDT", "free": "100", "locked": "0"}, {"asset": "TIA", "free": "26.1", "locked": "0"}]}
+        if path == "/api/v3/openOrders":
+            return []
+        raise AssertionError(path)
+
+    client.private_get = fake_private_get
+    client.public_get = lambda path, params=None: [{"symbol": "TIAUSDT", "price": "0.425"}] if path == "/api/v3/ticker/price" else []
+
+    stats = runtime._reconcile_open_positions(notify=True)
+
+    assert stats["untracked"] == 1
+    assert any(trade.symbol == "TIAUSDT" for trade in runtime.open_trades)
+    assert any("Reconciled holdings" in text for text, _mode in runtime.telegram.sent_messages)
+
+
+def test_daily_summary_reports_previous_utc_day_at_midnight():
+    runtime = LiveBotRuntime(_config(telegram_chat_id="12345"), StubClient())
+    runtime.telegram = StubTelegram()
+    runtime.trade_history = [
+        {
+            "symbol": "DOGEUSDT",
+            "strategy": "SCALPER",
+            "entry_signal": "TREND",
+            "pnl_pct": 2.5,
+            "pnl_usdt": 1.25,
+            "closed_at": datetime(2026, 4, 17, 23, 40, tzinfo=timezone.utc).isoformat(),
+            "opened_at": datetime(2026, 4, 17, 23, 0, tzinfo=timezone.utc).isoformat(),
+        }
+    ]
+
+    original_datetime = runtime_module.datetime
+
+    class _FakeDateTime:
+        @staticmethod
+        def now(tz=None):
+            return datetime(2026, 4, 18, 0, 5, tzinfo=timezone.utc)
+
+    runtime_module.datetime = _FakeDateTime
+    try:
+        runtime._send_daily_summary()
+    finally:
+        runtime_module.datetime = original_datetime
+
+    assert runtime.telegram.sent_messages
+    assert "Trades: <b>1</b>" in runtime.telegram.sent_messages[-1][0]

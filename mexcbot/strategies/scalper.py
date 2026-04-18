@@ -85,20 +85,21 @@ SCALPER_TP_AUTO_OPEN_POS_TIGHTEN = 0.10
 SCALPER_TP_AUTO_OVERSOLD_BLOCK = True
 
 SCALPER_SL_CAP = env_float("SCALPER_SL_CAP", 0.12)
-SCALPER_SL_FLOOR = env_float("SCALPER_SL_FLOOR", 0.05)
+SCALPER_SL_FLOOR = env_float("SCALPER_SL_FLOOR", 0.08)
 SCALPER_SL_ATR_MULT = env_float("SCALPER_SL_ATR_MULT", 3.0)
+SCALPER_TP_CAP = env_float("SCALPER_TP_CAP", 0.08)
 SCALPER_VOLUME_UNIVERSE_LIMIT = 120
 SCALPER_CANDIDATE_LIMIT = 80
 
 SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
     "CROSSOVER": {
-        "tp_min": 0.030,
+        "tp_min": 0.040,
         "tp_atr_mult": 2.5,
-        "breakeven_activation_pct": 0.015,
-        "trail_activation_pct": 0.020,
+        "breakeven_activation_pct": 0.006,
+        "trail_activation_pct": 1.0,
         "trail_pct": 0.025,
-        "partial_tp_trigger_pct": 0.020,
-        "partial_tp_ratio": 0.30,
+        "partial_tp_trigger_pct": 0.0,
+        "partial_tp_ratio": 0.0,
         "floor_chase": 1,
         "floor_buffer_pct": 0.008,
         "flat_max_minutes": 720,
@@ -106,13 +107,13 @@ SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
         "flat_min_profit_pct": 0.005,
     },
     "TREND": {
-        "tp_min": 0.040,
+        "tp_min": 0.050,
         "tp_atr_mult": 3.0,
-        "breakeven_activation_pct": 0.015,
-        "trail_activation_pct": 0.020,
+        "breakeven_activation_pct": 0.006,
+        "trail_activation_pct": 1.0,
         "trail_pct": 0.025,
-        "partial_tp_trigger_pct": 0.020,
-        "partial_tp_ratio": 0.30,
+        "partial_tp_trigger_pct": 0.0,
+        "partial_tp_ratio": 0.0,
         "floor_chase": 1,
         "floor_buffer_pct": 0.010,
         "flat_max_minutes": 960,
@@ -120,13 +121,13 @@ SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
         "flat_min_profit_pct": 0.008,
     },
     "OVERSOLD": {
-        "tp_min": 0.030,
+        "tp_min": 0.040,
         "tp_atr_mult": 2.0,
-        "breakeven_activation_pct": 0.015,
-        "trail_activation_pct": 0.020,
+        "breakeven_activation_pct": 0.006,
+        "trail_activation_pct": 1.0,
         "trail_pct": 0.020,
-        "partial_tp_trigger_pct": 0.020,
-        "partial_tp_ratio": 0.30,
+        "partial_tp_trigger_pct": 0.0,
+        "partial_tp_ratio": 0.0,
         "floor_chase": 1,
         "floor_buffer_pct": 0.008,
         "flat_max_minutes": 720,
@@ -325,7 +326,7 @@ def resolve_scalper_tp_execution_mode(
 def _scalper_exit_profile(entry_signal: str, atr_pct: float, base_trail_pct: float) -> tuple[float, float, dict[str, float | int]]:
     signal = entry_signal.upper()
     profile = dict(SCALPER_SIGNAL_PROFILES.get(signal, SCALPER_SIGNAL_PROFILES["TREND"]))
-    tp_pct = max(float(profile["tp_min"]), atr_pct * float(profile["tp_atr_mult"]))
+    tp_pct = min(SCALPER_TP_CAP, max(float(profile["tp_min"]), atr_pct * float(profile["tp_atr_mult"])))
     sl_pct = max(SCALPER_SL_FLOOR, min(SCALPER_SL_CAP, atr_pct * SCALPER_SL_ATR_MULT))
     profile["trail_pct"] = round(min(float(profile["trail_pct"]), base_trail_pct), 6)
     return round(tp_pct, 6), round(sl_pct, 6), profile

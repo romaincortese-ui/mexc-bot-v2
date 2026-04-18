@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
 import hashlib
 import hmac
 import logging
@@ -45,6 +46,46 @@ class MexcClient:
         self.session = requests.Session()
         self._account_snapshot_cache = {"at": 0.0, "free_usdt": 0.0, "total_equity": 0.0}
         self.last_buy_error = ""
+
+    def _symbol_info(self, symbol: str) -> dict[str, Any]:
+        info = self.public_get("/api/v3/exchangeInfo")
+        for item in info.get("symbols", []):
+            if item.get("symbol") == symbol:
+                return item
+        return {}
+
+    def _symbol_filter(self, symbol: str, filter_type: str) -> dict[str, Any]:
+        item = self._symbol_info(symbol)
+        for filter_row in item.get("filters", []):
+            if filter_row.get("filterType") == filter_type:
+                return filter_row
+        return {}
+
+    def _normalize_qty(self, qty: float, step: str | float, min_qty: str | float) -> float:
+        step_decimal = Decimal(str(step or "0.001"))
+        min_decimal = Decimal(str(min_qty or "0.001"))
+        qty_decimal = Decimal(str(qty))
+        if step_decimal <= 0:
+            step_decimal = Decimal("0.001")
+        rounded = (qty_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN) * step_decimal
+        if rounded < min_decimal:
+            return 0.0
+        return float(rounded.normalize())
+
+    def _format_decimal_str(self, value: float, quantum: str | float) -> str:
+        quantum_decimal = Decimal(str(quantum or "0.001"))
+        if quantum_decimal <= 0:
+            quantum_decimal = Decimal("0.001")
+        normalized = Decimal(str(value)).quantize(quantum_decimal, rounding=ROUND_DOWN)
+        return format(normalized.normalize(), "f")
+
+    def _order_qty_payload(self, symbol: str, qty: float, *, order_type: str) -> tuple[float, str]:
+        filter_type = "MARKET_LOT_SIZE" if order_type.upper() == "MARKET" else "LOT_SIZE"
+        size_filter = self._symbol_filter(symbol, filter_type) or self._symbol_filter(symbol, "LOT_SIZE")
+        step_size = size_filter.get("stepSize", "0.001")
+        min_qty = size_filter.get("minQty", "0.001")
+        normalized_qty = self._normalize_qty(qty, step_size, min_qty)
+        return normalized_qty, self._format_decimal_str(normalized_qty, step_size)
 
     def _canonical_private_items(self, params: dict[str, Any] | None = None) -> list[tuple[str, str]]:
         payload = [(str(key), str(value)) for key, value in (params or {}).items() if value is not None]
@@ -159,29 +200,19 @@ class MexcClient:
         return (best_ask - best_bid) / mid
 
     def get_lot_size(self, symbol: str) -> dict[str, Any]:
-        info = self.public_get("/api/v3/exchangeInfo")
-        for item in info.get("symbols", []):
-            if item.get("symbol") != symbol:
-                continue
-            for filter_row in item.get("filters", []):
-                if filter_row.get("filterType") == "LOT_SIZE":
-                    return filter_row
+        filter_row = self._symbol_filter(symbol, "LOT_SIZE")
+        if filter_row:
+            return filter_row
         return {"minQty": "0.001", "stepSize": "0.001"}
 
     def get_price_filter(self, symbol: str) -> dict[str, Any]:
-        info = self.public_get("/api/v3/exchangeInfo")
-        for item in info.get("symbols", []):
-            if item.get("symbol") != symbol:
-                continue
-            for filter_row in item.get("filters", []):
-                if filter_row.get("filterType") == "PRICE_FILTER":
-                    return filter_row
+        filter_row = self._symbol_filter(symbol, "PRICE_FILTER")
+        if filter_row:
+            return filter_row
         return {"tickSize": "0.0001"}
 
     def round_qty(self, qty: float, step: float) -> float:
-        precision = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
-        rounded = math.floor(qty / step) * step
-        return round(rounded, precision)
+        return self._normalize_qty(qty, step, step)
 
     def round_price(self, price: float, tick_size: float) -> float:
         precision = max(0, -int(math.floor(math.log10(tick_size)))) if tick_size < 1 else 0
@@ -206,11 +237,14 @@ class MexcClient:
             if price is not None:
                 payload["price"] = str(price)
             return payload
+        normalized_qty, quantity_text = self._order_qty_payload(symbol, qty, order_type=order_type)
+        if normalized_qty <= 0:
+            raise ValueError(f"normalized quantity is below minimum for {symbol}: qty={qty}")
         payload = {
             "symbol": symbol,
             "side": side,
             "type": order_type,
-            "quantity": qty,
+            "quantity": quantity_text,
             "newOrderRespType": "FULL",
         }
         if price is not None:
@@ -248,9 +282,11 @@ class MexcClient:
                     )
                     order_id = str(order.get("orderId", ""))
                     if order_id:
+                        last_status: dict[str, Any] | None = None
                         started_at = time.time()
                         while time.time() - started_at < MAKER_ORDER_TIMEOUT_SEC:
                             status = self.get_order(symbol, order_id)
+                            last_status = status
                             state = str(status.get("status", "")).upper()
                             if state == "FILLED":
                                 return status
@@ -258,6 +294,14 @@ class MexcClient:
                                 break
                             time.sleep(0.2)
                         self.cancel_order(symbol, order_id)
+                        try:
+                            final_status = self.get_order(symbol, order_id)
+                        except Exception:
+                            final_status = last_status
+                        if final_status is not None and float(final_status.get("executedQty", 0.0) or 0.0) > 0:
+                            return final_status
+                        if last_status is not None and float(last_status.get("executedQty", 0.0) or 0.0) > 0:
+                            return last_status
             except Exception as exc:
                 log.debug("Maker buy failed for %s: %s", symbol, exc)
 
@@ -279,6 +323,12 @@ class MexcClient:
                 self.last_buy_error = f"qty={qty} | {exc}"
                 log.error("BUY rejected for %s: qty=%s | %s", symbol, qty, exc)
             return None
+
+    def get_my_trades(self, symbol: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        if self.config.paper_trade:
+            return []
+        data = self.private_get("/api/v3/myTrades", {"symbol": symbol, "limit": limit})
+        return data if isinstance(data, list) else []
 
     def place_limit_sell(self, symbol: str, qty: float, price: float, *, maker: bool | None = None) -> str | None:
         maker_enabled = USE_MAKER_ORDERS if maker is None else maker

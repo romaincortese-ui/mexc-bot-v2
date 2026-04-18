@@ -11,6 +11,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
+from datetime import timedelta
 
 import pandas as pd
 import requests
@@ -1392,16 +1393,16 @@ class LiveBotRuntime:
         if not self.telegram.configured:
             return
         now = datetime.now(timezone.utc)
-        today = now.strftime("%Y-%m-%d")
-        if self._last_daily_summary_date == today or now.hour != 0:
+        summary_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        if self._last_daily_summary_date == summary_date or now.hour != 0:
             return
-        self._last_daily_summary_date = today
+        self._last_daily_summary_date = summary_date
         today_trades = [
             item for item in self.trade_history
-            if str(item.get("closed_at") or "")[:10] == today and not item.get("is_partial")
+            if str(item.get("closed_at") or "")[:10] == summary_date and not item.get("is_partial")
         ]
         if not today_trades:
-            self._notify(f"📅 <b>Daily Summary</b> [{self._mode_label()}]\n━━━━━━━━━━━━━━━\nNo trades today.")
+            self._notify(f"📅 <b>Daily Summary</b> [{self._mode_label()}]\n━━━━━━━━━━━━━━━\nNo trades on {summary_date}.")
             self._record_activity("Daily summary sent (no trades)")
             return
         total_pnl = sum(float(item.get("pnl_usdt", 0.0) or 0.0) for item in today_trades)
@@ -1488,6 +1489,66 @@ class LiveBotRuntime:
             f"Exit {float(closed.get('exit_price', 0.0) or 0.0):.6f}{remainder}{hold_line}"
         )
 
+    def _build_reconciled_trade(self, *, symbol: str, qty: float, mark_price: float, open_orders: list[dict[str, object]]) -> Trade | None:
+        if qty <= 0 or mark_price <= 0:
+            return None
+        strategy = "SCALPER" if "SCALPER" in {item.upper() for item in self.config.strategies} else (self.config.strategies[0] if self.config.strategies else "SCALPER")
+        tp_pct = self.config.take_profit_pct
+        sl_pct = self.config.stop_loss_pct
+        metadata: dict[str, object] = {"reconciled_untracked": True}
+        tp_order_id: str | None = None
+        symbol_orders = [order for order in open_orders if str(order.get("symbol") or "") == symbol]
+        sell_orders = [order for order in symbol_orders if str(order.get("side") or "").upper() == "SELL"]
+        if strategy == "SCALPER":
+            dummy = Opportunity(
+                symbol=symbol,
+                score=0.0,
+                price=mark_price,
+                rsi=0.0,
+                rsi_score=0.0,
+                ma_score=0.0,
+                vol_score=0.0,
+                vol_ratio=0.0,
+                entry_signal="RECONCILED",
+                strategy="SCALPER",
+                atr_pct=None,
+                metadata={},
+            )
+            tp_pct = dummy.tp_pct or self.config.take_profit_pct
+            sl_pct = dummy.sl_pct or self.config.stop_loss_pct
+            metadata["tp_execution_mode"] = "internal"
+        elif strategy in {"GRID", "TRINITY"} and sell_orders:
+            tp_order_id = str(sell_orders[0].get("orderId") or "") or None
+            try:
+                order_price = float(sell_orders[0].get("price", 0.0) or 0.0)
+                if order_price > 0:
+                    tp_pct = max(0.0, order_price / mark_price - 1.0)
+            except Exception:
+                pass
+            metadata["tp_execution_mode"] = "exchange"
+        entry_price = mark_price
+        return Trade(
+            symbol=symbol,
+            entry_price=entry_price,
+            qty=qty,
+            tp_price=round(entry_price * (1 + tp_pct), 8),
+            sl_price=round(entry_price * (1 - sl_pct), 8),
+            opened_at=datetime.now(timezone.utc),
+            order_id=f"RECONCILED_{symbol}_{int(time.time())}",
+            score=0.0,
+            entry_signal="RECONCILED",
+            paper=self.config.paper_trade,
+            strategy=strategy,
+            highest_price=entry_price,
+            last_price=entry_price,
+            atr_pct=None,
+            metadata=metadata,
+            entry_cost_usdt=round(entry_price * qty, 8),
+            remaining_cost_usdt=round(entry_price * qty, 8),
+            entry_fee_usdt=0.0,
+            tp_order_id=tp_order_id,
+        )
+
     def _reconcile_open_positions(self, *, notify: bool = False) -> dict[str, int]:
         if self.config.paper_trade:
             return {"stale": 0, "untracked": 0, "orphaned": 0}
@@ -1522,15 +1583,23 @@ class LiveBotRuntime:
             except Exception:
                 price_map = {}
             untracked_assets: list[str] = []
+            reconciled_symbols: list[str] = []
+            open_orders = self.client.private_get("/api/v3/openOrders", {})
+            order_rows = open_orders if isinstance(open_orders, list) else []
             for asset, qty in balances.items():
                 if asset in {"USDT", "MX"} or asset in known_assets or qty <= 0:
                     continue
-                value = qty * float(price_map.get(f"{asset}USDT", 0.0) or 0.0)
+                symbol = f"{asset}USDT"
+                mark_price = float(price_map.get(symbol, 0.0) or 0.0)
+                value = qty * mark_price
                 if value >= 5.0:
                     untracked += 1
                     untracked_assets.append(f"{asset}: {qty:.4f} (~${value:.2f})")
-            open_orders = self.client.private_get("/api/v3/openOrders", {})
-            order_rows = open_orders if isinstance(open_orders, list) else []
+                    reconciled = self._build_reconciled_trade(symbol=symbol, qty=qty, mark_price=mark_price, open_orders=order_rows)
+                    if reconciled is not None:
+                        self.open_trades.append(reconciled)
+                        known_assets.add(asset)
+                        reconciled_symbols.append(symbol)
             known_symbols = {trade.symbol for trade in self.open_trades}
             orphaned_symbols = sorted({str(order.get("symbol") or "") for order in order_rows if str(order.get("symbol") or "") not in known_symbols})
             orphaned = len(orphaned_symbols)
@@ -1540,6 +1609,9 @@ class LiveBotRuntime:
             if notify and untracked_assets:
                 self._record_activity(f"Reconcile untracked={len(untracked_assets)}")
                 self._notify("⚠️ <b>Untracked holdings</b>\n" + "\n".join(untracked_assets))
+            if notify and reconciled_symbols:
+                self._record_activity(f"Reconcile tracked={len(reconciled_symbols)}")
+                self._notify("✅ <b>Reconciled holdings</b>\n" + "\n".join(reconciled_symbols))
             if notify and orphaned_symbols:
                 self._record_activity(f"Reconcile orphaned={len(orphaned_symbols)}")
                 self._notify("⚠️ <b>Orphaned orders</b> | " + ", ".join(orphaned_symbols))

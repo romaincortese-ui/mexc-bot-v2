@@ -28,8 +28,8 @@ SCALPER_PROG_TIGHTEN = env_float("SCALPER_PROG_TIGHTEN", 0.30)
 SCALPER_PARTIAL_TP_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_MIN_SCORE", 45.0)
 SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE", 55.0)
 SCALPER_PARTIAL_TP_RATIO_CAP = env_float("SCALPER_PARTIAL_TP_RATIO_CAP", 0.30)
-SCALPER_PEAK_DROP_PCT = env_float("SCALPER_PEAK_DROP_PCT", 0.020)            # 2% drop from peak after breakeven
-SCALPER_PEAK_DROP_ATR_MULT = env_float("SCALPER_PEAK_DROP_ATR_MULT", 1.5)    # scale with ATR
+SCALPER_PEAK_DROP_PCT = env_float("SCALPER_PEAK_DROP_PCT", 0.015)            # 1.5% drop from peak after breakeven
+SCALPER_PEAK_DROP_ATR_MULT = env_float("SCALPER_PEAK_DROP_ATR_MULT", 0.0)    # disabled for scalper; keep fixed drop
 MOONSHOT_PEAK_DROP_PCT = env_float("MOONSHOT_PEAK_DROP_PCT", 0.015)          # 1.5% drop from peak after breakeven
 MOONSHOT_PEAK_DROP_ATR_MULT = env_float("MOONSHOT_PEAK_DROP_ATR_MULT", 2.0)  # scale with ATR for volatile coins
 REVERSAL_PEAK_DROP_PCT = env_float("REVERSAL_PEAK_DROP_PCT", 0.012)          # 1.2% drop from peak after breakeven
@@ -82,11 +82,11 @@ DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
         "flat_min_profit_pct": 0.001,
     },
     "SCALPER": {
-        "breakeven_activation_pct": env_float("SCALPER_BREAKEVEN_ACT", 0.015),
-        "trail_activation_pct": env_float("SCALPER_TRAIL_ACT", 0.020),
+        "breakeven_activation_pct": env_float("SCALPER_BREAKEVEN_ACT", 0.006),
+        "trail_activation_pct": env_float("SCALPER_TRAIL_ACT", 1.0),
         "trail_pct": env_float("SCALPER_TRAIL_PCT", 0.025),
-        "partial_tp_trigger_pct": 0.020,
-        "partial_tp_ratio": 0.30,
+        "partial_tp_trigger_pct": 0.0,
+        "partial_tp_ratio": 0.0,
         "floor_chase": 1,
         "flat_max_minutes": env_int("SCALPER_FLAT_MINS", 720),
         "flat_range_pct": env_float("SCALPER_FLAT_RANGE", 0.015),
@@ -131,25 +131,31 @@ DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
 SIGNAL_EXIT_PROFILE_OVERLAYS: dict[str, dict[str, dict[str, float | int]]] = {
     "SCALPER": {
         "CROSSOVER": {
-            "breakeven_activation_pct": 0.015,
-            "trail_activation_pct": 0.020,
+            "breakeven_activation_pct": 0.006,
+            "trail_activation_pct": 1.0,
             "trail_pct": 0.025,
+            "partial_tp_trigger_pct": 0.0,
+            "partial_tp_ratio": 0.0,
             "flat_max_minutes": 720,
             "flat_range_pct": 0.015,
             "flat_min_profit_pct": 0.005,
         },
         "TREND": {
-            "breakeven_activation_pct": 0.015,
-            "trail_activation_pct": 0.020,
+            "breakeven_activation_pct": 0.006,
+            "trail_activation_pct": 1.0,
             "trail_pct": 0.025,
+            "partial_tp_trigger_pct": 0.0,
+            "partial_tp_ratio": 0.0,
             "flat_max_minutes": 960,
             "flat_range_pct": 0.020,
             "flat_min_profit_pct": 0.008,
         },
         "OVERSOLD": {
-            "breakeven_activation_pct": 0.015,
-            "trail_activation_pct": 0.020,
+            "breakeven_activation_pct": 0.006,
+            "trail_activation_pct": 1.0,
             "trail_pct": 0.020,
+            "partial_tp_trigger_pct": 0.0,
+            "partial_tp_ratio": 0.0,
             "flat_max_minutes": 720,
             "flat_range_pct": 0.015,
             "flat_min_profit_pct": 0.005,
@@ -308,15 +314,8 @@ def initialize_exit_state(
     if trade.get("atr_pct") is None and atr_pct is not None:
         trade["atr_pct"] = atr_pct
     if strategy_name == "SCALPER":
-        score = float(trade.get("score") or 0.0)
-        partial_tp_ratio = float(trade.get("partial_tp_ratio") or 0.0)
-        min_score = SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE if entry_signal.upper() == "OVERSOLD" else SCALPER_PARTIAL_TP_MIN_SCORE
-        if partial_tp_ratio > 0:
-            if score < min_score:
-                trade["partial_tp_ratio"] = 0.0
-                trade["partial_tp_price"] = None
-            else:
-                trade["partial_tp_ratio"] = round(min(partial_tp_ratio, SCALPER_PARTIAL_TP_RATIO_CAP), 4)
+        trade["partial_tp_ratio"] = 0.0
+        trade["partial_tp_price"] = None
     return trade
 
 
@@ -569,7 +568,7 @@ def evaluate_trade_action(
         }
 
     trail_activation = float(profile["trail_activation_pct"])
-    if peak_gain >= trail_activation or bool(trade.get("partial_tp_done")):
+    if strategy != "SCALPER" and (peak_gain >= trail_activation or bool(trade.get("partial_tp_done"))):
         trade["trail_active"] = True
         trail_pct = _resolve_trail_pct(strategy, atr_pct, trade.get("exit_profile_override"))
         progressive_trail = strategy in {"MOONSHOT", "REVERSAL", "TRINITY", "SCALPER"}
@@ -602,10 +601,11 @@ def evaluate_trade_action(
             base_drop = GENERIC_PEAK_DROP_PCT
             atr_mult = GENERIC_PEAK_DROP_ATR_MULT
         peak_drop_pct = base_drop
-        if atr_pct is not None:
+        if atr_pct is not None and atr_mult > 0:
             peak_drop_pct = max(peak_drop_pct, atr_pct * atr_mult)
         drop_from_peak = (highest_price - current_price) / highest_price if highest_price > 0 else 0.0
-        if drop_from_peak >= peak_drop_pct:
+        current_above_breakeven = current_price >= calculate_true_breakeven(entry_price)
+        if drop_from_peak >= peak_drop_pct and current_above_breakeven:
             return {"action": "exit", "reason": "PROTECT_STOP", "price": current_price}
 
     # Scalper rotation: exit if a significantly stronger SCALPER signal is available

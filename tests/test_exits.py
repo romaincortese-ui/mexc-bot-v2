@@ -30,7 +30,7 @@ def _strategy_trade(strategy: str, entry_signal: str) -> dict:
     return initialize_exit_state(trade, strategy=strategy, opened_at=trade["opened_at"])
 
 
-def test_breakeven_and_trailing_stop_activate_after_profit_expands():
+def test_scalper_breakeven_and_peak_protect_exit_after_profit_expands():
     trade = _base_trade("SCALPER")
     trade["atr_pct"] = 0.008
     trade["tp_price"] = 108.0
@@ -44,8 +44,8 @@ def test_breakeven_and_trailing_stop_activate_after_profit_expands():
 
     assert first_check == (False, "", None)
     assert trade["breakeven_done"] is True
-    assert trade["trail_active"] is True
-    assert float(trade["trail_stop_price"]) > 100.0
+    assert trade["trail_active"] is False
+    assert trade["trail_stop_price"] is None
 
     should_exit, reason, exit_price = evaluate_exit(
         trade,
@@ -56,8 +56,8 @@ def test_breakeven_and_trailing_stop_activate_after_profit_expands():
     )
 
     assert should_exit is True
-    assert reason == "TRAILING_STOP"
-    assert exit_price == trade["trail_stop_price"]
+    assert reason == "PROTECT_STOP"
+    assert exit_price == 100.5
 
 
 def test_flat_exit_triggers_when_trade_stalls_past_strategy_window():
@@ -162,7 +162,7 @@ def test_exit_profile_override_updates_trade_management_behavior():
     }
     initialize_exit_state(trade, strategy="SCALPER", opened_at=trade["opened_at"])
 
-    assert trade["partial_tp_ratio"] == 0.3
+    assert trade["partial_tp_ratio"] == 0.0
 
     action = evaluate_trade_action(
         trade,
@@ -204,8 +204,8 @@ def test_scalper_partial_tp_caps_ratio_for_high_score_setup():
 
     initialize_exit_state(trade, strategy="SCALPER", opened_at=trade["opened_at"])
 
-    assert trade["partial_tp_ratio"] == 0.3
-    assert round(float(trade["partial_tp_price"]), 2) == 100.9
+    assert trade["partial_tp_ratio"] == 0.0
+    assert trade["partial_tp_price"] is None
 
 
 def test_scalper_signal_profiles_share_unified_timeout():
@@ -314,7 +314,7 @@ def test_stop_loss_watch_resets_after_recovery_above_stop_band():
     assert final_action == {"action": "hold", "reason": "", "price": None}
 
 
-def test_scalper_progressive_trail_tightens_after_large_run():
+def test_scalper_large_run_keeps_using_peak_protect_without_trailing_stop():
     trade = _base_trade("SCALPER")
     trade["atr_pct"] = 0.008
     trade["tp_price"] = 105.0
@@ -328,8 +328,8 @@ def test_scalper_progressive_trail_tightens_after_large_run():
     )
 
     assert action == {"action": "hold", "reason": "", "price": None}
-    assert trade["trail_active"] is True
-    assert float(trade["trail_stop_price"]) > 100.0
+    assert trade["trail_active"] is False
+    assert trade["trail_stop_price"] is None
 
 
 def test_scalper_protect_stop_exits_after_stalled_giveback():
@@ -347,15 +347,15 @@ def test_scalper_protect_stop_exits_after_stalled_giveback():
     )
     stalled_action = evaluate_trade_action(
         trade,
-        current_price=100.2,
+        current_price=100.5,
         current_time=trade["opened_at"] + timedelta(minutes=8),
-        bar_high=100.3,
-        bar_low=100.1,
+        bar_high=100.6,
+        bar_low=100.4,
     )
 
     assert first_action == {"action": "hold", "reason": "", "price": None}
     assert trade["breakeven_done"] is True
-    assert stalled_action == {"action": "exit", "reason": "PROTECT_STOP", "price": 100.2}
+    assert stalled_action == {"action": "exit", "reason": "PROTECT_STOP", "price": 100.5}
 
 
 def test_moonshot_breakout_and_rebound_burst_hold_under_unified_timeout():
