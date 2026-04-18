@@ -29,6 +29,9 @@ Important variables:
 - `FUTURES_PAPER_TRADE=true`
 - `FUTURES_SYMBOL=BTC_USDT`
 - `FUTURES_MARGIN_BUDGET_USDT=75`
+- `FUTURES_TELEGRAM_TOKEN=...`
+- `FUTURES_TELEGRAM_CHAT_ID=...`
+- `FUTURES_HEARTBEAT_SECONDS=3600`
 - `FUTURES_SCORE_THRESHOLD=56`
 - `FUTURES_LEVERAGE_MIN=20`
 - `FUTURES_LEVERAGE_MAX=50`
@@ -44,11 +47,27 @@ Important variables:
 
 The project reuses `MEXC_API_KEY`, `MEXC_API_SECRET`, `REDIS_URL`, and `ANTHROPIC_API_KEY` when present.
 
+If you do not set `FUTURES_TELEGRAM_TOKEN` or `FUTURES_TELEGRAM_CHAT_ID`, the runtime falls back to `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID`.
+
 ## Run Live Runtime
 
 ```bash
 python Futures-bot/main.py
 ```
+
+The runtime now sends Telegram notifications for:
+
+- startup
+- hourly heartbeat/status
+- new position opened
+- position closed
+- loop errors with cooldown protection
+
+Supported Telegram commands:
+
+- `/status`
+- `/close`
+- `/help`
 
 ## Run 60-Day Backtest
 
