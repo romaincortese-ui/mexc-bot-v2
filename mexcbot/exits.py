@@ -608,10 +608,15 @@ def evaluate_trade_action(
         if drop_from_peak >= peak_drop_pct and current_above_breakeven:
             return {"action": "exit", "reason": "PROTECT_STOP", "price": current_price}
 
-    # Scalper rotation: exit if a significantly stronger SCALPER signal is available
+    # Scalper rotation: exit if a significantly stronger SCALPER signal is available.
+    # Guarded so we never force-realize a loss to chase a better score: the trade
+    # must be at roughly flat/breakeven (no worse than -0.5% from entry). Rotation
+    # is a displacement heuristic, not an atomic swap -- the freed slot may or may
+    # not end up holding the rescored candidate, so sitting on a moderate red
+    # trade is usually better than crystallising the loss for a maybe-entry.
     if strategy == "SCALPER" and best_score > 0 and not bool(trade.get("trail_active")):
         trade_score = float(trade.get("score") or 0.0)
-        if best_score - trade_score >= 15.0:
+        if best_score - trade_score >= 15.0 and pct_gain >= -0.005:
             return {"action": "exit", "reason": "ROTATION", "price": current_price}
 
     max_hold_minutes = int(trade.get("max_hold_minutes") or profile["flat_max_minutes"])

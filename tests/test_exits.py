@@ -481,3 +481,21 @@ def test_scalper_rotation_exits_when_better_setup_opens_and_trade_has_not_progre
     assert should_exit is True
     assert reason == "ROTATION"
     assert exit_price == 100.6
+
+
+def test_scalper_rotation_blocked_when_trade_is_underwater():
+    """Never realize a > 0.5% loss just to chase a better scalper score."""
+    trade = _base_trade("SCALPER")
+    trade["score"] = 40.0
+
+    should_exit, reason, _exit_price = evaluate_exit(
+        trade,
+        current_price=99.3,  # -0.7% vs entry=100.0, still above SL=99.0
+        current_time=trade["opened_at"] + timedelta(minutes=6),
+        bar_high=99.5,
+        bar_low=99.2,
+        best_score=70.0,  # would otherwise qualify: gap >= 15
+    )
+
+    assert should_exit is False
+    assert reason == ""
