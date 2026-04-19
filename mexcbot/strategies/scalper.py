@@ -87,6 +87,10 @@ SCALPER_TP_AUTO_OVERSOLD_BLOCK = True
 SCALPER_SL_CAP = env_float("SCALPER_SL_CAP", 0.12)
 SCALPER_SL_FLOOR = env_float("SCALPER_SL_FLOOR", 0.08)
 SCALPER_SL_ATR_MULT = env_float("SCALPER_SL_ATR_MULT", 3.0)
+# Upper bound on per-bar ATR%. Above this the SL sizing pins to SCALPER_SL_CAP
+# and the stop becomes a 12%+ absorber rather than a meaningful risk control,
+# so we filter those tokens out at entry instead of burning capital on them.
+SCALPER_MAX_ATR_PCT = env_float("SCALPER_MAX_ATR_PCT", 0.04)
 SCALPER_TP_CAP = env_float("SCALPER_TP_CAP", 0.08)
 SCALPER_VOLUME_UNIVERSE_LIMIT = 120
 SCALPER_CANDIDATE_LIMIT = 80
@@ -404,6 +408,12 @@ def score_symbol_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: f
     atr = calc_atr(frame, period=SCALPER_ATR_PERIOD) if {"high", "low", "close"}.issubset(frame.columns) else float("nan")
     atr_pct = (atr / float(close.iloc[-1])) if not np.isnan(atr) and float(close.iloc[-1]) > 0 else 0.008
     if atr_pct < params["min_atr_pct"]:
+        return None
+    # Volatility ceiling: tokens moving >SCALPER_MAX_ATR_PCT per bar on average
+    # require stops wider than the SCALPER_SL_CAP we're comfortable assuming,
+    # so the SL stops being a meaningful risk control. Reject them upfront
+    # instead of clamping the stop and hoping.
+    if atr_pct > SCALPER_MAX_ATR_PCT:
         return None
 
     keltner_bonus = KELTNER_SCORE_BONUS if KELTNER_SCORE_BONUS > 0 and {"high", "low", "close"}.issubset(frame.columns) and keltner_breakout(frame) else 0.0

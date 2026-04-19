@@ -175,6 +175,38 @@ def test_classify_entry_signal_uses_configured_crossover_volume_threshold():
     assert result == "TREND"
 
 
+def test_score_symbol_from_frame_rejects_high_volatility_token(monkeypatch):
+    """Tokens with atr_pct above SCALPER_MAX_ATR_PCT are vetoed at entry so
+    we don't scalp assets that require a 12%+ stop to survive normal bar
+    noise (e.g. PHB class)."""
+    _reset_scalper_env(monkeypatch)
+
+    # Use the same strong-setup frame as the passing case; only the ATR is
+    # inflated so the veto fires in isolation.
+    close = [10.0, 9.9, 9.8, 9.7, 9.6, 9.55, 9.5, 9.48, 9.45, 9.4, 9.35, 9.3, 9.28, 9.25, 9.2]
+    close += [9.22, 9.25, 9.3, 9.38, 9.5, 9.62, 9.74, 9.88, 10.02, 10.16, 10.28, 10.35, 10.4, 10.45, 10.5]
+    close += [10.55, 10.58, 10.6, 10.55, 10.5, 10.56, 10.62, 10.67, 10.61, 10.68, 10.74, 10.7, 10.78, 10.84, 10.8]
+    close += [10.88, 10.94, 10.9, 10.98, 11.04, 11.0, 11.08, 11.14, 11.1, 11.18, 11.14, 11.22, 11.3, 11.26, 11.34]
+    volume = [1000] * 59 + [4000]
+    frame = pd.DataFrame(
+        {
+            "open": close[:60],
+            "high": [value * 1.005 for value in close[:60]],
+            "low": [value * 0.995 for value in close[:60]],
+            "close": close[:60],
+            "volume": volume[:60],
+        }
+    )
+
+    # Force atr/price ratio above the default 4% ceiling: atr=0.6 on a ~11.3
+    # close yields atr_pct ~= 0.053 (5.3%), which should reject.
+    monkeypatch.setattr("mexcbot.strategies.scalper.calc_atr", lambda *_a, **_k: 0.6)
+
+    result = score_symbol_from_frame("PHBUSDT", frame, score_threshold=20.0)
+
+    assert result is None
+
+
 def test_score_symbol_from_frame_treats_recent_cross_as_trend_not_fresh_crossover(monkeypatch):
     _reset_scalper_env(monkeypatch)
     close = [10.0 + (index * 0.02) for index in range(60)]

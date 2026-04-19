@@ -58,6 +58,7 @@ KELLY_MULT_STANDARD = env_float("KELLY_MULT_STANDARD", 1.00)
 KELLY_MULT_HIGH_CONF = env_float("KELLY_MULT_HIGH_CONF", 1.50)
 DEFENSIVE_EXIT_REASONS = {
     "STOP_LOSS",
+    "BREAKEVEN_STOP",
     "TRAILING_STOP",
     "TIMEOUT",
     "FLAT_EXIT",
@@ -1072,18 +1073,24 @@ class LiveBotRuntime:
     def _post_trade_analysis(self, closed: dict) -> None:
         """Analyse a losing trade in a background thread using Haiku + web search."""
         pnl_pct = float(closed.get("pnl_pct", 0.0) or 0.0)
+        symbol = closed.get("symbol") or "?"
         if pnl_pct >= 0:
             return
         if not self._anthropic_enabled():
+            log.info("Post-trade analysis skipped for %s: ANTHROPIC_API_KEY not configured", symbol)
             return
-        if not env_bool("WEB_SEARCH_ENABLED", False):
+        # Default ON: the whole point of this hook is to diagnose losing trades
+        # like PHB -12.76%. Explicit opt-out via WEB_SEARCH_ENABLED=false still
+        # works (e.g. to cap Anthropic API spend).
+        if not env_bool("WEB_SEARCH_ENABLED", True):
+            log.info("Post-trade analysis skipped for %s: WEB_SEARCH_ENABLED=false", symbol)
             return
 
         def _run() -> None:
             try:
                 self._do_post_trade_analysis(closed)
             except Exception as exc:
-                log.debug("Post-trade analysis failed for %s: %s", closed.get("symbol"), exc)
+                log.warning("Post-trade analysis failed for %s: %s", closed.get("symbol"), exc)
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()

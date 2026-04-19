@@ -499,3 +499,71 @@ def test_scalper_rotation_blocked_when_trade_is_underwater():
 
     assert should_exit is False
     assert reason == ""
+
+
+def test_stop_after_breakeven_is_tagged_breakeven_stop():
+    """When breakeven has armed (SL lifted to entry) and price gives it back,
+    the exit reason should be BREAKEVEN_STOP, not STOP_LOSS -- a -0.3%
+    "STOP_LOSS" is misleading; it was really a BE hit."""
+    trade = _base_trade("SCALPER")
+    trade["atr_pct"] = 0.008
+    # Step 1: push price high enough to arm breakeven (SCALPER BE act = 0.6%).
+    first_check = evaluate_exit(
+        trade,
+        current_price=100.8,
+        current_time=trade["opened_at"] + timedelta(minutes=5),
+        bar_high=100.9,
+        bar_low=100.5,
+    )
+    assert first_check == (False, "", None)
+    assert trade["breakeven_done"] is True
+    assert float(trade["sl_price"]) >= float(trade["entry_price"])
+
+    # Step 2: price drifts to the new entry-level stop; first breach starts
+    # the confirm clock, then the next poll past confirm-secs exits BE-tagged.
+    first_breach = evaluate_exit(
+        trade,
+        current_price=99.95,
+        current_time=trade["opened_at"] + timedelta(minutes=10),
+        bar_high=100.2,
+        bar_low=99.90,
+    )
+    assert first_breach[0] is False
+
+    should_exit, reason, _exit_price = evaluate_exit(
+        trade,
+        current_price=99.80,
+        current_time=trade["opened_at"] + timedelta(minutes=12),
+        bar_high=100.0,
+        bar_low=99.70,
+    )
+    assert should_exit is True
+    assert reason == "BREAKEVEN_STOP"
+
+
+def test_hard_stop_loss_is_not_relabelled_as_breakeven():
+    """A true hard-floor blowthrough must remain STOP_LOSS even if breakeven
+    armed earlier -- it represents a risk-control failure, not a BE give-back."""
+    trade = _base_trade("SCALPER")
+    trade["atr_pct"] = 0.008
+
+    evaluate_exit(
+        trade,
+        current_price=100.8,
+        current_time=trade["opened_at"] + timedelta(minutes=5),
+        bar_high=100.9,
+        bar_low=100.5,
+    )
+    assert trade["breakeven_done"] is True
+
+    # Catastrophic drop: pct_gain <= -(sl_pct*100 + 4) triggers the hard floor.
+    # sl distance from entry = 1%; hard floor = -5%; -6% blows through.
+    should_exit, reason, _exit_price = evaluate_exit(
+        trade,
+        current_price=94.0,
+        current_time=trade["opened_at"] + timedelta(minutes=20),
+        bar_high=95.0,
+        bar_low=93.5,
+    )
+    assert should_exit is True
+    assert reason == "STOP_LOSS"

@@ -436,6 +436,22 @@ def _clear_stop_watch(trade: MutableMapping[str, object]) -> None:
     trade.pop("_sl_breach_price", None)
 
 
+def _stop_loss_reason(trade: Mapping[str, object], stop_price: float) -> str:
+    """Return BREAKEVEN_STOP when the active stop was raised to entry after
+    breakeven armed, otherwise STOP_LOSS. Pure telemetry helper -- does not
+    change any gating or sizing logic."""
+    if not bool(trade.get("breakeven_done")):
+        return "STOP_LOSS"
+    entry_price = float(trade.get("entry_price") or 0.0)
+    if entry_price <= 0:
+        return "STOP_LOSS"
+    # A tiny slack: pricing rounding could push stop fractionally below entry
+    # after breakeven but it's still conceptually a breakeven-stop.
+    if stop_price >= entry_price * 0.999:
+        return "BREAKEVEN_STOP"
+    return "STOP_LOSS"
+
+
 def _evaluate_stop_loss(
     trade: MutableMapping[str, object],
     *,
@@ -451,6 +467,7 @@ def _evaluate_stop_loss(
     hard_sl_pct = -(sl_pct * 100.0 + 4.0)
     if pct_gain * 100.0 <= hard_sl_pct:
         _clear_stop_watch(trade)
+        # Hard floor is a true stop-loss, never a breakeven exit.
         return {"action": "exit", "reason": "STOP_LOSS", "price": stop_price}
 
     atr_pct = float(trade.get("atr_pct") or trade.get("trail_pct") or sl_pct or 0.02)
@@ -461,7 +478,7 @@ def _evaluate_stop_loss(
 
     if low_price <= hard_breach_price:
         _clear_stop_watch(trade)
-        return {"action": "exit", "reason": "STOP_LOSS", "price": stop_price}
+        return {"action": "exit", "reason": _stop_loss_reason(trade, stop_price), "price": stop_price}
 
     if current_price > recovery_price:
         _clear_stop_watch(trade)
@@ -479,7 +496,7 @@ def _evaluate_stop_loss(
     trade["_sl_breach_price"] = min(float(trade.get("_sl_breach_price") or current_price), current_price)
     if (current_dt - breach_at).total_seconds() >= confirm_secs:
         _clear_stop_watch(trade)
-        return {"action": "exit", "reason": "STOP_LOSS", "price": stop_price}
+        return {"action": "exit", "reason": _stop_loss_reason(trade, stop_price), "price": stop_price}
     return None
 
 
