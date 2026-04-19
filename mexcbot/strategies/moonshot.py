@@ -41,8 +41,26 @@ MOONSHOT_TREND_CONTINUATION_EXTRA_SCORE = 8.0
 MOONSHOT_TREND_CONTINUATION_MAX_MATURITY = 0.45
 MOONSHOT_TP_MIN = env_float("MOONSHOT_TP_MIN", 0.10)
 MOONSHOT_TP_ATR_MULT = 3.5
-MOONSHOT_SL_ATR_MULT = 2.3
+# Memecoin-trader-inspired stop calibration: realized-vol-adaptive, not floored at
+# arbitrary 3%.  The 15-day backtest showed every MOONSHOT TREND_CONTINUATION
+# loser (PEPE/WIF/BONK, atr_pct 0.22-0.27%) taking the full -3.19% floor stop
+# while typical wins only scaled out at 1.5% partial_tp; that inverted R:R is
+# what drove the strategy PF to 0.61.  We now:
+#   - tighten the ATR mult (2.3 -> 2.0) so stops breathe ~1x candle on typical
+#     5m memecoin ranges instead of 1.15x;
+#   - drop the floor 3% -> 0.8% so low-vol setups (atr_pct < 1.3%) actually get
+#     a proportional stop instead of eating 12-14x ATR in worst-case bleeds;
+#   - keep the 8% cap -- a genuinely volatile memecoin should still be room to
+#     breathe on a legit breakout.
+MOONSHOT_SL_ATR_MULT = env_float("MOONSHOT_SL_ATR_MULT", 2.0)
+MOONSHOT_SL_FLOOR = env_float("MOONSHOT_SL_FLOOR", 0.008)
 MOONSHOT_SL_CAP = env_float("MOONSHOT_SL_CAP", 0.08)
+# Minimum realized-volatility floor for MOONSHOT entries.  Low-ATR setups can't
+# physically reach partial_tp_trigger (~1.5-1.7%) within the 90-minute trend
+# timeout, so they skew R:R negative by design.  0.25% blocks both 04-18 losses
+# (WIF atr 0.22%, BONK atr 0.23%) while still admitting the PEPE 04-10 winner
+# (atr 0.28%).  Set to 0 to disable.
+MOONSHOT_MIN_ATR_PCT = env_float("MOONSHOT_MIN_ATR_PCT", 0.0025)
 MOONSHOT_TREND_MIN_VOL_RATIO = 1.50
 MOONSHOT_TREND_MIN_RSI_DELTA = 0.5
 MOONSHOT_TREND_MIN_VOL_ZSCORE = 0.3
@@ -367,8 +385,13 @@ def score_moonshot_from_frame(
 
     atr = calc_atr(frame, period=14)
     atr_pct = (atr / price_now) if not np.isnan(atr) and price_now > 0 else 0.012
+    # Skip entries where realized volatility is too low to plausibly reach the
+    # partial_tp trigger within the trend timeout.  See MOONSHOT_MIN_ATR_PCT
+    # docstring above for sizing rationale.
+    if MOONSHOT_MIN_ATR_PCT > 0 and atr_pct < MOONSHOT_MIN_ATR_PCT:
+        return None
     tp_pct = max(params["tp_min"], atr_pct * params["tp_atr_mult"])
-    sl_pct = min(MOONSHOT_SL_CAP, max(0.03, atr_pct * MOONSHOT_SL_ATR_MULT))
+    sl_pct = min(MOONSHOT_SL_CAP, max(MOONSHOT_SL_FLOOR, atr_pct * MOONSHOT_SL_ATR_MULT))
 
     entry_signal = classify_entry_signal(
         crossed_now=crossed_up,

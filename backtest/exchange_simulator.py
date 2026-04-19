@@ -112,6 +112,7 @@ class SyntheticExchangeSimulator:
             "PROTECT_STOP",
             "MANUAL_CLOSE",
             "EMERGENCY_CLOSE",
+            "EARLY_TIMEOUT",
         }
 
     def can_retry(self, attempt_number: int) -> bool:

@@ -55,6 +55,18 @@ FLAT_EXIT_MIN_ABOVE_BE = env_float("FLAT_EXIT_MIN_ABOVE_BE", 0.015)
 TIMEOUT_MIN_ABOVE_BE = env_float("TIMEOUT_MIN_ABOVE_BE", 0.02)          # 2% above breakeven
 TIMEOUT_MIN_HOLD_MINUTES = env_int("TIMEOUT_MIN_HOLD_MINUTES", 2880)    # 48 hours
 
+# MOONSHOT-specific early time-kill.  Memecoin momentum theses confirm fast
+# (15-60 min on a 5m chart) or fail fast -- sitting in a red MOONSHOT trade for
+# hours waiting for the full stop turns every miss into a maximum loss.  If
+# held >= MOONSHOT_EARLY_TIMEOUT_MINS and still underwater beyond
+# MOONSHOT_EARLY_TIMEOUT_LOSS_PCT, close at market.  Only fires below BE
+# (breakeven_done is False), so we never eject a winner.  Defaults are tuned
+# conservatively so the ATR-adaptive stop handles the typical case and this
+# only fires when price hovers just above the stop without making progress --
+# observed in the 15-day backtest as the PEPE 04-08 slow-bleed pattern.
+MOONSHOT_EARLY_TIMEOUT_MINS = env_int("MOONSHOT_EARLY_TIMEOUT_MINS", 75)
+MOONSHOT_EARLY_TIMEOUT_LOSS_PCT = env_float("MOONSHOT_EARLY_TIMEOUT_LOSS_PCT", 0.015)
+
 
 DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
     "MOONSHOT": {
@@ -637,6 +649,18 @@ def evaluate_trade_action(
             return {"action": "exit", "reason": "ROTATION", "price": current_price}
 
     max_hold_minutes = int(trade.get("max_hold_minutes") or profile["flat_max_minutes"])
+    # MOONSHOT early time-kill below BE: if the pump thesis hasn't confirmed
+    # within MOONSHOT_EARLY_TIMEOUT_MINS and we're still underwater by more than
+    # MOONSHOT_EARLY_TIMEOUT_LOSS_PCT, bail before the slow bleed reaches the
+    # full stop.  Only applies pre-breakeven so we never eject runners.
+    if (
+        strategy == "MOONSHOT"
+        and not bool(trade.get("breakeven_done"))
+        and held_minutes >= MOONSHOT_EARLY_TIMEOUT_MINS
+        and pct_gain <= -MOONSHOT_EARLY_TIMEOUT_LOSS_PCT
+    ):
+        return {"action": "exit", "reason": "EARLY_TIMEOUT", "price": current_price}
+
     # Unified timeout: only exit if held >= 48h AND >= 2% above breakeven. Never timeout below breakeven.
     timeout_threshold = 2 * FEE_RATE_TAKER + TIMEOUT_MIN_ABOVE_BE
     if held_minutes >= TIMEOUT_MIN_HOLD_MINUTES and pct_gain >= timeout_threshold:
