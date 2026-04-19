@@ -1299,10 +1299,50 @@ class LiveBotRuntime:
         lines.append(f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b>")
         return "\n".join(lines)[:4000]
 
+    def _open_positions_summary(self) -> tuple[list[str], dict[str, dict[str, float | int]], float]:
+        """Return (detail_lines, per_strategy_stats, total_unrealized_usdt) for currently open trades."""
+        detail_lines: list[str] = []
+        per_strategy: dict[str, dict[str, float | int]] = {}
+        total_unrealized = 0.0
+        for trade in self.open_trades:
+            price = float(trade.last_price or trade.entry_price or 0.0)
+            entry_cost = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty))
+            unrealized_usdt = (price - trade.entry_price) * trade.qty if price > 0 else 0.0
+            unrealized_pct = (unrealized_usdt / entry_cost * 100.0) if entry_cost > 0 else 0.0
+            total_unrealized += unrealized_usdt
+            strategy = str(trade.strategy or "UNKNOWN").upper()
+            stats = per_strategy.setdefault(strategy, {"count": 0, "unrealized_usdt": 0.0, "unrealized_pct_sum": 0.0})
+            stats["count"] = int(stats["count"]) + 1
+            stats["unrealized_usdt"] = float(stats["unrealized_usdt"]) + unrealized_usdt
+            stats["unrealized_pct_sum"] = float(stats["unrealized_pct_sum"]) + unrealized_pct
+            detail_lines.append(
+                f"  {self._strategy_icon(strategy)} {strategy}: {trade.symbol} "
+                f"{unrealized_pct:+.2f}% (${unrealized_usdt:+.2f})"
+            )
+        return detail_lines, per_strategy, total_unrealized
+
     def _build_metrics_message(self) -> str:
         metrics = self._compute_metrics()
+        open_detail, open_by_strategy, open_unrealized = self._open_positions_summary()
         if not metrics:
-            return "📊 <b>Metrics</b>\n━━━━━━━━━━━━━━━\nNo completed trades yet."
+            if not open_detail:
+                return "📊 <b>Metrics</b>\n━━━━━━━━━━━━━━━\nNo completed trades yet."
+            lines = [
+                "📊 <b>Performance Metrics</b>",
+                "━━━━━━━━━━━━━━━",
+                "No closed trades yet.",
+                "━━━━━━━━━━━━━━━",
+                f"📌 <b>Open positions</b> ({len(open_detail)}) unrealized <b>${open_unrealized:+.2f}</b>",
+            ]
+            for strategy, data in sorted(open_by_strategy.items()):
+                count = int(data["count"])
+                avg_pct = float(data["unrealized_pct_sum"]) / count if count else 0.0
+                lines.append(
+                    f"{self._strategy_icon(strategy)} <b>{strategy}</b> {count} open "
+                    f"${float(data['unrealized_usdt']):+.2f} avg {avg_pct:+.2f}%"
+                )
+            lines.extend(open_detail)
+            return "\n".join(lines)[:4000]
         profit_factor = float(metrics["profit_factor"])
         pf_text = "∞" if math.isinf(profit_factor) else f"{profit_factor:.2f}"
         avg_hold_min = float(metrics.get("avg_hold_min", 0.0) or 0.0)
@@ -1320,12 +1360,23 @@ class LiveBotRuntime:
             "━━━━━━━━━━━━━━━",
         ]
         by_strategy = metrics.get("by_strategy", {})
-        for strategy, data in sorted(by_strategy.items()):
-            lines.append(
-                f"{self._strategy_icon(strategy)} <b>{strategy}</b> {int(data['total'])}t "
-                f"{float(data['win_rate']):.0f}%WR ${float(data['total_pnl']):+.2f} "
-                f"avg +{float(data['avg_win']):.1f}%/{float(data['avg_loss']):.1f}%"
-            )
+        all_strategies = sorted(set(by_strategy.keys()) | set(open_by_strategy.keys()))
+        for strategy in all_strategies:
+            data = by_strategy.get(strategy)
+            open_data = open_by_strategy.get(strategy)
+            if data is not None:
+                line = (
+                    f"{self._strategy_icon(strategy)} <b>{strategy}</b> {int(data['total'])}t "
+                    f"{float(data['win_rate']):.0f}%WR ${float(data['total_pnl']):+.2f} "
+                    f"avg +{float(data['avg_win']):.1f}%/{float(data['avg_loss']):.1f}%"
+                )
+            else:
+                line = f"{self._strategy_icon(strategy)} <b>{strategy}</b> 0 closed"
+            if open_data is not None:
+                line += (
+                    f" | open {int(open_data['count'])} (${float(open_data['unrealized_usdt']):+.2f})"
+                )
+            lines.append(line)
         by_reason = metrics.get("by_reason", {})
         if by_reason:
             lines.append("━━━━━━━━━━━━━━━")
@@ -1361,6 +1412,12 @@ class LiveBotRuntime:
         lines.append(
             f"Worst: {worst_trade['symbol']} {float(worst_trade.get('pnl_pct', 0.0) or 0.0):+.2f}% ${float(worst_trade.get('pnl_usdt', 0.0) or 0.0):+.2f}"
         )
+        if open_detail:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append(
+                f"📌 <b>Open positions</b> ({len(open_detail)}) unrealized <b>${open_unrealized:+.2f}</b>"
+            )
+            lines.extend(open_detail)
         return "\n".join(lines)[:4000]
 
     def _build_config_message(self) -> str:
