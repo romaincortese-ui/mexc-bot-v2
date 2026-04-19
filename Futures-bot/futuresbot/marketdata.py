@@ -161,6 +161,7 @@ class MexcFuturesClient:
         price: float | None = None,
         take_profit_price: float | None = None,
         stop_loss_price: float | None = None,
+        flash_close: bool | None = None,
     ) -> dict[str, Any]:
         payload = {
             "symbol": symbol,
@@ -176,6 +177,7 @@ class MexcFuturesClient:
             "stopLossPrice": stop_loss_price,
             "profitTrend": 1 if take_profit_price else None,
             "lossTrend": 1 if stop_loss_price else None,
+            "flashClose": flash_close,
         }
         response = self.private_post("/api/v1/private/order/create", payload)
         return response.get("data", {}) if isinstance(response, dict) else {}
@@ -201,6 +203,11 @@ class MexcFuturesClient:
         return self.private_post("/api/v1/private/stoporder/cancel_all", payload)
 
     def close_position(self, *, symbol: str, side: int, vol: int, leverage: int, open_type: int = 1, position_mode: int = 2) -> dict[str, Any]:
+        # Use MEXC's dedicated flashClose flag so the exchange fills the close at
+        # best-available market price immediately, matching the "Flash Close"
+        # button in the MEXC futures UI. Order type 5 (market) + reduceOnly are
+        # kept as a belt-and-suspenders fallback for accounts where flashClose is
+        # rejected (e.g. some sub-account configurations).
         return self.place_order(
             symbol=symbol,
             side=side,
@@ -210,6 +217,7 @@ class MexcFuturesClient:
             open_type=open_type,
             position_mode=position_mode,
             reduce_only=True,
+            flash_close=True,
         )
 
     def get_klines(self, symbol: str, *, interval: str = "Min15", start: int | None = None, end: int | None = None) -> pd.DataFrame:
