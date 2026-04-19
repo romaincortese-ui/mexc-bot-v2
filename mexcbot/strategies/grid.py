@@ -20,8 +20,8 @@ GRID_BB_PERIOD = 20
 GRID_BB_STD = 2.0
 GRID_BB_WIDTH_MAX_PCT = 0.05
 GRID_BB_WIDTH_SQUEEZE_PCT = 0.30
-GRID_ADX_MAX = 18.0
-GRID_RSI_MIN = 32.0
+GRID_ADX_MAX = 16.0
+GRID_RSI_MIN = 38.0
 GRID_RSI_MAX = 52.0
 GRID_ENTRY_BB_ZONE = 0.20
 GRID_TP_BB_ZONE = 0.72
@@ -30,11 +30,12 @@ GRID_TP_MAX = 0.028
 GRID_SL_MIN = env_float("GRID_SL_MIN", 0.08)
 GRID_SL_CAP = env_float("GRID_SL_CAP", 0.10)
 GRID_SL_MAX = env_float("GRID_SL_MAX", 0.10)
-GRID_MIN_REWARD_RISK = env_float("GRID_MIN_REWARD_RISK", 0.12)
+GRID_MIN_REWARD_RISK = env_float("GRID_MIN_REWARD_RISK", 0.35)
 GRID_MIN_SCORE = 55.0
 GRID_SPREAD_MAX = 0.002
 GRID_UNIVERSE_MIN_ABS_CHANGE_PCT = 0.003
-GRID_UNIVERSE_MAX_ABS_CHANGE_PCT = 0.08
+GRID_UNIVERSE_MAX_ABS_CHANGE_PCT = 0.04
+GRID_SYMBOL_24H_DOWNSIDE_MAX = 0.025
 
 GRID_EXCLUDED_BASE_ASSETS = {
     "EUR",
@@ -72,6 +73,7 @@ def _grid_params() -> dict[str, float]:
         "spread_max": env_float("GRID_SPREAD_MAX", GRID_SPREAD_MAX),
         "universe_min_abs_change_pct": env_float("GRID_UNIVERSE_MIN_ABS_CHANGE_PCT", GRID_UNIVERSE_MIN_ABS_CHANGE_PCT),
         "universe_max_abs_change_pct": env_float("GRID_UNIVERSE_MAX_ABS_CHANGE_PCT", GRID_UNIVERSE_MAX_ABS_CHANGE_PCT),
+        "symbol_24h_downside_max": env_float("GRID_SYMBOL_24H_DOWNSIDE_MAX", GRID_SYMBOL_24H_DOWNSIDE_MAX),
     }
 
 
@@ -99,9 +101,16 @@ def _build_grid_universe(tickers: pd.DataFrame, config: LiveConfig, params: dict
     eligible = eligible.assign(abs_change=eligible["priceChangePercent"].abs())
     min_abs_change = max(0.0, float(params["universe_min_abs_change_pct"]))
     max_abs_change = max(min_abs_change, float(params["universe_max_abs_change_pct"]))
-    ranged = eligible[(eligible["abs_change"] >= min_abs_change) & (eligible["abs_change"] <= max_abs_change)]
+    downside_floor = -abs(float(params.get("symbol_24h_downside_max", GRID_SYMBOL_24H_DOWNSIDE_MAX)))
+    ranged = eligible[
+        (eligible["abs_change"] >= min_abs_change)
+        & (eligible["abs_change"] <= max_abs_change)
+        & (eligible["priceChangePercent"] >= downside_floor)
+    ]
     if ranged.empty:
-        ranged = eligible
+        ranged = eligible[eligible["priceChangePercent"] >= downside_floor]
+    if ranged.empty:
+        return []
 
     ranked = ranged.sort_values(["quoteVolume", "abs_change"], ascending=[False, True])
     return ranked.head(config.universe_limit)["symbol"].tolist()

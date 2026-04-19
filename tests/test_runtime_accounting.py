@@ -284,6 +284,9 @@ def _config(**overrides) -> LiveConfig:
         fear_greed_extreme_fear_threshold=20,
         fear_greed_extreme_fear_mult=1.4,
         fear_greed_bear_block_moonshot=True,
+        fear_greed_bear_block_grid=True,
+        grid_btc_1h_floor=-0.005,
+        grid_btc_24h_floor=-0.015,
         state_file="",
         base_url="https://api.mexc.com",
     )

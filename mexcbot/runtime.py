@@ -171,6 +171,7 @@ class LiveBotRuntime:
         self._moonshot_gate_open = True
         self._market_regime_mult = 1.0
         self._fear_greed_index: int | None = None
+        self._last_grid_block_reason: str | None = None
         self._adaptive_offsets: dict[str, float] = {}
         self._last_rebalance_count = 0
         self._dynamic_scalper_budget: float | None = None
@@ -1924,6 +1925,27 @@ class LiveBotRuntime:
             eligible = [strategy for strategy in eligible if strategy.upper() != "MOONSHOT"]
         if self.config.fear_greed_bear_block_moonshot and self._fear_greed_index is not None and self._fear_greed_index <= self.config.fear_greed_bear_threshold:
             eligible = [strategy for strategy in eligible if strategy.upper() != "MOONSHOT"]
+        if "GRID" in {strategy.upper() for strategy in eligible}:
+            block_grid_reason: str | None = None
+            if (
+                self.config.fear_greed_bear_block_grid
+                and self._fear_greed_index is not None
+                and self._fear_greed_index <= self.config.fear_greed_extreme_fear_threshold
+            ):
+                block_grid_reason = f"F&G {self._fear_greed_index} ≤ {self.config.fear_greed_extreme_fear_threshold}"
+            else:
+                change_1h, change_24h = self._btc_trend_changes()
+                if change_1h < self.config.grid_btc_1h_floor:
+                    block_grid_reason = f"BTC 1h {change_1h:+.2%} < {self.config.grid_btc_1h_floor:+.2%}"
+                elif change_24h < self.config.grid_btc_24h_floor:
+                    block_grid_reason = f"BTC 24h {change_24h:+.2%} < {self.config.grid_btc_24h_floor:+.2%}"
+            if block_grid_reason is not None:
+                eligible = [strategy for strategy in eligible if strategy.upper() != "GRID"]
+                if self._last_grid_block_reason != block_grid_reason:
+                    log.info("[GRID] Macro gate blocking entries: %s", block_grid_reason)
+                    self._last_grid_block_reason = block_grid_reason
+            else:
+                self._last_grid_block_reason = None
         return eligible
 
     def _update_moonshot_gate(self) -> None:

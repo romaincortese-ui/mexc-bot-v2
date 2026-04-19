@@ -128,6 +128,9 @@ class LiveConfig:
     fear_greed_extreme_fear_threshold: int
     fear_greed_extreme_fear_mult: float
     fear_greed_bear_block_moonshot: bool
+    fear_greed_bear_block_grid: bool
+    grid_btc_1h_floor: float
+    grid_btc_24h_floor: float
     state_file: str
     base_url: str = "https://api.mexc.com"
 
@@ -220,6 +223,9 @@ class LiveConfig:
             fear_greed_extreme_fear_threshold=env_int("FG_EXTREME_FEAR_THRESHOLD", 20),
             fear_greed_extreme_fear_mult=env_float("FG_EXTREME_FEAR_MULT", 1.40),
             fear_greed_bear_block_moonshot=env_bool("FG_BEAR_BLOCK_MOONSHOT", True),
+            fear_greed_bear_block_grid=env_bool("FG_BEAR_BLOCK_GRID", True),
+            grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
+            grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
             state_file=env_str("MEXCBOT_STATE_FILE", "runtime_state.json"),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
         )
