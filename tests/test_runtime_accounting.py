@@ -1369,6 +1369,29 @@ def test_runtime_state_save_updates_after_partial_close(tmp_path):
     assert restored.trade_history[-1]["exit_reason"] == "PARTIAL_TP"
 
 
+def test_runtime_state_save_handles_datetime_in_trade_metadata(tmp_path):
+    """Regression for 'State save failed: Object of type datetime is not JSON serializable'.
+    evaluate_trade_action writes last_new_high_at (datetime) into trade.metadata;
+    json.dumps must serialize it via the default= hook instead of raising."""
+    state_file = tmp_path / "runtime_state.json"
+    runtime = LiveBotRuntime(_config(state_file=str(state_file)), StubClient())
+    runtime.telegram = StubTelegram()
+
+    trade = runtime.open_position(_opportunity(), allocation_usdt=100.0)
+    assert trade is not None
+    runtime.open_trades.append(trade)
+    # Simulate what check_trade_action does after evaluate_trade_action emits a datetime.
+    trade.metadata["last_new_high_at"] = datetime.now(timezone.utc)
+
+    runtime._save_state()  # must not emit "State save failed"
+
+    import json as _json
+    payload = _json.loads(state_file.read_text(encoding="utf-8"))
+    saved_meta = payload["open_trades"][0]["metadata"]
+    assert isinstance(saved_meta["last_new_high_at"], str)
+    assert "T" in saved_meta["last_new_high_at"]
+
+
 def test_partial_close_triggers_post_trade_analysis_for_grid_loss(monkeypatch):
     runtime = LiveBotRuntime(_config(anthropic_api_key="test-key"), StubClient())
     captured = []

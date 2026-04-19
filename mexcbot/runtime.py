@@ -118,6 +118,14 @@ def compute_market_regime_multiplier(frame: pd.DataFrame, config: LiveConfig) ->
         return 1.0
 
 
+def _json_default(value: object) -> object:
+    """Fallback serializer for ``json.dumps`` so datetimes inside
+    ``trade.metadata`` (e.g. ``last_new_high_at``) don't break state-save."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _trade_state_payload(trade: Trade) -> dict[str, object]:
     return {
         "symbol": trade.symbol,
@@ -234,7 +242,10 @@ class LiveBotRuntime:
             parent = self._state_path.parent
             if str(parent) not in {"", "."}:
                 parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(json.dumps(self._state_payload(), indent=2), encoding="utf-8")
+            self._state_path.write_text(
+                json.dumps(self._state_payload(), indent=2, default=_json_default),
+                encoding="utf-8",
+            )
         except Exception as exc:
             log.warning("State save failed: %s", exc)
 
