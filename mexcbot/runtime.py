@@ -1671,10 +1671,11 @@ class LiveBotRuntime:
 
     def _reconcile_open_positions(self, *, notify: bool = False) -> dict[str, int]:
         if self.config.paper_trade:
-            return {"stale": 0, "untracked": 0, "orphaned": 0}
+            return {"stale": 0, "untracked": 0, "orphaned": 0, "tracked": len(self.open_trades), "tracked_symbols": []}
         stale = 0
         untracked = 0
         orphaned = 0
+        tracked_symbols: list[str] = []
         try:
             account = self.client.private_get("/api/v3/account")
             balances = {
@@ -1696,6 +1697,8 @@ class LiveBotRuntime:
                         "pnl_usdt": 0.0,
                     }
                     self.trade_history.append(offline_closed)
+                else:
+                    tracked_symbols.append(trade.symbol)
             known_assets = {trade.symbol[:-4] if trade.symbol.endswith("USDT") else trade.symbol for trade in self.open_trades}
             try:
                 prices = self.client.public_get("/api/v3/ticker/price")
@@ -1740,7 +1743,13 @@ class LiveBotRuntime:
         except Exception as exc:
             log.error("Reconcile failed: %s", exc)
             self._notify_once("reconcile-failed", f"⚠️ <b>Reconcile failed</b>\n{str(exc)[:200]}")
-        return {"stale": stale, "untracked": untracked, "orphaned": orphaned}
+        return {
+            "stale": stale,
+            "untracked": untracked,
+            "orphaned": orphaned,
+            "tracked": len(tracked_symbols),
+            "tracked_symbols": tracked_symbols,
+        }
 
     def _handle_telegram_commands(self) -> None:
         updates = self.telegram.get_updates(
@@ -1853,12 +1862,25 @@ class LiveBotRuntime:
                 self._notify(f"✅ Closed {closed} position(s)." + (f" Failed: {failed}." if failed else ""))
             elif text.startswith("/reconcile"):
                 stats = self._reconcile_open_positions(notify=True)
-                self._notify(
-                    f"🔧 <b>Reconcile complete</b>\n"
-                    f"Stale: <b>{stats['stale']}</b>\n"
-                    f"Untracked: <b>{stats['untracked']}</b>\n"
-                    f"Orphaned: <b>{stats['orphaned']}</b>"
+                tracked_symbols = stats.get("tracked_symbols") or []
+                tracked_count = int(stats.get("tracked", 0) or 0)
+                lines = [
+                    "🔧 <b>Reconcile complete</b>",
+                    f"Tracked healthy: <b>{tracked_count}</b>",
+                ]
+                if tracked_symbols:
+                    preview = ", ".join(tracked_symbols[:10])
+                    if len(tracked_symbols) > 10:
+                        preview += f" (+{len(tracked_symbols) - 10} more)"
+                    lines.append(f"  {preview}")
+                lines.extend(
+                    [
+                        f"Stale (closed off-exchange): <b>{stats['stale']}</b>",
+                        f"Untracked (found on exchange): <b>{stats['untracked']}</b>",
+                        f"Orphaned orders: <b>{stats['orphaned']}</b>",
+                    ]
                 )
+                self._notify("\n".join(lines))
             elif text == "/restart":
                 self._notify("🔄 <b>Restarting...</b>")
                 raise SystemExit(1)
