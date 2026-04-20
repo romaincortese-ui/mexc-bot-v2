@@ -25,7 +25,7 @@ from mexcbot.indicators import calc_ema
 from mexcbot.marketdata import fetch_fear_and_greed
 from mexcbot.models import Opportunity, Trade
 from mexcbot.strategies import find_best_opportunity
-from mexcbot.strategies.scalper import resolve_scalper_tp_execution_mode
+from mexcbot.strategies.scalper import SCALPER_SL_CAP, resolve_scalper_tp_execution_mode
 from mexcbot.telegram import TelegramClient
 from mexcbot.websocket import PriceMonitor
 
@@ -56,6 +56,13 @@ KELLY_MULT_MARGINAL = env_float("KELLY_MULT_MARGINAL", 0.50)
 KELLY_MULT_SOLID = env_float("KELLY_MULT_SOLID", 0.80)
 KELLY_MULT_STANDARD = env_float("KELLY_MULT_STANDARD", 1.00)
 KELLY_MULT_HIGH_CONF = env_float("KELLY_MULT_HIGH_CONF", 1.50)
+# SL applied when we reconcile an untracked position (manually-opened, orphaned,
+# or surviving a bot restart without recoverable state). Must not be looser than
+# what the strategy would have picked, or we silently widen real risk on restart.
+# SCALPER uses its own ATR-derived SL (capped at SCALPER_SL_CAP=0.12). Other
+# strategies get RECONCILE_DEFAULT_SL_PCT (0.10 = -10%), tighter than the
+# global HARD_SL_FLOOR_PCT (0.20) and the old STOP_LOSS_PCT default (0.40).
+RECONCILE_DEFAULT_SL_PCT = env_float("RECONCILE_DEFAULT_SL_PCT", 0.10)
 DEFENSIVE_EXIT_REASONS = {
     "STOP_LOSS",
     "BREAKEVEN_STOP",
@@ -1632,7 +1639,13 @@ class LiveBotRuntime:
             return None
         strategy = "SCALPER" if "SCALPER" in {item.upper() for item in self.config.strategies} else (self.config.strategies[0] if self.config.strategies else "SCALPER")
         tp_pct = self.config.take_profit_pct
-        sl_pct = self.config.stop_loss_pct
+        # Reconciled positions can't recover the strategy's original SL. Use a
+        # tighter per-strategy default rather than self.config.stop_loss_pct,
+        # which (historically 0.40, now 0.20) would silently widen live risk.
+        if strategy == "SCALPER":
+            sl_pct = SCALPER_SL_CAP
+        else:
+            sl_pct = min(RECONCILE_DEFAULT_SL_PCT, self.config.stop_loss_pct)
         metadata: dict[str, object] = {"reconciled_untracked": True}
         tp_order_id: str | None = None
         symbol_orders = [order for order in open_orders if str(order.get("symbol") or "") == symbol]
@@ -1653,7 +1666,9 @@ class LiveBotRuntime:
                 metadata={},
             )
             tp_pct = dummy.tp_pct or self.config.take_profit_pct
-            sl_pct = dummy.sl_pct or self.config.stop_loss_pct
+            # Preserve the tight SCALPER_SL_CAP already set above; never widen
+            # back to the global stop_loss_pct on reconciliation.
+            sl_pct = dummy.sl_pct or sl_pct
             metadata["tp_execution_mode"] = "internal"
         elif strategy in {"GRID", "TRINITY"} and sell_orders:
             tp_order_id = str(sell_orders[0].get("orderId") or "") or None
