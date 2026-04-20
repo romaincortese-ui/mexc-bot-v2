@@ -67,6 +67,14 @@ TIMEOUT_MIN_HOLD_MINUTES = env_int("TIMEOUT_MIN_HOLD_MINUTES", 2880)    # 48 hou
 MOONSHOT_EARLY_TIMEOUT_MINS = env_int("MOONSHOT_EARLY_TIMEOUT_MINS", 75)
 MOONSHOT_EARLY_TIMEOUT_LOSS_PCT = env_float("MOONSHOT_EARLY_TIMEOUT_LOSS_PCT", 0.015)
 
+# Absolute hard stop-loss floor (% drop from entry).  No matter what soft-stop
+# or ATR-derived stop logic is active, a trade is force-exited the moment its
+# unrealised loss breaches this floor.  Per operator directive: while a trade
+# is negative, the ONLY ways out are TP, this hard SL, or post-breakeven peak
+# drop (which is unreachable while negative anyway) -- rotation and other
+# "complicated" exits must not realise losses.
+HARD_SL_FLOOR_PCT = env_float("HARD_SL_FLOOR_PCT", 0.20)
+
 
 DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
     "MOONSHOT": {
@@ -476,7 +484,11 @@ def _evaluate_stop_loss(
 ) -> dict[str, object] | None:
     pct_gain = (current_price - float(trade["entry_price"])) / float(trade["entry_price"]) if float(trade["entry_price"]) > 0 else 0.0
     sl_pct = _infer_sl_pct(trade, stop_price)
-    hard_sl_pct = -(sl_pct * 100.0 + 4.0)
+    # Dynamic hard floor derived from the strategy-sized stop, kept strictly
+    # within the absolute HARD_SL_FLOOR_PCT operator-directive cap.
+    dynamic_hard_sl_pct = -(sl_pct * 100.0 + 4.0)
+    absolute_hard_sl_pct = -HARD_SL_FLOOR_PCT * 100.0
+    hard_sl_pct = max(dynamic_hard_sl_pct, absolute_hard_sl_pct)
     if pct_gain * 100.0 <= hard_sl_pct:
         _clear_stop_watch(trade)
         # Hard floor is a true stop-loss, never a breakeven exit.
@@ -638,14 +650,13 @@ def evaluate_trade_action(
             return {"action": "exit", "reason": "PROTECT_STOP", "price": current_price}
 
     # Scalper rotation: exit if a significantly stronger SCALPER signal is available.
-    # Guarded so we never force-realize a loss to chase a better score: the trade
-    # must be at roughly flat/breakeven (no worse than -0.5% from entry). Rotation
-    # is a displacement heuristic, not an atomic swap -- the freed slot may or may
-    # not end up holding the rescored candidate, so sitting on a moderate red
-    # trade is usually better than crystallising the loss for a maybe-entry.
+    # Operator directive: while a trade is in negative P&L, rotation is NOT a
+    # valid exit -- the only ways out while negative are TP, hard SL, and the
+    # post-breakeven peak drop (which is positive-only by construction).
+    # Rotation therefore requires pct_gain >= 0 (strictly breakeven or green).
     if strategy == "SCALPER" and best_score > 0 and not bool(trade.get("trail_active")):
         trade_score = float(trade.get("score") or 0.0)
-        if best_score - trade_score >= 15.0 and pct_gain >= -0.005:
+        if best_score - trade_score >= 15.0 and pct_gain >= 0.0:
             return {"action": "exit", "reason": "ROTATION", "price": current_price}
 
     max_hold_minutes = int(trade.get("max_hold_minutes") or profile["flat_max_minutes"])

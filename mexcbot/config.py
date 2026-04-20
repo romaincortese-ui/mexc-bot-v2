@@ -142,7 +142,7 @@ class LiveConfig:
             paper_trade=env_bool("PAPER_TRADE", True),
             trade_budget=env_float("TRADE_BUDGET", 50.0),
             take_profit_pct=env_float("TAKE_PROFIT_PCT", 0.020),
-            stop_loss_pct=env_float("STOP_LOSS_PCT", 0.40),
+            stop_loss_pct=env_float("STOP_LOSS_PCT", 0.20),
             scan_interval=env_int("SCAN_INTERVAL", 60),
             price_check_interval=env_int("PRICE_CHECK_INTERVAL", 15),
             min_volume_usdt=env_float("MIN_VOLUME_USDT", 500_000.0),
