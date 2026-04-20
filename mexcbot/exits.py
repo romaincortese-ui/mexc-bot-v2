@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Mapping, MutableMapping
 
 from mexcbot.config import env_float, env_int
+
+_log = logging.getLogger(__name__)
 
 
 FEE_RATE_TAKER = env_float("FEE_RATE_TAKER", 0.001)
@@ -66,6 +69,21 @@ TIMEOUT_MIN_HOLD_MINUTES = env_int("TIMEOUT_MIN_HOLD_MINUTES", 2880)    # 48 hou
 # observed in the 15-day backtest as the PEPE 04-08 slow-bleed pattern.
 MOONSHOT_EARLY_TIMEOUT_MINS = env_int("MOONSHOT_EARLY_TIMEOUT_MINS", 75)
 MOONSHOT_EARLY_TIMEOUT_LOSS_PCT = env_float("MOONSHOT_EARLY_TIMEOUT_LOSS_PCT", 0.015)
+
+# SCALPER DOA (Dead-On-Arrival) early exit.  Per the 2025-12 bleed diagnosis:
+# when a scalper entry fails to produce even a small peak within the first few
+# minutes, the thesis was wrong.  Rather than waiting for the full structural
+# exit (which after Tier 1 tuning is ~0.8% peak-drop from a 1.4% activation)
+# to grind the position down, free the capital near-entry.  Only fires
+# pre-breakeven, and only if the position is still within a tight friction band
+# (SCALPER_DOA_MAX_LOSS_PCT) so we don't override the hard SL / peak-drop on
+# deeper reds.  Defaults to DISABLED so operators must opt in after validating
+# Tier 1 env-var calibration; the trigger realises a small loss by design and
+# should only run after backtest confirmation.
+SCALPER_DOA_ENABLED = env_int("SCALPER_DOA_ENABLED", 0)
+SCALPER_DOA_MIN_MINUTES = env_float("SCALPER_DOA_MIN_MINUTES", 10.0)
+SCALPER_DOA_PEAK_GAIN_FLOOR = env_float("SCALPER_DOA_PEAK_GAIN_FLOOR", 0.003)
+SCALPER_DOA_MAX_LOSS_PCT = env_float("SCALPER_DOA_MAX_LOSS_PCT", 0.005)
 
 # Absolute hard stop-loss floor (% drop from entry).  No matter what soft-stop
 # or ATR-derived stop logic is active, a trade is force-exited the moment its
@@ -273,8 +291,55 @@ SIGNAL_EXIT_PROFILE_OVERLAYS: dict[str, dict[str, dict[str, float | int]]] = {
 }
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _validate_exit_profile_invariants() -> list[str]:
+    """Validate the structural invariant that each strategy's post-breakeven
+    peak-drop is meaningfully tighter than its breakeven activation.
+
+    Rationale: the BREAKEVEN_STOP / PROTECT_STOP sequence fires twice -- once
+    when price retraces from its peak to raise the stop to entry (breakeven
+    activation), and again when the stop is hit.  If ``peak_drop_pct`` is not
+    less than roughly 70% of ``breakeven_activation_pct``, a trade that pokes
+    just above the activation threshold and then retraces normal noise will
+    always hit the entry stop (with fees and slippage that becomes a -0.2% to
+    -0.8% loss) before the peak-drop ever gets a chance to lock in any gain.
+    This was the dominant bleed pattern identified in the 2025-12 diagnosis.
+
+    This check logs a WARNING rather than raising so the bot still starts when
+    operators are mid-tuning via env vars; the warning is actionable and loud.
+    Returns the list of violation messages for testability.
+    """
+    strategy_peak_drop: dict[str, float] = {
+        "SCALPER": SCALPER_PEAK_DROP_PCT,
+        "MOONSHOT": MOONSHOT_PEAK_DROP_PCT,
+        "REVERSAL": REVERSAL_PEAK_DROP_PCT,
+        "GRID": GENERIC_PEAK_DROP_PCT,
+        "TRINITY": GENERIC_PEAK_DROP_PCT,
+        "PRE_BREAKOUT": GENERIC_PEAK_DROP_PCT,
+    }
+    violations: list[str] = []
+    for strat, profile in DEFAULT_EXIT_PROFILES.items():
+        be_act = float(profile.get("breakeven_activation_pct", 0.0))
+        peak_drop = strategy_peak_drop.get(strat)
+        if peak_drop is None or be_act <= 0:
+            continue
+        ceiling = be_act * 0.7
+        if peak_drop >= ceiling:
+            msg = (
+                f"{strat}: peak_drop_pct={peak_drop:.4f} >= "
+                f"breakeven_activation_pct*0.7={ceiling:.4f} "
+                f"(breakeven_activation_pct={be_act:.4f}). "
+                f"Post-breakeven retracement will hit entry stop before peak-drop engages."
+            )
+            violations.append(msg)
+    if violations:
+        _log.warning(
+            "Exit profile invariant violated -- trades may bleed via BREAKEVEN_STOP:\n  - %s",
+            "\n  - ".join(violations),
+        )
+    return violations
+
+
+_validate_exit_profile_invariants()
 
 
 def _coerce_datetime(value: datetime | str | None) -> datetime:
@@ -671,6 +736,20 @@ def evaluate_trade_action(
         and pct_gain <= -MOONSHOT_EARLY_TIMEOUT_LOSS_PCT
     ):
         return {"action": "exit", "reason": "EARLY_TIMEOUT", "price": current_price}
+
+    # SCALPER DOA early exit: opt-in via SCALPER_DOA_ENABLED.  Fires only
+    # pre-breakeven, inside a tight friction band so deeper losses still go
+    # through the structural stop.  See env-var block at the top of this file
+    # for the rationale.
+    if (
+        SCALPER_DOA_ENABLED
+        and strategy == "SCALPER"
+        and not bool(trade.get("breakeven_done"))
+        and held_minutes >= SCALPER_DOA_MIN_MINUTES
+        and peak_gain < SCALPER_DOA_PEAK_GAIN_FLOOR
+        and pct_gain >= -SCALPER_DOA_MAX_LOSS_PCT
+    ):
+        return {"action": "exit", "reason": "DOA_EXIT", "price": current_price}
 
     # Unified timeout: only exit if held >= 48h AND >= 2% above breakeven. Never timeout below breakeven.
     timeout_threshold = 2 * FEE_RATE_TAKER + TIMEOUT_MIN_ABOVE_BE

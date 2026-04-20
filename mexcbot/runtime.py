@@ -74,6 +74,7 @@ DEFENSIVE_EXIT_REASONS = {
     "PROTECT_STOP",
     "MANUAL_CLOSE",
     "EMERGENCY_CLOSE",
+    "DOA_EXIT",
 }
 REVIEW_RUNTIME_OVERRIDE_SPECS: dict[str, dict[str, object]] = {
     "SCALPER_THRESHOLD": {"attr": "scalper_threshold", "type": "float", "min": 0.0, "max": 100.0},
@@ -2860,11 +2861,15 @@ class LiveBotRuntime:
         self.refresh_daily_review(force=True)
         log.info("MEXC bot starting - %s", mode)
         log.info(
-            "Budget: $%.2f | Max positions: %s | TP: %.2f%% | SL: %.2f%%",
+            "Budget: $%.2f | Max positions: %s | TP: %.2f%% | Hard floor: %.2f%%",
             self.config.trade_budget,
             self.config.max_open_positions,
             self.config.take_profit_pct * 100.0,
             self.config.stop_loss_pct * 100.0,
+        )
+        log.info(
+            "Effective stop: per-strategy breakeven-chase (see exits.py profiles); "
+            "Hard floor is an absolute backstop, not the normal exit path."
         )
         self._flush_telegram_updates()
         self._send_startup_message()
