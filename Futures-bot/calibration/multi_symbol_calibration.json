@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-04-20T00:00:00+00:00",
+  "window_start": "2026-02-20T00:00:00+00:00",
+  "window_end": "2026-04-20T00:00:00+00:00",
+  "total_trades": 39,
+  "notes": "Hand-tuned calibration derived from the 9-symbol 60-day backtest. Blocks the chronically-losing signal/symbol combinations on XRP and SILVER and tightens thresholds on marginal pairs. Auto-derived by _build_calibration.py against all 39 trades, then overridden per the analysis in the commit message.",
+  "by_strategy": {
+    "BTC_FUTURES": {
+      "trades": 39,
+      "win_rate": 0.487,
+      "total_pnl": 4054.15,
+      "profit_factor": 1.45,
+      "expectancy": 103.95
+    }
+  },
+  "by_strategy_signal": {},
+  "by_strategy_symbol": {},
+  "by_strategy_symbol_signal": {},
+  "entry_adjustments": {
+    "by_strategy": {
+      "BTC_FUTURES": {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": null}
+    },
+    "by_strategy_signal": {},
+    "by_strategy_symbol": {
+      "BTC_FUTURES": {
+        "XRP_USDT": {
+          "threshold_offset": 8.0,
+          "risk_mult": 0.6,
+          "block_reason": null,
+          "_comment": "Raise score bar 8pts and reduce size. Base-rate hostile to shorts (see signal blocks); long loser at score 62.4 also filtered."
+        },
+        "SILVER_USDT": {
+          "threshold_offset": 3.0,
+          "risk_mult": 0.75,
+          "block_reason": null,
+          "_comment": "Raise score bar and reduce size. Silver is whippy at 15m."
+        }
+      }
+    },
+    "by_strategy_symbol_signal": {
+      "BTC_FUTURES": {
+        "XRP_USDT": {
+          "COIL_BREAKDOWN_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "XRP shorts persistently fail: 1W/4L in 60d backtest, -$141.56. Structural bullish bias since 2024 SEC resolution; breakdowns squeeze."
+          },
+          "TREND_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "XRP short side disabled (0W/1L, low-score entry)."
+          }
+        },
+        "SILVER_USDT": {
+          "TREND_CONTINUATION_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "Silver trend-continuation long 0W/3L. Silver mean-reverts at 15m TF."
+          },
+          "TREND_CONTINUATION_SHORT": {
+            "threshold_offset": 10.0,
+            "risk_mult": 0.5,
+            "block_reason": null,
+            "_comment": "Near-even on 2 trades; require very high conviction before taking silver shorts."
+          },
+          "PRESSURE_BREAK_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "0W/1L, false break into London open."
+          }
+        }
+      }
+    }
+  }
+}

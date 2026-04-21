@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Protocol
 
 import pandas as pd
 
 from futuresbot.indicators import calc_adx, calc_atr, calc_ema, calc_rsi, resample_ohlcv
 from futuresbot.models import FuturesSignal
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 class StrategyConfig(Protocol):
@@ -147,6 +155,53 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
     breakout_short = current_price < consolidation_low - breakout_buffer
     pressure_short = current_price < consolidation_low + breakout_buffer * 0.35
 
+    # Trend-continuation path: in a confirmed uptrend/downtrend, accept entries
+    # on pullbacks to EMA20 without requiring a fresh coil breakout. This
+    # captures continuation setups that classic coil-breakout logic misses
+    # once the trend is already underway.
+    continuation_enabled = os.environ.get("FUTURES_CONTINUATION_ENABLED", "true").lower() == "true"
+    continuation_ema_pullback_upper = _env_float("FUTURES_CONTINUATION_PULLBACK_UPPER_ATR", 1.0)
+    continuation_ema_pullback_lower = _env_float("FUTURES_CONTINUATION_PULLBACK_LOWER_ATR", 0.4)
+    continuation_trend_24h_mult = _env_float("FUTURES_CONTINUATION_TREND_24H_MULT", 1.2)
+    continuation_trend_6h_min = _env_float("FUTURES_CONTINUATION_TREND_6H_MIN", 0.0015)
+    continuation_adx_min = _env_float("FUTURES_CONTINUATION_ADX_MIN", config.adx_floor + 4.0)
+    # Pullback zone: price within [-lower*ATR, +upper*ATR] of EMA20. Allows
+    # both shallow dips below EMA20 and ride-above-EMA20 during strong trends,
+    # while excluding extended/parabolic conditions far above EMA20.
+    ema_offset_long = (current_price - current_ema20) / current_atr_1h if current_atr_1h > 0 else 999.0
+    ema_offset_short = (current_ema20 - current_price) / current_atr_1h if current_atr_1h > 0 else 999.0
+    long_pullback_zone = -continuation_ema_pullback_lower <= ema_offset_long <= continuation_ema_pullback_upper
+    short_pullback_zone = -continuation_ema_pullback_lower <= ema_offset_short <= continuation_ema_pullback_upper
+    continuation_long = (
+        continuation_enabled
+        and current_ema20 > current_ema50 > current_ema100
+        and ema_slope > 0
+        and current_adx >= continuation_adx_min
+        and trend_24h >= config.trend_24h_floor * continuation_trend_24h_mult
+        and trend_6h >= continuation_trend_6h_min
+        and long_pullback_zone
+    )
+    continuation_short = (
+        continuation_enabled
+        and current_ema20 < current_ema50 < current_ema100
+        and ema_slope < 0
+        and current_adx >= continuation_adx_min
+        and trend_24h <= -config.trend_24h_floor * continuation_trend_24h_mult
+        and trend_6h <= -continuation_trend_6h_min
+        and short_pullback_zone
+    )
+
+    rsi_1h_long_min = _env_float("FUTURES_RSI_1H_LONG_MIN", 56.0)
+    rsi_15_long_min = _env_float("FUTURES_RSI_15_LONG_MIN", 54.0)
+    rsi_1h_short_max = _env_float("FUTURES_RSI_1H_SHORT_MAX", 44.0)
+    rsi_15_short_max = _env_float("FUTURES_RSI_15_SHORT_MAX", 46.0)
+    volume_floor_cfg = _env_float("FUTURES_VOLUME_RATIO_FLOOR", config.volume_ratio_floor)
+    # Continuation entries relax RSI to mid-range (natural pullback levels)
+    rsi_1h_long_cont = _env_float("FUTURES_RSI_1H_LONG_CONT_MIN", 50.0)
+    rsi_15_long_cont = _env_float("FUTURES_RSI_15_LONG_CONT_MIN", 48.0)
+    rsi_1h_short_cont = _env_float("FUTURES_RSI_1H_SHORT_CONT_MAX", 50.0)
+    rsi_15_short_cont = _env_float("FUTURES_RSI_15_SHORT_CONT_MAX", 52.0)
+
     long_ok = (
         consolidation_ok
         and current_adx >= config.adx_floor
@@ -154,9 +209,9 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         and trend_6h >= config.trend_6h_floor
         and current_ema20 > current_ema50 > current_ema100
         and ema_slope > 0
-        and current_rsi_1h >= 56
-        and current_rsi_15 >= 54
-        and volume_ratio >= config.volume_ratio_floor
+        and current_rsi_1h >= rsi_1h_long_min
+        and current_rsi_15 >= rsi_15_long_min
+        and volume_ratio >= volume_floor_cfg
         and (breakout_long or pressure_long)
     )
     short_ok = (
@@ -166,10 +221,24 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         and trend_6h <= -config.trend_6h_floor
         and current_ema20 < current_ema50 < current_ema100
         and ema_slope < 0
-        and current_rsi_1h <= 44
-        and current_rsi_15 <= 46
-        and volume_ratio >= config.volume_ratio_floor
+        and current_rsi_1h <= rsi_1h_short_max
+        and current_rsi_15 <= rsi_15_short_max
+        and volume_ratio >= volume_floor_cfg
         and (breakout_short or pressure_short)
+    )
+    # Continuation path is independent of coil/breakout gating but still
+    # respects volume and RSI (with relaxed thresholds on the directional side).
+    continuation_long_ok = (
+        continuation_long
+        and current_rsi_1h >= rsi_1h_long_cont
+        and current_rsi_15 >= rsi_15_long_cont
+        and volume_ratio >= volume_floor_cfg
+    )
+    continuation_short_ok = (
+        continuation_short
+        and current_rsi_1h <= rsi_1h_short_cont
+        and current_rsi_15 <= rsi_15_short_cont
+        and volume_ratio >= volume_floor_cfg
     )
 
     long_score = 40.0
@@ -181,6 +250,15 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         long_score += min(8.0, max(0.0, (volume_ratio - config.volume_ratio_floor) * 12.0))
         long_score += 7.0 if breakout_long else 3.5
         long_score += min(6.0, max(0.0, (consolidation_cap - consolidation_range_pct) / max(consolidation_cap, 1e-9) * 6.0))
+    elif continuation_long_ok:
+        # Continuation entries score lower than fresh breakouts (score -6)
+        # but still meaningful when trend is strong.
+        long_score += min(16.0, max(0.0, (current_adx - config.adx_floor) * 1.1))
+        long_score += min(14.0, max(0.0, trend_24h * 220.0))
+        long_score += min(10.0, max(0.0, trend_6h * 380.0))
+        long_score += min(10.0, max(0.0, ema_gap * 850.0))
+        long_score += min(6.0, max(0.0, (volume_ratio - volume_floor_cfg) * 10.0))
+        long_score -= 6.0  # continuation discount vs. fresh breakout
 
     short_score = 40.0
     if short_ok:
@@ -191,6 +269,13 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         short_score += min(8.0, max(0.0, (volume_ratio - config.volume_ratio_floor) * 12.0))
         short_score += 7.0 if breakout_short else 3.5
         short_score += min(6.0, max(0.0, (consolidation_cap - consolidation_range_pct) / max(consolidation_cap, 1e-9) * 6.0))
+    elif continuation_short_ok:
+        short_score += min(16.0, max(0.0, (current_adx - config.adx_floor) * 1.1))
+        short_score += min(14.0, max(0.0, abs(trend_24h) * 220.0))
+        short_score += min(10.0, max(0.0, abs(trend_6h) * 380.0))
+        short_score += min(10.0, max(0.0, abs(ema_gap) * 850.0))
+        short_score += min(6.0, max(0.0, (volume_ratio - volume_floor_cfg) * 10.0))
+        short_score -= 6.0
 
     if long_score < config.min_confidence_score and short_score < config.min_confidence_score:
         return None
@@ -212,7 +297,11 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
             entry_price=current_price,
             tp_price=current_price + tp_move,
             sl_price=sl_price,
-            entry_signal="COIL_BREAKOUT_LONG" if breakout_long else "PRESSURE_BREAK_LONG",
+            entry_signal=(
+                "COIL_BREAKOUT_LONG" if breakout_long
+                else "PRESSURE_BREAK_LONG" if pressure_long
+                else "TREND_CONTINUATION_LONG"
+            ),
             config=config,
             metadata={
                 "trend_24h": round(trend_24h, 6),
@@ -239,7 +328,11 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         entry_price=current_price,
         tp_price=current_price - tp_move,
         sl_price=sl_price,
-        entry_signal="COIL_BREAKDOWN_SHORT" if breakout_short else "PRESSURE_BREAK_SHORT",
+        entry_signal=(
+            "COIL_BREAKDOWN_SHORT" if breakout_short
+            else "PRESSURE_BREAK_SHORT" if pressure_short
+            else "TREND_CONTINUATION_SHORT"
+        ),
         config=config,
         metadata={
             "trend_24h": round(trend_24h, 6),
