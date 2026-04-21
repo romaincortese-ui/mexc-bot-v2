@@ -14,7 +14,7 @@ from mexcbot.config import env_bool, env_float, env_int, env_str
 from mexcbot.exchange import MexcClient
 from mexcbot.indicators import calc_atr, calc_ema, calc_rsi
 from mexcbot.models import Opportunity
-from mexcbot.strategies.common import KELTNER_SCORE_BONUS, MATURITY_LOOKBACK, MATURITY_MOONSHOT_THRESHOLD, calc_move_maturity, calc_vol_zscore, classify_entry_signal, compute_dynamic_sl, keltner_breakout, maturity_penalty
+from mexcbot.strategies.common import KELTNER_SCORE_BONUS, MATURITY_LOOKBACK, MATURITY_MOONSHOT_THRESHOLD, calc_move_maturity, calc_vol_zscore, classify_entry_signal, compute_dynamic_sl, keltner_breakout, maturity_penalty, maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -392,6 +392,7 @@ def score_moonshot_from_frame(
         return None
     tp_pct = max(params["tp_min"], atr_pct * params["tp_atr_mult"])
     sl_pct = min(MOONSHOT_SL_CAP, max(MOONSHOT_SL_FLOOR, atr_pct * MOONSHOT_SL_ATR_MULT))
+    sl_pct = maybe_apply_atr_stops_v2(sl_pct, strategy="MOONSHOT", atr_pct=atr_pct)
 
     entry_signal = classify_entry_signal(
         crossed_now=crossed_up,

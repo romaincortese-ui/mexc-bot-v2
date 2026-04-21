@@ -11,6 +11,7 @@ from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
 from mexcbot.indicators import calc_atr, calc_ema, calc_rsi
 from mexcbot.models import Opportunity
+from mexcbot.strategies.common import maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -284,6 +285,7 @@ def score_reversal_from_frame(
     # --- TP / SL ---
     tp_pct = max(REVERSAL_TP_MIN, min(REVERSAL_TP_MAX, atr_pct * REVERSAL_TP_ATR_MULT))
     sl_pct = max(REVERSAL_SL_MIN, min(REVERSAL_SL_MAX, atr_pct * REVERSAL_SL_ATR_MULT))
+    sl_pct = maybe_apply_atr_stops_v2(sl_pct, strategy="REVERSAL", atr_pct=atr_pct)
 
     # R:R gate — require at least 1.5:1 reward:risk
     if tp_pct / sl_pct < REVERSAL_MIN_REWARD_RISK:

@@ -14,7 +14,7 @@ from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
 from mexcbot.indicators import calc_atr, calc_ema, calc_rsi
 from mexcbot.models import Opportunity
-from mexcbot.strategies.common import KELTNER_SCORE_BONUS, MATURITY_LOOKBACK, MATURITY_THRESHOLD, calc_move_maturity, classify_entry_signal, keltner_breakout, maturity_penalty
+from mexcbot.strategies.common import KELTNER_SCORE_BONUS, MATURITY_LOOKBACK, MATURITY_THRESHOLD, calc_move_maturity, classify_entry_signal, keltner_breakout, maturity_penalty, maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -332,6 +332,7 @@ def _scalper_exit_profile(entry_signal: str, atr_pct: float, base_trail_pct: flo
     profile = dict(SCALPER_SIGNAL_PROFILES.get(signal, SCALPER_SIGNAL_PROFILES["TREND"]))
     tp_pct = min(SCALPER_TP_CAP, max(float(profile["tp_min"]), atr_pct * float(profile["tp_atr_mult"])))
     sl_pct = max(SCALPER_SL_FLOOR, min(SCALPER_SL_CAP, atr_pct * SCALPER_SL_ATR_MULT))
+    sl_pct = maybe_apply_atr_stops_v2(sl_pct, strategy="SCALPER", atr_pct=atr_pct)
     profile["trail_pct"] = round(min(float(profile["trail_pct"]), base_trail_pct), 6)
     return round(tp_pct, 6), round(sl_pct, 6), profile
 

@@ -11,6 +11,7 @@ from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
 from mexcbot.indicators import calc_adx, calc_atr, calc_ema, calc_rsi
 from mexcbot.models import Opportunity
+from mexcbot.strategies.common import maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -168,6 +169,7 @@ def score_trinity_from_frame(
     if ema21_sl + 0.005 > TRINITY_SL_MIN and ema21_sl + 0.005 < sl_pct:
         sl_pct = round(ema21_sl + 0.005, 6)  # buffer below EMA21
         sl_pct = max(sl_pct, TRINITY_SL_MIN)
+    sl_pct = maybe_apply_atr_stops_v2(sl_pct, strategy="TRINITY", atr_pct=atr_pct)
 
     return Opportunity(
         symbol=symbol,

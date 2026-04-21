@@ -7,6 +7,39 @@ from mexcbot.config import env_float, env_int
 from mexcbot.indicators import calc_atr, calc_ema
 
 
+# -- Feature flag: route per-strategy SL through atr_stops.compute_atr_stop_pct
+# (caps at 3%, floors at 0.8%). Default OFF so live behaviour is unchanged.
+# Set USE_ATR_STOPS_V2=1 in env to enable.
+USE_ATR_STOPS_V2 = env_int("USE_ATR_STOPS_V2", 0)
+
+
+def maybe_apply_atr_stops_v2(
+    sl_pct: float,
+    *,
+    strategy: str,
+    atr_pct: float,
+) -> float:
+    """Optionally override the legacy per-strategy SL with the ATR-based cap.
+
+    When ``USE_ATR_STOPS_V2`` is falsy we return the caller's ``sl_pct``
+    unchanged — this is a strict no-op on the live-default code path. When the
+    flag is on, we defer to :func:`mexcbot.atr_stops.compute_atr_stop_pct`,
+    which clamps to the memo §2.1 envelope (0.8% floor, 3% cap).
+    """
+
+    if not USE_ATR_STOPS_V2:
+        return sl_pct
+    # Local import so a circular import never surfaces during module load.
+    from mexcbot.atr_stops import compute_atr_stop_pct
+
+    plan = compute_atr_stop_pct(strategy=strategy, atr_pct=float(atr_pct))
+    if plan is None:
+        # Unknown strategy key or non-positive ATR: fall back to legacy sl_pct
+        # rather than silently widening to the cap.
+        return sl_pct
+    return float(plan.sl_pct)
+
+
 MATURITY_LOOKBACK = env_int("MATURITY_LOOKBACK", 12)
 MATURITY_THRESHOLD = env_float("MATURITY_THRESHOLD", 0.55)
 MATURITY_MOONSHOT_THRESHOLD = env_float("MATURITY_MOONSHOT_THRESHOLD", 0.68)

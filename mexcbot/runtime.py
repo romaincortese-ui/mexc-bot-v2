@@ -56,6 +56,27 @@ KELLY_MULT_MARGINAL = env_float("KELLY_MULT_MARGINAL", 0.50)
 KELLY_MULT_SOLID = env_float("KELLY_MULT_SOLID", 0.80)
 KELLY_MULT_STANDARD = env_float("KELLY_MULT_STANDARD", 1.00)
 KELLY_MULT_HIGH_CONF = env_float("KELLY_MULT_HIGH_CONF", 1.50)
+
+# ---------------------------------------------------------------------------
+# Sprint memo integrations — feature flags, all OFF by default.
+# When any flag is 0 the helpers below are strict no-ops (identity behaviour).
+# ---------------------------------------------------------------------------
+# §2.8 Portfolio drawdown kill (30d soft / 90d hard).
+USE_DRAWDOWN_KILL = env_int("USE_DRAWDOWN_KILL", 0)
+# §2.4 Correlation-adjusted aggregate risk cap.
+USE_CORRELATION_CAP = env_int("USE_CORRELATION_CAP", 0)
+PORTFOLIO_RISK_CAP_PCT = env_float("PORTFOLIO_RISK_CAP_PCT", 0.04)
+# §2.6 Fee-tier volume banking sizing multiplier.
+USE_FEE_TIER_SIZING = env_int("USE_FEE_TIER_SIZING", 0)
+# §3.7 Weekend exposure multiplier (Fri 20:00 UTC → Sun 23:59 UTC → 0.70×).
+USE_WEEKEND_FLATTEN = env_int("USE_WEEKEND_FLATTEN", 0)
+# §2.7 MOONSHOT per-symbol trailing hit-rate gate.
+USE_MOONSHOT_PER_SYMBOL_GATE = env_int("USE_MOONSHOT_PER_SYMBOL_GATE", 0)
+# §2.9 FIFO tax-lot shadow ledger — accounting only, does not affect trading.
+USE_FIFO_TAX_LOTS = env_int("USE_FIFO_TAX_LOTS", 0)
+# §2.10 Review override validator — reject Anthropic-approved overrides when
+# the backing review does not meet OOS profit-factor and sample thresholds.
+USE_REVIEW_VALIDATION = env_int("USE_REVIEW_VALIDATION", 0)
 # SL applied when we reconcile an untracked position (manually-opened, orphaned,
 # or surviving a bot restart without recoverable state). Must not be looser than
 # what the strategy would have picked, or we silently widen real risk on restart.
@@ -208,6 +229,8 @@ class LiveBotRuntime:
         self._approved_review_overrides: dict[str, dict[str, object]] = {}
         self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
         self._telegram_alert_timestamps: dict[str, float] = {}
+        # §2.9 FIFO lot ledger — created lazily when flag is enabled.
+        self._fifo_lot_ledger = None
         self._state_path = Path(self.config.state_file) if self.config.state_file else None
         self._price_monitor = PriceMonitor()
         self._load_state()
@@ -591,6 +614,27 @@ class LiveBotRuntime:
         env_var = str(suggestion.get("env_var") or "")
         if env_var not in REVIEW_RUNTIME_OVERRIDE_SPECS:
             return False, f"{env_var} is suggestion-only and cannot be applied live."
+        if USE_REVIEW_VALIDATION:
+            try:
+                from mexcbot.review_validator import BacktestMetrics, validate_review_override
+
+                overview = dict(self.daily_review.get("overview", {}) or {})
+                oos_payload = {
+                    "total_trades": int(self.daily_review.get("total_trades", 0) or 0),
+                    "profit_factor": float(overview.get("profit_factor", 0.0) or 0.0),
+                    "sharpe": float(overview.get("sharpe", 0.0) or 0.0),
+                    "win_rate": float(overview.get("win_rate", 0.0) or 0.0),
+                }
+                # Without a separate IS window we use the same metrics for IS; the
+                # gate then enforces only sample-size + floor-PF, not degradation.
+                oos = BacktestMetrics.from_mapping(oos_payload)
+                decision = validate_review_override(in_sample=oos, out_of_sample=oos)
+                if not decision.accept:
+                    log.info("[REVIEW_VALIDATE] Rejected %s: %s", env_var, decision.reason)
+                    self._record_activity(f"Review override rejected {env_var}: {decision.reason}")
+                    return False, f"Rejected by validator: {decision.reason}"
+            except Exception as exc:
+                log.debug("review validator failed: %s", exc)
         current_value = self._current_override_value(env_var)
         delta_text = str(suggestion.get("suggested_delta") or "")
         try:
@@ -877,6 +921,13 @@ class LiveBotRuntime:
         trade.remaining_cost_usdt = 0.0
         closed = trade.to_dict()
         self.trade_history.append(closed)
+        self._maybe_record_tax_lot_sell(
+            symbol=trade.symbol,
+            qty=float(exit_qty),
+            price=float(exit_price),
+            fee=float(fee_quote_qty or 0.0),
+            at=trade.closed_at or datetime.now(timezone.utc),
+        )
         self._record_symbol_cooldown(trade, reason)
         self._update_strategy_guards(closed)
         self._send_close_alert(closed)
@@ -2167,6 +2218,292 @@ class LiveBotRuntime:
         cap = total_equity * self._strategy_capital_pct(strategy)
         return max(0.0, cap - self._used_strategy_capital(strategy))
 
+    # ------------------------------------------------------------------
+    # Sprint memo integrations — all gated on feature flags defaulting OFF.
+    # ------------------------------------------------------------------
+    def _daily_equity_curve(self) -> list:
+        """Reconstruct a daily equity curve from closed-trade pnl_usdt.
+
+        Only used when USE_DRAWDOWN_KILL is enabled. Falls back to an empty
+        list (drawdown_kill then returns ``no_data`` and a neutral 1.0
+        multiplier) if trade_history does not carry timestamped pnl_usdt.
+        """
+
+        from mexcbot.drawdown_kill import EquityPoint
+
+        if not self.trade_history:
+            return []
+        by_day: dict[str, float] = {}
+        order: list[str] = []
+        for row in self.trade_history:
+            closed_raw = row.get("closed_at")
+            pnl = row.get("pnl_usdt")
+            if not closed_raw or pnl is None:
+                continue
+            try:
+                closed_dt = datetime.fromisoformat(str(closed_raw))
+            except Exception:
+                continue
+            if closed_dt.tzinfo is None:
+                closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+            key = closed_dt.strftime("%Y-%m-%d")
+            if key not in by_day:
+                order.append(key)
+                by_day[key] = 0.0
+            by_day[key] += float(pnl)
+        if not order:
+            return []
+        anchor = self._session_anchor_equity
+        if anchor is None or anchor <= 0:
+            try:
+                anchor = float(self._balance_snapshot().get("total_equity", 0.0) or 0.0)
+            except Exception:
+                anchor = 0.0
+            # Subtract cumulative pnl so the curve starts at a reasonable base.
+            anchor -= sum(by_day.values())
+        if anchor <= 0:
+            anchor = max(1.0, sum(abs(v) for v in by_day.values()))
+        running = float(anchor)
+        points: list = []
+        for key in order:
+            running += by_day[key]
+            ts = datetime.strptime(key, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            points.append(EquityPoint(at=ts, equity=running))
+        return points
+
+    def _drawdown_kill_multiplier(self) -> float:
+        """Return the drawdown-kill allocation multiplier. 1.0 when flag OFF
+        or when we cannot build an equity curve.
+        """
+
+        if not USE_DRAWDOWN_KILL:
+            return 1.0
+        try:
+            from mexcbot.drawdown_kill import evaluate_drawdown_kill
+
+            curve = self._daily_equity_curve()
+            if not curve:
+                return 1.0
+            decision = evaluate_drawdown_kill(equity_curve=curve)
+            mult = float(decision.allocation_multiplier)
+            if decision.hard_halt or decision.soft_throttle:
+                self._record_activity(
+                    f"Drawdown kill {decision.reason} x{mult:.2f}"
+                )
+            return mult
+        except Exception as exc:
+            log.debug("drawdown_kill multiplier failed: %s", exc)
+            return 1.0
+
+    def _fee_tier_multiplier(self) -> float:
+        if not USE_FEE_TIER_SIZING:
+            return 1.0
+        try:
+            from mexcbot.fee_tier import evaluate_fee_tier
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            volume = 0.0
+            for row in self.trade_history:
+                closed_raw = row.get("closed_at")
+                if not closed_raw:
+                    continue
+                try:
+                    closed_dt = datetime.fromisoformat(str(closed_raw))
+                except Exception:
+                    continue
+                if closed_dt.tzinfo is None:
+                    closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+                if closed_dt < cutoff:
+                    continue
+                entry_cost = float(row.get("entry_cost_usdt") or 0.0)
+                exit_price = float(row.get("exit_price") or 0.0)
+                qty = float(row.get("qty") or 0.0)
+                exit_notional = exit_price * qty if exit_price > 0 and qty > 0 else entry_cost
+                volume += entry_cost + exit_notional
+            state = evaluate_fee_tier(current_volume_usd=volume)
+            return float(state.sizing_multiplier)
+        except Exception as exc:
+            log.debug("fee_tier multiplier failed: %s", exc)
+            return 1.0
+
+    def _weekend_flatten_multiplier(self) -> float:
+        if not USE_WEEKEND_FLATTEN:
+            return 1.0
+        try:
+            from mexcbot.execution_hardening import weekend_exposure_multiplier
+
+            return float(weekend_exposure_multiplier(datetime.now(timezone.utc)))
+        except Exception as exc:
+            log.debug("weekend flatten multiplier failed: %s", exc)
+            return 1.0
+
+    def _sprint_sizing_multiplier(self, opportunity: Opportunity, *, total_equity: float) -> float:
+        """Composite multiplier applied to the final allocation.
+
+        Each component returns 1.0 when its flag is OFF, so the product is
+        exactly 1.0 when all memo integrations are disabled.
+        """
+
+        mult = 1.0
+        mult *= self._drawdown_kill_multiplier()
+        mult *= self._fee_tier_multiplier()
+        mult *= self._weekend_flatten_multiplier()
+        return max(0.0, mult)
+
+    def _existing_exposures_for_corr(self, total_equity: float) -> dict:
+        if total_equity <= 0:
+            return {}
+        exposures: dict[str, float] = {}
+        for trade in self.open_trades:
+            notional = float(
+                (trade.last_price or trade.entry_price) * trade.qty
+            )
+            if notional <= 0:
+                continue
+            sl_pct_meta = trade.metadata.get("sl_pct") if isinstance(trade.metadata, dict) else None
+            sl_pct = float(sl_pct_meta) if sl_pct_meta else 0.05
+            risk_frac = (notional * sl_pct) / total_equity
+            sym = trade.symbol.upper()
+            exposures[sym] = exposures.get(sym, 0.0) + risk_frac
+        return exposures
+
+    def _correlation_cap_rejects(
+        self,
+        opportunity: Opportunity,
+        *,
+        allocation_usdt: float,
+        total_equity: float,
+    ) -> bool:
+        if not USE_CORRELATION_CAP:
+            return False
+        if total_equity <= 0 or allocation_usdt <= 0:
+            return False
+        try:
+            from mexcbot.correlation_risk import would_breach_cap
+
+            sl_pct = float(opportunity.sl_pct or 0.05)
+            if sl_pct <= 0:
+                sl_pct = 0.05
+            new_risk = (allocation_usdt * sl_pct) / total_equity
+            existing = self._existing_exposures_for_corr(total_equity)
+            assessment = would_breach_cap(
+                existing_exposures_pct=existing,
+                new_symbol=opportunity.symbol,
+                new_risk_pct=new_risk,
+                cap_pct=PORTFOLIO_RISK_CAP_PCT,
+            )
+            if assessment.would_breach:
+                self._record_activity(
+                    f"Corr cap block {opportunity.symbol} risk={assessment.portfolio_risk_pct:.4f}"
+                )
+                log.info(
+                    "[CORR_CAP] Rejected %s: portfolio risk %.4f > cap %.4f",
+                    opportunity.symbol,
+                    assessment.portfolio_risk_pct,
+                    assessment.cap_pct,
+                )
+                return True
+            return False
+        except Exception as exc:
+            log.debug("correlation cap check failed: %s", exc)
+            return False
+
+    def _moonshot_per_symbol_rejects(self, opportunity: Opportunity) -> bool:
+        if not USE_MOONSHOT_PER_SYMBOL_GATE:
+            return False
+        if opportunity.strategy.upper() != "MOONSHOT":
+            return False
+        try:
+            from mexcbot.moonshot_gate import MoonshotTrade, evaluate_moonshot_gate
+
+            history: list = []
+            for row in self.trade_history:
+                if str(row.get("strategy", "")).upper() != "MOONSHOT":
+                    continue
+                if row.get("is_partial"):
+                    continue
+                if row.get("pnl_pct") is None:
+                    continue
+                history.append(
+                    MoonshotTrade(
+                        symbol=str(row.get("symbol", "")),
+                        pnl_pct=float(row.get("pnl_pct") or 0.0),
+                    )
+                )
+            decision = evaluate_moonshot_gate(
+                symbol=opportunity.symbol,
+                history=history,
+            )
+            if not decision.allow:
+                log.info(
+                    "[MOONSHOT_GATE] Blocked %s: hit_rate=%.2f < %.2f (n=%d)",
+                    opportunity.symbol,
+                    decision.hit_rate,
+                    decision.min_hit_rate,
+                    decision.sample_size,
+                )
+                self._record_activity(
+                    f"Moonshot gate block {opportunity.symbol} hr={decision.hit_rate:.2f}"
+                )
+                return True
+            return False
+        except Exception as exc:
+            log.debug("moonshot_gate check failed: %s", exc)
+            return False
+
+    def _passes_sprint_pretrade_gates(self, opportunity: Opportunity) -> bool:
+        """Combined pretrade gate — True when all enabled gates allow entry."""
+
+        if self._moonshot_per_symbol_rejects(opportunity):
+            return False
+        return True
+
+    def _maybe_record_tax_lot_buy(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        price: float,
+        fee: float,
+        at: datetime,
+    ) -> None:
+        if not USE_FIFO_TAX_LOTS:
+            return
+        try:
+            if self._fifo_lot_ledger is None:
+                from mexcbot.tax_lots import FifoLotLedger
+
+                self._fifo_lot_ledger = FifoLotLedger()
+            if qty <= 0 or price <= 0:
+                return
+            self._fifo_lot_ledger.record_buy(
+                symbol=symbol, qty=qty, price=price, fee=fee, at=at
+            )
+        except Exception as exc:
+            log.debug("tax_lot buy failed: %s", exc)
+
+    def _maybe_record_tax_lot_sell(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        price: float,
+        fee: float,
+        at: datetime,
+    ) -> None:
+        if not USE_FIFO_TAX_LOTS:
+            return
+        if self._fifo_lot_ledger is None:
+            return
+        try:
+            if qty <= 0 or price <= 0:
+                return
+            self._fifo_lot_ledger.record_sell(
+                symbol=symbol, qty=qty, price=price, fee=fee, at=at
+            )
+        except Exception as exc:
+            log.debug("tax_lot sell failed: %s", exc)
+
     def _kelly_multiplier(self, opportunity: Opportunity) -> float:
         if opportunity.strategy.upper() != "SCALPER":
             return 1.0
@@ -2200,21 +2537,23 @@ class LiveBotRuntime:
         capped_budget = min(per_trade_cap, available_pool_cap, available_balance)
         if capped_budget <= 0:
             return 0.0
+        # Sprint memo composite multiplier (1.0 when all flags OFF).
+        sprint_mult = self._sprint_sizing_multiplier(opportunity, total_equity=total_equity)
         if opportunity.strategy.upper() != "SCALPER":
             opportunity.metadata.pop("kelly_mult", None)
             opportunity.metadata.pop("risk_budget_usdt", None)
-            return capped_budget
+            return capped_budget * sprint_mult
 
         sl_pct = float(opportunity.sl_pct or 0.0)
         if sl_pct <= 0:
             opportunity.metadata.pop("kelly_mult", None)
             opportunity.metadata.pop("risk_budget_usdt", None)
-            return capped_budget
+            return capped_budget * sprint_mult
 
         kelly_mult = self._kelly_multiplier(opportunity)
         risk_per_trade = min(SCALPER_RISK_PER_TRADE * kelly_mult, KELLY_RISK_CAP)
         risk_budget = available_balance * risk_per_trade / sl_pct
-        allocation = min(risk_budget, capped_budget)
+        allocation = min(risk_budget, capped_budget) * sprint_mult
         opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
         opportunity.metadata["risk_budget_usdt"] = round(allocation, 4)
         return allocation
@@ -2529,6 +2868,13 @@ class LiveBotRuntime:
             trade.sl_price,
             trade.entry_signal,
         )
+        self._maybe_record_tax_lot_buy(
+            symbol=trade.symbol,
+            qty=float(trade.qty),
+            price=float(trade.entry_price),
+            fee=float(trade.entry_fee_usdt or 0.0),
+            at=trade.opened_at,
+        )
         return trade
 
     def _fill_open_slots(self) -> None:
@@ -2561,6 +2907,9 @@ class LiveBotRuntime:
             )
             if opportunity is None:
                 break
+            if not self._passes_sprint_pretrade_gates(opportunity):
+                cycle_excluded.add(opportunity.symbol)
+                continue
             if not self._passes_liquidity_guard(opportunity, ticker_by_symbol=ticker_by_symbol):
                 cycle_excluded.add(opportunity.symbol)
                 continue
@@ -2570,6 +2919,13 @@ class LiveBotRuntime:
                 total_equity=total_equity or available_balance,
             )
             if allocation_usdt <= 0:
+                cycle_excluded.add(opportunity.symbol)
+                continue
+            if self._correlation_cap_rejects(
+                opportunity,
+                allocation_usdt=allocation_usdt,
+                total_equity=total_equity or available_balance,
+            ):
                 cycle_excluded.add(opportunity.symbol)
                 continue
             trade = self.open_position(opportunity, allocation_usdt=allocation_usdt)

@@ -11,6 +11,7 @@ from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
 from mexcbot.indicators import calc_adx, calc_atr, calc_bollinger_bands, calc_rsi
 from mexcbot.models import Opportunity
+from mexcbot.strategies.common import maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -198,6 +199,7 @@ def score_grid_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: flo
     tp_pct = max(params["tp_min"], min(params["tp_max"], (tp_price_target / price_now) - 1))
     sl_price_target = lower * (1 - bb_width)
     sl_pct = min(GRID_SL_CAP, max(params["sl_min"], min(params["sl_max"], (price_now - sl_price_target) / price_now)))
+    sl_pct = maybe_apply_atr_stops_v2(sl_pct, strategy="GRID", atr_pct=atr_pct)
     if sl_pct <= 0 or tp_pct / sl_pct < params["min_reward_risk"]:
         return None
 
