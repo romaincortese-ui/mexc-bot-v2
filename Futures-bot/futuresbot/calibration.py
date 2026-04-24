@@ -18,9 +18,18 @@ def _utc_now() -> datetime:
 
 
 def _profit_factor(pnl: pd.Series) -> float:
+    """Gate A A2 (memo 1 §7): return ``float('inf')`` when there are zero losing
+    trades rather than the misleading ``999.0`` sentinel. Downstream consumers
+    that treat profit_factor as a numeric comparison must clamp this value
+    themselves; the calibration validator below enforces a minimum-trade floor
+    before any inf-PF payload is acted upon.
+    """
+
     wins = pnl[pnl > 0]
     losses = pnl[pnl < 0]
-    return float(wins.sum() / abs(losses.sum())) if not losses.empty else 999.0
+    if losses.empty:
+        return float("inf") if not wins.empty else 0.0
+    return float(wins.sum() / abs(losses.sum()))
 
 
 def _summarize_trade_group(group: pd.DataFrame) -> dict[str, Any]:
@@ -52,10 +61,26 @@ def _group_trade_metrics(trades_df: pd.DataFrame, keys: list[str]) -> dict[str, 
     return grouped
 
 
-def _derive_entry_adjustment(metrics: Mapping[str, Any], *, min_trades: int) -> dict[str, Any]:
+def _derive_entry_adjustment(
+    metrics: Mapping[str, Any],
+    *,
+    min_trades: int,
+    min_trades_loosen: int | None = None,
+) -> dict[str, Any]:
+    """Gate A A1 (memo 1 §7): asymmetric trade-count floors.
+
+    ``min_trades`` gates any adjustment at all (tightening is allowed as soon
+    as the sample reaches this floor). ``min_trades_loosen``, when supplied,
+    gates the *loosen* branch only — the runtime must never widen entry gates
+    or inflate size on a small sample. A 4-trade / PF-∞ payload can tighten or
+    block the bot; it must not loosen it. Defaults to ``3 * min_trades`` when
+    not supplied, matching the Gold-bot 40/15 ratio in spirit.
+    """
+
     trades = int(metrics.get("trades", 0) or 0)
     if trades < min_trades:
         return {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}
+    loosen_floor = int(min_trades_loosen if min_trades_loosen is not None else min_trades * 3)
     profit_factor = float(metrics.get("profit_factor", 0.0) or 0.0)
     expectancy = float(metrics.get("expectancy", 0.0) or 0.0)
     win_rate = float(metrics.get("win_rate", 0.0) or 0.0)
@@ -70,6 +95,15 @@ def _derive_entry_adjustment(metrics: Mapping[str, Any], *, min_trades: int) -> 
         risk_mult = max(0.5, round(1.0 - min(0.45, tighten / 12.0), 2))
         return {"threshold_offset": tighten, "risk_mult": risk_mult, "block_reason": None}
     if profit_factor > 1.15 and expectancy > 0.02 and win_rate > 0.5:
+        if trades < loosen_floor:
+            # Sample is good but not big enough to justify loosening. Hold
+            # neutral rather than widening entries on statistically thin data.
+            return {
+                "threshold_offset": 0.0,
+                "risk_mult": 1.0,
+                "block_reason": None,
+                "loosen_held": f"trades={trades}<{loosen_floor}",
+            }
         relax = min(3.0, round((profit_factor - 1.0) * 5.0 + min(1.0, expectancy * 10.0), 2))
         risk_mult = min(1.25, round(1.0 + min(0.25, relax / 10.0), 2))
         return {"threshold_offset": -relax, "risk_mult": risk_mult, "block_reason": None}
@@ -83,7 +117,14 @@ def build_trade_calibration(
     window_end: datetime,
     min_strategy_trades: int = 12,
     min_symbol_trades: int = 8,
+    min_strategy_trades_loosen: int | None = None,
+    min_symbol_trades_loosen: int | None = None,
 ) -> dict[str, Any]:
+    # Gate A A1 (memo 1 §7): the floor to *loosen* entries defaults to 3x the
+    # floor to *tighten*. You should tighten quickly on weakness and loosen
+    # slowly on strength.
+    strategy_loosen = min_strategy_trades_loosen if min_strategy_trades_loosen is not None else min_strategy_trades * 3
+    symbol_loosen = min_symbol_trades_loosen if min_symbol_trades_loosen is not None else min_symbol_trades * 3
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         return {
@@ -111,26 +152,26 @@ def build_trade_calibration(
     by_strategy_symbol = _group_trade_metrics(normalized, ["strategy", "symbol"])
     by_strategy_symbol_signal = _group_trade_metrics(normalized, ["strategy", "symbol", "entry_signal"])
     entry_by_strategy = {
-        strategy: _derive_entry_adjustment(metrics, min_trades=min_strategy_trades)
+        strategy: _derive_entry_adjustment(metrics, min_trades=min_strategy_trades, min_trades_loosen=strategy_loosen)
         for strategy, metrics in by_strategy.items()
     }
     entry_by_strategy_signal: dict[str, dict[str, Any]] = {}
     for strategy, signals in by_strategy_signal.items():
         for signal, metrics in signals.items():
-            entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_strategy_trades)
+            entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_strategy_trades, min_trades_loosen=strategy_loosen)
             if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
                 entry_by_strategy_signal.setdefault(strategy, {})[signal] = entry_adjustment
     entry_by_strategy_symbol: dict[str, dict[str, Any]] = {}
     for strategy, symbols in by_strategy_symbol.items():
         for symbol, metrics in symbols.items():
-            entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_symbol_trades)
+            entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_symbol_trades, min_trades_loosen=symbol_loosen)
             if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
                 entry_by_strategy_symbol.setdefault(strategy, {})[symbol] = entry_adjustment
     entry_by_strategy_symbol_signal: dict[str, dict[str, dict[str, Any]]] = {}
     for strategy, symbols in by_strategy_symbol_signal.items():
         for symbol, signals in symbols.items():
             for signal, metrics in signals.items():
-                entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_symbol_trades)
+                entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_symbol_trades, min_trades_loosen=symbol_loosen)
                 if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
                     entry_by_strategy_symbol_signal.setdefault(strategy, {}).setdefault(symbol, {})[signal] = entry_adjustment
     return {
@@ -151,17 +192,39 @@ def build_trade_calibration(
     }
 
 
+def _json_safe(value: Any) -> Any:
+    """Gate A A2 (memo 1 §7): recursively sanitise a payload for strict JSON.
+
+    ``float('inf')`` / ``-inf`` / ``nan`` are not valid JSON and break strict
+    consumers (Redis clients, JS / Rust / Go parsers). This converts them to
+    ``null`` so downstream code sees "no-loss sample" as a first-class empty
+    signal rather than a pseudo-numeric 999.
+    """
+
+    import math as _math
+
+    if isinstance(value, float):
+        if _math.isnan(value) or _math.isinf(value):
+            return None
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def write_trade_calibration(file_path: str, calibration: Mapping[str, Any]) -> None:
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(calibration, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(_json_safe(calibration), indent=2), encoding="utf-8")
 
 
 def publish_trade_calibration(redis_url: str, redis_key: str, calibration: Mapping[str, Any]) -> bool:
     if not redis_url or not redis_key or redis is None:
         return False
     client = redis.from_url(redis_url)
-    client.set(redis_key, json.dumps(calibration))
+    client.set(redis_key, json.dumps(_json_safe(calibration)))
     return True
 
 

@@ -24,9 +24,17 @@ class BacktestState:
 
 
 def _profit_factor(pnl: pd.Series) -> float:
+	"""Gate A A2 (memo 1 §7): return ``inf`` (not 999) when there are no losses.
+
+	Lets downstream consumers distinguish "no-loss sample" (first-class empty
+	signal) from "bounded positive edge" (a real number) instead of treating a
+	4-trade sample's PF 999 as production-grade.
+	"""
 	wins = pnl[pnl > 0]
 	losses = pnl[pnl < 0]
-	return float(wins.sum() / abs(losses.sum())) if not losses.empty else 999.0
+	if losses.empty:
+		return float("inf") if not wins.empty else 0.0
+	return float(wins.sum() / abs(losses.sum()))
 
 
 def _group_trade_metrics(trades_df: pd.DataFrame, keys: list[str]) -> dict[str, Any]:
@@ -104,11 +112,15 @@ def build_signal_summary(report: Mapping[str, Any], *, limit: int = 3) -> dict[s
 
 
 def export_artifacts(output_dir: str, equity_curve: list[dict[str, Any]], trades: list[dict[str, Any]], report: dict[str, Any]) -> None:
+	# Gate A A2 (memo 1 §7): sanitise ``inf`` profit_factor before writing
+	# summary.json so strict JSON consumers can parse it.
+	from futuresbot.calibration import _json_safe
+
 	path = Path(output_dir)
 	path.mkdir(parents=True, exist_ok=True)
 	pd.DataFrame(equity_curve).to_csv(path / "equity_curve.csv", index=False)
 	pd.DataFrame(trades).to_csv(path / "trade_journal.csv", index=False)
-	(path / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+	(path / "summary.json").write_text(json.dumps(_json_safe(report), indent=2), encoding="utf-8")
 
 
 class FuturesBacktestEngine:

@@ -229,7 +229,7 @@ class FuturesConfig:
             calibration_redis_key=env_str("FUTURES_CALIBRATION_REDIS_KEY", "mexc_futures_calibration"),
             calibration_refresh_seconds=env_int("FUTURES_CALIBRATION_REFRESH_SECONDS", 900),
             calibration_max_age_hours=env_float("FUTURES_CALIBRATION_MAX_AGE_HOURS", 72.0),
-            calibration_min_total_trades=env_int("FUTURES_CALIBRATION_MIN_TOTAL_TRADES", 4),
+            calibration_min_total_trades=env_int("FUTURES_CALIBRATION_MIN_TOTAL_TRADES", 15),
             review_file=resolve_repo_path(env_str("FUTURES_DAILY_REVIEW_FILE", "backtest_output/daily_review.json")),
             review_redis_key=env_str("FUTURES_DAILY_REVIEW_REDIS_KEY", "mexc_futures_daily_review"),
             redis_url=env_str("REDIS_URL", ""),
@@ -262,7 +262,7 @@ class FuturesConfig:
             correlation_buckets=parse_correlation_buckets(env_str("FUTURES_CORRELATION_BUCKETS", "")),
             max_per_bucket=max(1, env_int("FUTURES_MAX_PER_BUCKET", 1)),
             session_hours_utc=env_str("FUTURES_SESSION_HOURS_UTC", ""),
-            funding_rate_abs_max=env_float("FUTURES_FUNDING_RATE_ABS_MAX", 0.0),
+            funding_rate_abs_max=env_float("FUTURES_FUNDING_RATE_ABS_MAX", 0.0008),
             open_type=env_int("FUTURES_OPEN_TYPE", 1),
             position_mode=env_int("FUTURES_POSITION_MODE", 2),
         )

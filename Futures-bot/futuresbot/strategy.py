@@ -342,3 +342,120 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
             "consolidation_range_pct": round(consolidation_range_pct, 6),
         },
     )
+
+def diagnose_setup_rejection(frame_15m: pd.DataFrame, config: StrategyConfig) -> str:
+    """Gate A A5 (memo 1 Â§7): return the *first* gate that rejected a bar.
+
+    Pure function, no I/O. Used by the runtime to emit a ``[GATE_BLOCK]`` log
+    line explaining why ``score_btc_futures_setup`` returned ``None``, so the
+    operator can tell the difference between "market was quiet" and "filters
+    are mathematically unreachable for this symbol" (the Futures-bot memo 1
+    Â§3 finding on PEPE / TAO running BTC-tuned gates).
+
+    The diagnosis is best-effort and conservative: any compute failure returns
+    ``"diagnostic_error"`` rather than raising.
+    """
+
+    try:
+        if frame_15m is None or len(frame_15m) < 220:
+            return f"insufficient_15m_bars={0 if frame_15m is None else len(frame_15m)}<220"
+        frame_1h = resample_ohlcv(frame_15m.copy(), "1h")
+        if len(frame_1h) < 120:
+            return f"insufficient_1h_bars={len(frame_1h)}<120"
+        close_15 = frame_15m["close"].astype(float)
+        volume_15 = frame_15m["volume"].astype(float)
+        close_1h = frame_1h["close"].astype(float)
+        ema20 = calc_ema(close_1h, 20)
+        ema50 = calc_ema(close_1h, 50)
+        ema100 = calc_ema(close_1h, 100)
+        rsi_1h = calc_rsi(close_1h, 14)
+        rsi_15 = calc_rsi(close_15, 14)
+        adx_1h = calc_adx(frame_1h, 14)
+        atr_1h = calc_atr(frame_1h, 14)
+        atr_15 = calc_atr(frame_15m, 14)
+
+        current_price = float(close_15.iloc[-1])
+        current_ema20 = float(ema20.iloc[-1])
+        current_ema50 = float(ema50.iloc[-1])
+        current_ema100 = float(ema100.iloc[-1])
+        current_rsi_1h = float(rsi_1h.iloc[-1])
+        current_rsi_15 = float(rsi_15.iloc[-1])
+        current_adx = float(adx_1h.iloc[-1])
+        current_atr_1h = float(atr_1h.iloc[-1])
+        current_atr_15 = float(atr_15.iloc[-1])
+
+        consolidation = frame_15m.iloc[-(config.consolidation_window_bars + 1):-1]
+        if consolidation.empty:
+            return "consolidation_window_empty"
+        consolidation_high = float(consolidation["high"].max())
+        consolidation_low = float(consolidation["low"].min())
+        consolidation_range_pct = (consolidation_high - consolidation_low) / current_price if current_price > 0 else 0.0
+        consolidation_cap = max(
+            config.consolidation_max_range_pct,
+            (current_atr_15 / current_price) * config.consolidation_atr_mult if current_price > 0 else 0.0,
+        )
+        if consolidation_range_pct > consolidation_cap:
+            return (
+                f"consolidation_range_pct={consolidation_range_pct:.4f}>{consolidation_cap:.4f}"
+            )
+
+        if current_adx < config.adx_floor:
+            return f"adx={current_adx:.2f}<{config.adx_floor:.2f}"
+
+        trend_24h = (float(close_1h.iloc[-1]) / float(close_1h.iloc[-25])) - 1.0 if len(close_1h) >= 25 else 0.0
+        trend_6h = (float(close_1h.iloc[-1]) / float(close_1h.iloc[-7])) - 1.0 if len(close_1h) >= 7 else 0.0
+        if abs(trend_24h) < config.trend_24h_floor:
+            return f"trend_24h={trend_24h:+.4f}|<{config.trend_24h_floor:.4f}"
+        if abs(trend_6h) < config.trend_6h_floor:
+            return f"trend_6h={trend_6h:+.4f}|<{config.trend_6h_floor:.4f}"
+
+        # EMA alignment: price must be stacked in one direction
+        long_stack = current_ema20 > current_ema50 > current_ema100
+        short_stack = current_ema20 < current_ema50 < current_ema100
+        if not (long_stack or short_stack):
+            return (
+                f"ema_not_aligned ema20={current_ema20:.2f} ema50={current_ema50:.2f} ema100={current_ema100:.2f}"
+            )
+
+        # Volume on the trigger bar
+        volume_baseline = max(
+            1e-9,
+            float(volume_15.iloc[-(config.consolidation_window_bars + 1):-1].mean()),
+        )
+        volume_ratio = float(volume_15.iloc[-1]) / volume_baseline
+        if volume_ratio < config.volume_ratio_floor:
+            return f"volume_ratio={volume_ratio:.2f}<{config.volume_ratio_floor:.2f}"
+
+        # RSI alignment (direction-aware)
+        if long_stack:
+            if current_rsi_1h < 50.0:
+                return f"rsi_1h={current_rsi_1h:.1f}<50.0 (long-stack)"
+            if current_rsi_15 < 48.0:
+                return f"rsi_15={current_rsi_15:.1f}<48.0 (long-stack)"
+        else:
+            if current_rsi_1h > 50.0:
+                return f"rsi_1h={current_rsi_1h:.1f}>50.0 (short-stack)"
+            if current_rsi_15 > 52.0:
+                return f"rsi_15={current_rsi_15:.1f}>52.0 (short-stack)"
+
+        # Breakout / pressure zone â€” if we got here, stack and trend are fine
+        # but the trigger bar is not in a breakout region.
+        breakout_buffer = current_atr_15 * config.breakout_buffer_atr
+        if long_stack:
+            if current_price <= consolidation_high - breakout_buffer * 0.35:
+                return (
+                    f"no_breakout_long price={current_price:.2f} coil_high={consolidation_high:.2f} "
+                    f"buffer={breakout_buffer:.2f}"
+                )
+        else:
+            if current_price >= consolidation_low + breakout_buffer * 0.35:
+                return (
+                    f"no_breakdown_short price={current_price:.2f} coil_low={consolidation_low:.2f} "
+                    f"buffer={breakout_buffer:.2f}"
+                )
+
+        # If everything above passed, the score probably landed below the
+        # threshold or the reward/risk ratio rejected the entry.
+        return "score_or_rr_below_threshold"
+    except Exception as exc:
+        return f"diagnostic_error={type(exc).__name__}"
