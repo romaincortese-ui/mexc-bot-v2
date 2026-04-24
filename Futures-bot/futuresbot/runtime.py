@@ -155,7 +155,28 @@ class FuturesRuntime:
         return "📝 PAPER" if self.config.paper_trade else "💰 LIVE"
 
     def _format_price(self, value: float) -> str:
-        return f"{value:,.2f}"
+        # Sub-cent coins (PEPE ~$3.88e-6, SHIB, etc.) must not be rounded to
+        # "$0.00" or TP/SL lines become indistinguishable from entry. Keep 2
+        # decimals above $1, 4 decimals between $0.01 and $1, and 8 significant
+        # decimals below $0.01.
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return "0.00"
+        mag = abs(v)
+        if mag >= 1.0:
+            return f"{v:,.2f}"
+        if mag >= 0.01:
+            return f"{v:,.4f}"
+        if mag > 0.0:
+            formatted = f"{v:.8f}"
+            # Trim trailing zeros but keep at least 2 decimals for readability
+            if "." in formatted:
+                formatted = formatted.rstrip("0")
+                if formatted.endswith("."):
+                    formatted += "00"
+            return formatted
+        return "0.00"
 
     def _safe_float(self, payload: dict[str, Any], *keys: str, default: float = 0.0) -> float:
         for key in keys:
