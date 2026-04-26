@@ -247,6 +247,12 @@ def _config(**overrides) -> LiveConfig:
         session_loss_pause_mins=120,
         strategy_loss_streak_max=3,
         strategy_loss_streak_mins=240,
+        symbol_perf_gate_enabled=True,
+        symbol_perf_gate_min_trades=3,
+        symbol_perf_gate_max_losses=2,
+        symbol_perf_gate_min_profit_factor=1.0,
+        symbol_perf_gate_lookback_trades=20,
+        symbol_perf_gate_pause_hours=24,
         moonshot_btc_ema_gate=-0.02,
         moonshot_btc_gate_reopen=-0.01,
         adaptive_window=20,
@@ -461,6 +467,156 @@ def test_handle_telegram_review_command_sends_daily_review(monkeypatch):
     runtime._handle_telegram_commands()
 
     assert any("Daily Review" in text for text, _mode in runtime.telegram.sent_messages)
+
+
+def test_fee_report_message_shows_gross_fees_net_and_fee_share():
+    runtime = LiveBotRuntime(_config(), StubClient())
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    runtime.trade_history = [
+        {
+            "symbol": "DOGEUSDT",
+            "strategy": "SCALPER",
+            "closed_at": f"{today}T01:00:00+00:00",
+            "gross_pnl_usdt": 2.0,
+            "net_pnl_usdt": 1.7,
+            "total_fees_usdt": 0.3,
+            "pnl_pct": 1.0,
+            "is_partial": False,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "strategy": "GRID",
+            "closed_at": f"{today}T02:00:00+00:00",
+            "gross_pnl_usdt": -1.0,
+            "net_pnl_usdt": -1.2,
+            "total_fees_usdt": 0.2,
+            "pnl_pct": -1.0,
+            "is_partial": False,
+        },
+    ]
+
+    message = runtime._build_fee_report_message(day=today)
+
+    assert "Daily Fee Report" in message
+    assert "Gross P&L: <b>$+1.00</b>" in message
+    assert "Fees: <b>$0.50</b>" in message
+    assert "Net P&L: <b>$+0.50</b>" in message
+    assert "Fee share of gross profit: <b>25.0%</b>" in message
+    assert "SCALPER" in message
+    assert "GRID" in message
+
+
+def test_allocation_dashboard_shows_pool_capacity_open_risk_and_unused():
+    runtime = LiveBotRuntime(_config(), StubClient())
+    runtime.open_trades = [
+        Trade(
+            symbol="DOGEUSDT",
+            entry_price=10.0,
+            qty=2.0,
+            tp_price=10.2,
+            sl_price=9.5,
+            opened_at=datetime.now(timezone.utc),
+            order_id="s1",
+            score=40.0,
+            entry_signal="CROSSOVER",
+            paper=False,
+            strategy="SCALPER",
+            remaining_cost_usdt=20.0,
+        ),
+        Trade(
+            symbol="ETHUSDT",
+            entry_price=10.0,
+            qty=1.5,
+            tp_price=10.2,
+            sl_price=9.0,
+            opened_at=datetime.now(timezone.utc),
+            order_id="r1",
+            score=40.0,
+            entry_signal="REV",
+            paper=False,
+            strategy="REVERSAL",
+            remaining_cost_usdt=15.0,
+        ),
+    ]
+
+    message = runtime._build_allocation_dashboard_message()
+
+    assert "Allocation Dashboard" in message
+    assert "SCALPER" in message
+    assert "MOONSHOT pool" in message
+    assert "unused" in message
+    assert "open risk $1.00" in message
+    assert "open risk $1.50" in message
+    assert "Total open capital: <b>$35.00</b>" in message
+    assert "Total open risk to stops: <b>$2.50</b>" in message
+
+
+def test_symbol_performance_gate_blocks_symbol_after_loss_limit(caplog):
+    runtime = LiveBotRuntime(_config(symbol_perf_gate_max_losses=2, symbol_perf_gate_min_trades=3), StubClient())
+    runtime.trade_history = [
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "pnl_usdt": -0.5, "pnl_pct": -1.0, "is_partial": False},
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "pnl_usdt": -0.4, "pnl_pct": -0.8, "is_partial": False},
+    ]
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        allowed = runtime._passes_sprint_pretrade_gates(opportunity)
+
+    assert allowed is False
+    assert opportunity.metadata["pretrade_block_reason"] == "symbol_performance_gate"
+    assert "2 losses >= limit 2" in opportunity.metadata["symbol_gate_detail"]
+    assert runtime.symbol_performance_paused_until["DOGEUSDT"] > time.time()
+    assert "[SYMBOL_GATE] Blocked DOGEUSDT" in caplog.text
+
+
+def test_symbol_performance_gate_blocks_pf_below_floor_after_sample():
+    runtime = LiveBotRuntime(_config(symbol_perf_gate_max_losses=10, symbol_perf_gate_min_trades=3), StubClient())
+    runtime.trade_history = [
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "net_pnl_usdt": 0.3, "is_partial": False},
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "net_pnl_usdt": -0.4, "is_partial": False},
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "net_pnl_usdt": -0.2, "is_partial": False},
+    ]
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    allowed = runtime._passes_sprint_pretrade_gates(opportunity)
+
+    assert allowed is False
+    assert "PF 0.50 < 1.00 over 3 trades" in opportunity.metadata["symbol_gate_detail"]
+
+
+def test_symbol_gate_message_lists_active_blocks_and_weak_symbols():
+    runtime = LiveBotRuntime(_config(), StubClient())
+    runtime.trade_history = [
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "net_pnl_usdt": -0.4, "is_partial": False},
+        {"symbol": "DOGEUSDT", "strategy": "SCALPER", "net_pnl_usdt": -0.2, "is_partial": False},
+    ]
+    opportunity = _opportunity(symbol="DOGEUSDT")
+    runtime._passes_sprint_pretrade_gates(opportunity)
+
+    message = runtime._build_symbol_gate_message()
+
+    assert "Symbol Performance Gate" in message
+    assert "DOGEUSDT" in message
+    assert "Blocked now" in message
+    assert "PF 0.00" in message
+
+
+def test_handle_telegram_p2_commands_send_fee_allocation_and_symbol_messages():
+    runtime = LiveBotRuntime(_config(telegram_chat_id="12345"), StubClient())
+    runtime.telegram = StubTelegram(
+        updates=[
+            {"update_id": 1, "message": {"chat": {"id": "12345"}, "text": "/fees"}},
+            {"update_id": 2, "message": {"chat": {"id": "12345"}, "text": "/allocation"}},
+            {"update_id": 3, "message": {"chat": {"id": "12345"}, "text": "/symbols"}},
+        ]
+    )
+
+    runtime._handle_telegram_commands()
+
+    sent_text = "\n".join(text for text, _mode in runtime.telegram.sent_messages)
+    assert "Daily Fee Report" in sent_text
+    assert "Allocation Dashboard" in sent_text
+    assert "Symbol Performance Gate" in sent_text
 
 
 def test_handle_telegram_approve_command_applies_supported_suggestion():
@@ -1427,6 +1583,7 @@ def test_runtime_restores_persisted_open_trades_and_guards(tmp_path):
     runtime._consecutive_losses = 2
     runtime._strategy_loss_streaks["GRID"] = 1
     runtime.symbol_cooldowns[trade.symbol] = time.time() + 600
+    runtime.symbol_performance_paused_until["SOLUSDT"] = time.time() + 600
     runtime.trade_history.append(
         {
             "symbol": "BTCUSDT",
@@ -1452,6 +1609,7 @@ def test_runtime_restores_persisted_open_trades_and_guards(tmp_path):
     assert restored._consecutive_losses == 2
     assert restored._strategy_loss_streaks == {"GRID": 1}
     assert "DOGEUSDT" in restored.symbol_cooldowns
+    assert "SOLUSDT" in restored.symbol_performance_paused_until
     assert restored.trade_history[-1]["symbol"] == "BTCUSDT"
     assert any("Restored 1 open trade(s) from state" in item for item in restored._recent_activity)
 
@@ -1596,4 +1754,8 @@ def test_daily_summary_reports_previous_utc_day_at_midnight():
         runtime_module.datetime = original_datetime
 
     assert runtime.telegram.sent_messages
-    assert "Trades: <b>1</b>" in runtime.telegram.sent_messages[-1][0]
+    sent_text = "\n".join(text for text, _mode in runtime.telegram.sent_messages)
+    assert "Daily Summary" in sent_text
+    assert "Trades: <b>1</b>" in sent_text
+    assert "Daily Fee Report" in sent_text
+    assert "Gross P&L: <b>$+1.25</b>" in sent_text

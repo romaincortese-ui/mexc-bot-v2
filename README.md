@@ -70,6 +70,12 @@ MAX_CONSECUTIVE_LOSSES=4
 STREAK_AUTO_RESET_MINS=60
 SESSION_LOSS_PAUSE_PCT=0.03
 SESSION_LOSS_PAUSE_MINS=120
+SYMBOL_PERF_GATE_ENABLED=true
+SYMBOL_PERF_GATE_MIN_TRADES=3
+SYMBOL_PERF_GATE_MAX_LOSSES=2
+SYMBOL_PERF_GATE_MIN_PF=1.0
+SYMBOL_PERF_GATE_LOOKBACK_TRADES=20
+SYMBOL_PERF_GATE_PAUSE_HOURS=24
 MOONSHOT_SYMBOLS=SOLUSDT,DOGEUSDT,PEPEUSDT,ENAUSDT,WIFUSDT
 MOONSHOT_SOCIAL_BOOST_MAX=20
 MOONSHOT_SOCIAL_CACHE_MINS=20
@@ -173,6 +179,8 @@ The live runtime uses that calibration in three places:
 
 The live runtime can also load the daily review payload and expose it over Telegram with `/review`, including suggested env-var changes such as threshold tightening or loosening when the last-24h review supports it. Supported suggestions can be applied live with `/approve <n>`, which updates the running bot and persists the override across restarts.
 
+Live operator messages include `/fees` for the daily gross/fee/net report, `/allocation` for strategy-pool capital, open risk, and unused capacity, and `/symbols` for the per-symbol performance gate. The symbol gate pauses any pair after the configured loss count or after realized PF drops below `SYMBOL_PERF_GATE_MIN_PF` once the minimum sample is reached.
+
 Artifacts are written to `backtest_output/`:
 
 - `equity_curve.csv`
@@ -228,6 +236,12 @@ git push -u origin main
        STREAK_AUTO_RESET_MINS   = 60
        SESSION_LOSS_PAUSE_PCT   = 0.03
        SESSION_LOSS_PAUSE_MINS  = 120
+         SYMBOL_PERF_GATE_ENABLED = true
+         SYMBOL_PERF_GATE_MIN_TRADES = 3
+         SYMBOL_PERF_GATE_MAX_LOSSES = 2
+         SYMBOL_PERF_GATE_MIN_PF = 1.0
+         SYMBOL_PERF_GATE_LOOKBACK_TRADES = 20
+         SYMBOL_PERF_GATE_PAUSE_HOURS = 24
         MEXCBOT_STATE_FILE = /data/runtime_state.json
      SCAN_INTERVAL     = 60
      ```

@@ -220,6 +220,7 @@ class LiveBotRuntime:
         self.open_trades: list[Trade] = []
         self.recently_closed: dict[str, float] = {}
         self.symbol_cooldowns: dict[str, float] = {}
+        self.symbol_performance_paused_until: dict[str, float] = {}
         self.liquidity_blacklist: dict[str, float] = {}
         self.liquidity_fail_count: dict[str, int] = {}
         self.trade_calibration: dict = {}
@@ -269,6 +270,7 @@ class LiveBotRuntime:
             "open_trades": [trade.to_dict() for trade in self.open_trades],
             "recently_closed": dict(self.recently_closed),
             "symbol_cooldowns": dict(self.symbol_cooldowns),
+            "symbol_performance_paused_until": dict(self.symbol_performance_paused_until),
             "liquidity_blacklist": dict(self.liquidity_blacklist),
             "liquidity_fail_count": dict(self.liquidity_fail_count),
             "win_rate_pause_until": self._win_rate_pause_until,
@@ -326,6 +328,10 @@ class LiveBotRuntime:
             self.open_trades = [Trade.from_dict(item) for item in payload.get("open_trades", [])]
             self.recently_closed = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("recently_closed", {})).items()}
             self.symbol_cooldowns = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("symbol_cooldowns", {})).items()}
+            self.symbol_performance_paused_until = {
+                str(symbol): float(expires_at)
+                for symbol, expires_at in dict(payload.get("symbol_performance_paused_until", {})).items()
+            }
             self.liquidity_blacklist = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("liquidity_blacklist", {})).items()}
             self.liquidity_fail_count = {str(symbol): int(count) for symbol, count in dict(payload.get("liquidity_fail_count", {})).items()}
             self._win_rate_pause_until = float(payload.get("win_rate_pause_until", 0.0) or 0.0)
@@ -356,6 +362,7 @@ class LiveBotRuntime:
             self.open_trades = []
             self.recently_closed = {}
             self.symbol_cooldowns = {}
+            self.symbol_performance_paused_until = {}
             self.liquidity_blacklist = {}
             self.liquidity_fail_count = {}
             self._win_rate_pause_until = 0.0
@@ -574,10 +581,16 @@ class LiveBotRuntime:
                 continue
             mins_left = max(1, math.ceil((expires_at - now_ts) / 60.0))
             lines.append(f"🛑 {strategy} paused ({mins_left} min)")
+        for symbol in sorted(self.symbol_performance_paused_until):
+            expires_at = self.symbol_performance_paused_until[symbol]
+            if expires_at <= now_ts:
+                continue
+            mins_left = max(1, math.ceil((expires_at - now_ts) / 60.0))
+            lines.append(f"⛔ {symbol} symbol gate ({mins_left} min)")
         return lines
 
     def _commands_hint(self) -> str:
-        return "/status /pnl /metrics /config /logs /review /approve /pause /resume /close /reconcile /resetstreak /restart /ask"
+        return "/status /pnl /fees /allocation /symbols /metrics /config /logs /review /approve /pause /resume /close /reconcile /resetstreak /restart /ask"
 
     def _review_suggestions(self) -> list[dict[str, object]]:
         merged: list[dict[str, object]] = []
@@ -761,6 +774,247 @@ class LiveBotRuntime:
             )
         return lines
 
+    def _trade_net_pnl_usdt(self, trade: dict[str, object]) -> float:
+        if trade.get("net_pnl_usdt") is not None:
+            return float(trade.get("net_pnl_usdt", 0.0) or 0.0)
+        return float(trade.get("pnl_usdt", 0.0) or 0.0)
+
+    def _trade_total_fees_usdt(self, trade: dict[str, object]) -> float:
+        if trade.get("total_fees_usdt") is not None:
+            return float(trade.get("total_fees_usdt", 0.0) or 0.0)
+        return float(trade.get("entry_fee_usdt", 0.0) or 0.0) + float(trade.get("exit_fee_usdt", 0.0) or 0.0)
+
+    def _trade_gross_pnl_usdt(self, trade: dict[str, object]) -> float:
+        if trade.get("gross_pnl_usdt") is not None:
+            return float(trade.get("gross_pnl_usdt", 0.0) or 0.0)
+        return self._trade_net_pnl_usdt(trade) + self._trade_total_fees_usdt(trade)
+
+    def _day_closed_trades(self, day: str, *, include_partials: bool = True) -> list[dict]:
+        return [
+            trade for trade in self.trade_history
+            if str(trade.get("closed_at") or "")[:10] == day and (include_partials or not trade.get("is_partial"))
+        ]
+
+    def _build_fee_report_message(self, day: str | None = None) -> str:
+        report_day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        trades = self._day_closed_trades(report_day, include_partials=True)
+        lines = [
+            f"🧾 <b>Daily Fee Report</b> [{self._mode_label()}]",
+            "━━━━━━━━━━━━━━━",
+            f"Date: <b>{report_day}</b>",
+        ]
+        if not trades:
+            lines.append("No realized closes yet for this date.")
+            return "\n".join(lines)
+
+        gross_pnl = sum(self._trade_gross_pnl_usdt(trade) for trade in trades)
+        total_fees = sum(self._trade_total_fees_usdt(trade) for trade in trades)
+        net_pnl = sum(self._trade_net_pnl_usdt(trade) for trade in trades)
+        gross_profit = sum(max(0.0, self._trade_gross_pnl_usdt(trade)) for trade in trades)
+        fee_share = total_fees / gross_profit * 100.0 if gross_profit > 0 else None
+        winners = sum(1 for trade in trades if self._trade_net_pnl_usdt(trade) > 0)
+        lines.extend(
+            [
+                f"Closes: <b>{len(trades)}</b> | {winners}W {len(trades) - winners}L",
+                f"Gross P&L: <b>${gross_pnl:+.2f}</b>",
+                f"Fees: <b>${total_fees:.2f}</b>",
+                f"Net P&L: <b>${net_pnl:+.2f}</b>",
+                f"Fee share of gross profit: <b>{fee_share:.1f}%</b>" if fee_share is not None else "Fee share of gross profit: <b>n/a</b>",
+                "━━━━━━━━━━━━━━━",
+                "By strategy:",
+            ]
+        )
+        by_strategy: dict[str, list[dict]] = {}
+        for trade in trades:
+            by_strategy.setdefault(str(trade.get("strategy") or "UNKNOWN").upper(), []).append(trade)
+        for strategy, strategy_trades in sorted(by_strategy.items()):
+            strategy_gross = sum(self._trade_gross_pnl_usdt(trade) for trade in strategy_trades)
+            strategy_fees = sum(self._trade_total_fees_usdt(trade) for trade in strategy_trades)
+            strategy_net = sum(self._trade_net_pnl_usdt(trade) for trade in strategy_trades)
+            lines.append(
+                f"  {self._strategy_icon(strategy)} {strategy}: {len(strategy_trades)} close(s) | "
+                f"gross ${strategy_gross:+.2f} | fees ${strategy_fees:.2f} | net ${strategy_net:+.2f}"
+            )
+        return "\n".join(lines)[:4000]
+
+    def _effective_stop_price(self, trade: Trade) -> float:
+        candidates = [
+            float(value or 0.0)
+            for value in (trade.trail_stop_price, trade.sl_price, trade.hard_floor_price)
+            if float(value or 0.0) > 0
+        ]
+        return max(candidates) if candidates else 0.0
+
+    def _trade_open_risk_usdt(self, trade: Trade) -> float:
+        stop_price = self._effective_stop_price(trade)
+        if stop_price <= 0 or trade.entry_price <= 0 or trade.qty <= 0:
+            return 0.0
+        return max(0.0, (float(trade.entry_price) - stop_price) * float(trade.qty))
+
+    def _build_allocation_dashboard_message(self) -> str:
+        snapshot = self._balance_snapshot(force_refresh=not self.config.paper_trade)
+        total_equity = float(snapshot["total_equity"] or 0.0)
+        free_usdt = float(snapshot["free_usdt"] or 0.0)
+        pool_order = [
+            ("SCALPER", "SCALPER"),
+            ("MOONSHOT", "MOONSHOT pool"),
+            ("TRINITY", "TRINITY"),
+            ("GRID", "GRID"),
+        ]
+        total_used = 0.0
+        total_risk = 0.0
+        lines = [
+            f"📊 <b>Allocation Dashboard</b> [{self._mode_label()}]",
+            "━━━━━━━━━━━━━━━",
+            f"Equity: <b>${total_equity:.2f}</b> | Free cash: <b>${free_usdt:.2f}</b>",
+            "━━━━━━━━━━━━━━━",
+        ]
+        for pool_key, label in pool_order:
+            allocation_pct = self._strategy_capital_pct(pool_key)
+            cap = total_equity * allocation_pct
+            used = sum(
+                float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
+                for trade in self.open_trades
+                if self._strategy_pool_key(trade.strategy) == pool_key
+            )
+            risk = sum(self._trade_open_risk_usdt(trade) for trade in self.open_trades if self._strategy_pool_key(trade.strategy) == pool_key)
+            unused = max(0.0, cap - used)
+            deployable = min(free_usdt, unused)
+            total_used += used
+            total_risk += risk
+            lines.append(
+                f"{self._strategy_icon(pool_key)} <b>{label}</b> ({allocation_pct * 100:.0f}%)\n"
+                f"  cap ${cap:.2f} | used ${used:.2f} | unused ${unused:.2f}\n"
+                f"  deployable now ${deployable:.2f} | open risk ${risk:.2f}"
+            )
+        lines.extend(
+            [
+                "━━━━━━━━━━━━━━━",
+                f"Total open capital: <b>${total_used:.2f}</b>",
+                f"Total open risk to stops: <b>${total_risk:.2f}</b>",
+            ]
+        )
+        if self.open_trades:
+            lines.append("Open positions:")
+            for trade in self.open_trades[:8]:
+                used = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
+                lines.append(
+                    f"  {self._strategy_icon(trade.strategy)} {trade.symbol} [{trade.strategy}] "
+                    f"capital ${used:.2f} | risk ${self._trade_open_risk_usdt(trade):.2f}"
+                )
+        return "\n".join(lines)[:4000]
+
+    def _symbol_performance_stats(self, symbol: str) -> dict[str, object]:
+        resolved = symbol.upper()
+        lookback = max(self.config.symbol_perf_gate_min_trades, self.config.symbol_perf_gate_lookback_trades)
+        trades = [
+            trade for trade in self.trade_history
+            if str(trade.get("symbol") or "").upper() == resolved and not trade.get("is_partial")
+        ][-lookback:]
+        wins = [trade for trade in trades if self._trade_net_pnl_usdt(trade) > 0]
+        losses = [trade for trade in trades if self._trade_net_pnl_usdt(trade) <= 0]
+        gross_profit = sum(max(0.0, self._trade_net_pnl_usdt(trade)) for trade in trades)
+        gross_loss = abs(sum(min(0.0, self._trade_net_pnl_usdt(trade)) for trade in trades))
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
+        return {
+            "symbol": resolved,
+            "trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "net_pnl": sum(self._trade_net_pnl_usdt(trade) for trade in trades),
+            "profit_factor": profit_factor,
+        }
+
+    def _symbol_gate_block_reason(self, stats: dict[str, object]) -> str | None:
+        losses = int(stats.get("losses", 0) or 0)
+        trades = int(stats.get("trades", 0) or 0)
+        profit_factor = float(stats.get("profit_factor", 0.0) or 0.0)
+        if self.config.symbol_perf_gate_max_losses > 0 and losses >= self.config.symbol_perf_gate_max_losses:
+            return f"{losses} losses >= limit {self.config.symbol_perf_gate_max_losses}"
+        if trades >= self.config.symbol_perf_gate_min_trades and profit_factor < self.config.symbol_perf_gate_min_profit_factor:
+            return f"PF {profit_factor:.2f} < {self.config.symbol_perf_gate_min_profit_factor:.2f} over {trades} trades"
+        return None
+
+    def _symbol_performance_rejects(self, opportunity: Opportunity) -> bool:
+        if not self.config.symbol_perf_gate_enabled:
+            return False
+        symbol = opportunity.symbol.upper()
+        now_ts = time.time()
+        paused_until = float(self.symbol_performance_paused_until.get(symbol, 0.0) or 0.0)
+        if paused_until > now_ts:
+            mins_left = max(1, math.ceil((paused_until - now_ts) / 60.0))
+            opportunity.metadata["pretrade_block_reason"] = "symbol_performance_gate"
+            opportunity.metadata["symbol_gate_detail"] = f"active pause {mins_left}m"
+            return True
+        stats = self._symbol_performance_stats(symbol)
+        reason = self._symbol_gate_block_reason(stats)
+        if reason is None:
+            return False
+        pause_seconds = max(1, self.config.symbol_perf_gate_pause_hours) * 3600
+        self.symbol_performance_paused_until[symbol] = now_ts + pause_seconds
+        opportunity.metadata["pretrade_block_reason"] = "symbol_performance_gate"
+        opportunity.metadata["symbol_gate_detail"] = reason
+        opportunity.metadata["symbol_gate_trades"] = int(stats["trades"])
+        opportunity.metadata["symbol_gate_pf"] = round(float(stats["profit_factor"]), 4) if math.isfinite(float(stats["profit_factor"])) else "inf"
+        log.info("[SYMBOL_GATE] Blocked %s: %s", symbol, reason)
+        self._record_activity(f"Symbol gate block {symbol}: {reason}")
+        self._save_state()
+        return True
+
+    def _build_symbol_gate_message(self) -> str:
+        now_ts = time.time()
+        self._purge_cooldowns()
+        lines = [
+            "🚦 <b>Symbol Performance Gate</b>",
+            "━━━━━━━━━━━━━━━",
+            (
+                f"Rules: {self.config.symbol_perf_gate_max_losses} losses or PF "
+                f"&lt; {self.config.symbol_perf_gate_min_profit_factor:.2f} after "
+                f"{self.config.symbol_perf_gate_min_trades} trades"
+            ),
+            f"Pause: <b>{self.config.symbol_perf_gate_pause_hours}h</b> | Lookback: <b>{self.config.symbol_perf_gate_lookback_trades}</b> trades",
+        ]
+        active = {
+            symbol: expires_at
+            for symbol, expires_at in self.symbol_performance_paused_until.items()
+            if expires_at > now_ts
+        }
+        if active:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Blocked now:")
+            for symbol, expires_at in sorted(active.items(), key=lambda item: item[1]):
+                mins_left = max(1, math.ceil((expires_at - now_ts) / 60.0))
+                stats = self._symbol_performance_stats(symbol)
+                pf = float(stats["profit_factor"])
+                pf_text = "∞" if math.isinf(pf) else f"{pf:.2f}"
+                lines.append(
+                    f"  ⛔ {symbol}: {mins_left}m left | {int(stats['trades'])}t "
+                    f"{int(stats['wins'])}W/{int(stats['losses'])}L | PF {pf_text} | ${float(stats['net_pnl']):+.2f}"
+                )
+        symbols = sorted({str(trade.get("symbol") or "").upper() for trade in self.trade_history if trade.get("symbol") and not trade.get("is_partial")})
+        stats_rows = [self._symbol_performance_stats(symbol) for symbol in symbols]
+        stats_rows = [row for row in stats_rows if int(row["trades"]) > 0]
+        stats_rows.sort(key=lambda row: (float(row["net_pnl"]), -int(row["losses"])))
+        if stats_rows:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Weakest recent symbols:")
+            for row in stats_rows[:5]:
+                pf = float(row["profit_factor"])
+                pf_text = "∞" if math.isinf(pf) else f"{pf:.2f}"
+                marker = "⛔" if str(row["symbol"]) in active else "•"
+                lines.append(
+                    f"  {marker} {row['symbol']}: {int(row['trades'])}t {int(row['wins'])}W/{int(row['losses'])}L "
+                    f"PF {pf_text} | ${float(row['net_pnl']):+.2f}"
+                )
+        else:
+            lines.append("No closed symbol history yet.")
+        return "\n".join(lines)[:4000]
+
     def _format_hold_time(self, closed_trade: dict[str, object]) -> str | None:
         opened_raw = closed_trade.get("opened_at")
         closed_raw = closed_trade.get("closed_at")
@@ -907,6 +1161,13 @@ class LiveBotRuntime:
                 "REVERSAL": self.config.reversal_budget_pct,
                 "TRINITY": self.config.trinity_budget_pct,
                 "GRID": self.config.grid_budget_pct,
+            },
+            "symbol_performance_gate": {
+                "enabled": self.config.symbol_perf_gate_enabled,
+                "min_trades": self.config.symbol_perf_gate_min_trades,
+                "max_losses": self.config.symbol_perf_gate_max_losses,
+                "min_profit_factor": self.config.symbol_perf_gate_min_profit_factor,
+                "pause_hours": self.config.symbol_perf_gate_pause_hours,
             },
             "calibration": dict(self._calibration_manifest),
         }
@@ -1603,6 +1864,7 @@ class LiveBotRuntime:
             f"Circuit breaker: WR<{self.config.win_rate_cb_threshold * 100:.0f}% over {self.config.win_rate_cb_window} trades | {self.config.win_rate_cb_pause_mins}min\n"
             f"Moon gate: {self.config.moonshot_btc_ema_gate:+.3f} reopen {self.config.moonshot_btc_gate_reopen:+.3f}\n"
             f"Adaptive: window {self.config.adaptive_window} | tighten {self.config.adaptive_tighten_step:.1f} | relax {self.config.adaptive_relax_step:.1f}\n"
+            f"Symbol gate: {'on' if self.config.symbol_perf_gate_enabled else 'off'} | {self.config.symbol_perf_gate_max_losses} losses or PF&lt;{self.config.symbol_perf_gate_min_profit_factor:.2f} after {self.config.symbol_perf_gate_min_trades}t | pause {self.config.symbol_perf_gate_pause_hours}h\n"
             f"{self._calibration_manifest_line()}\n"
             f"☠️ Blacklisted {dead_active} | {'⏸️ PAUSED' if self._paused else '▶️ RUNNING'}"
         )
@@ -1712,6 +1974,7 @@ class LiveBotRuntime:
         lines.append(f"Worst: {worst_trade['symbol']} ${float(worst_trade.get('pnl_usdt', 0.0) or 0.0):+.2f}")
         lines.append(f"Open positions: <b>{len(self.open_trades)}</b>")
         self._notify("\n".join(lines)[:4000])
+        self._notify(self._build_fee_report_message(day=summary_date))
         self._record_activity("Daily summary sent")
 
     def _send_weekly_summary(self) -> None:
@@ -2071,6 +2334,12 @@ class LiveBotRuntime:
                 self._notify(self._build_status_message())
             elif text == "/pnl":
                 self._notify(self._build_pnl_message())
+            elif text in {"/fees", "/fee"}:
+                self._notify(self._build_fee_report_message())
+            elif text in {"/allocation", "/alloc"}:
+                self._notify(self._build_allocation_dashboard_message())
+            elif text in {"/symbols", "/symbolgate"}:
+                self._notify(self._build_symbol_gate_message())
             elif text == "/metrics":
                 self._notify(self._build_metrics_message())
             elif text in {"/logs", "/log"}:
@@ -2094,6 +2363,9 @@ class LiveBotRuntime:
                     f"━━━━━━━━━━━━━━━\n"
                     f"/status — Open positions & balance\n"
                     f"/pnl — Daily & session P&L\n"
+                    f"/fees — Daily gross/fee/net report\n"
+                    f"/allocation — Strategy pool capacity\n"
+                    f"/symbols — Symbol performance gate\n"
                     f"/metrics — Win rate, PF, signals\n"
                     f"/config — Strategy thresholds & pools\n"
                     f"/logs — Recent activity\n"
@@ -2273,6 +2545,11 @@ class LiveBotRuntime:
             for symbol, expires_at in self.symbol_cooldowns.items()
             if expires_at > now_ts
         }
+        self.symbol_performance_paused_until = {
+            symbol: expires_at
+            for symbol, expires_at in self.symbol_performance_paused_until.items()
+            if expires_at > now_ts
+        }
         expired_blacklist = [symbol for symbol, expires_at in self.liquidity_blacklist.items() if expires_at <= now_ts]
         for symbol in expired_blacklist:
             self.liquidity_blacklist.pop(symbol, None)
@@ -2280,7 +2557,7 @@ class LiveBotRuntime:
 
     def _excluded_symbols(self) -> set[str]:
         self._purge_cooldowns()
-        return set(self.recently_closed) | set(self.symbol_cooldowns) | set(self.liquidity_blacklist)
+        return set(self.recently_closed) | set(self.symbol_cooldowns) | set(self.symbol_performance_paused_until) | set(self.liquidity_blacklist)
 
     def _entries_paused(self) -> bool:
         self._maybe_auto_reset_streak_guard()
@@ -2688,7 +2965,12 @@ class LiveBotRuntime:
     def _passes_sprint_pretrade_gates(self, opportunity: Opportunity) -> bool:
         """Combined pretrade gate — True when all enabled gates allow entry."""
 
+        opportunity.metadata.pop("pretrade_block_reason", None)
+        opportunity.metadata.pop("symbol_gate_detail", None)
+        if self._symbol_performance_rejects(opportunity):
+            return False
         if self._moonshot_per_symbol_rejects(opportunity):
+            opportunity.metadata["pretrade_block_reason"] = "moonshot_symbol_gate"
             return False
         return True
 
@@ -3148,7 +3430,13 @@ class LiveBotRuntime:
             if opportunity is None:
                 break
             if not self._passes_sprint_pretrade_gates(opportunity):
-                self._log_entry_block(opportunity, "pretrade_gate")
+                self._log_entry_block(
+                    opportunity,
+                    str(opportunity.metadata.get("pretrade_block_reason") or "pretrade_gate"),
+                    detail=str(opportunity.metadata.get("symbol_gate_detail") or ""),
+                    symbol_gate_trades=opportunity.metadata.get("symbol_gate_trades", ""),
+                    symbol_gate_pf=opportunity.metadata.get("symbol_gate_pf", ""),
+                )
                 cycle_excluded.add(opportunity.symbol)
                 continue
             if not self._passes_liquidity_guard(opportunity, ticker_by_symbol=ticker_by_symbol):

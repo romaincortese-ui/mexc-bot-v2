@@ -97,6 +97,12 @@ class LiveConfig:
     session_loss_pause_mins: int
     strategy_loss_streak_max: int
     strategy_loss_streak_mins: int
+    symbol_perf_gate_enabled: bool
+    symbol_perf_gate_min_trades: int
+    symbol_perf_gate_max_losses: int
+    symbol_perf_gate_min_profit_factor: float
+    symbol_perf_gate_lookback_trades: int
+    symbol_perf_gate_pause_hours: int
     moonshot_btc_ema_gate: float
     moonshot_btc_gate_reopen: float
     adaptive_window: int
@@ -193,6 +199,12 @@ class LiveConfig:
             session_loss_pause_mins=env_int("SESSION_LOSS_PAUSE_MINS", 120),
             strategy_loss_streak_max=env_int("STRATEGY_LOSS_STREAK_MAX", 3),
             strategy_loss_streak_mins=env_int("STRATEGY_LOSS_STREAK_MINS", 240),
+            symbol_perf_gate_enabled=env_bool("SYMBOL_PERF_GATE_ENABLED", True),
+            symbol_perf_gate_min_trades=env_int("SYMBOL_PERF_GATE_MIN_TRADES", 3),
+            symbol_perf_gate_max_losses=env_int("SYMBOL_PERF_GATE_MAX_LOSSES", 2),
+            symbol_perf_gate_min_profit_factor=env_float("SYMBOL_PERF_GATE_MIN_PF", 1.0),
+            symbol_perf_gate_lookback_trades=env_int("SYMBOL_PERF_GATE_LOOKBACK_TRADES", 20),
+            symbol_perf_gate_pause_hours=env_int("SYMBOL_PERF_GATE_PAUSE_HOURS", 24),
             moonshot_btc_ema_gate=env_float("MOONSHOT_BTC_EMA_GATE", -0.02),
             moonshot_btc_gate_reopen=env_float("MOONSHOT_BTC_GATE_REOPEN", -0.01),
             adaptive_window=env_int("ADAPTIVE_WINDOW", 16),
