@@ -47,6 +47,7 @@ def main() -> None:
                     "file": config.calibration_file,
                     "redis_key": config.calibration_redis_key,
                     "published": result["published"],
+                    "manifest": result["calibration_manifest"],
                 }
             },
             indent=2,

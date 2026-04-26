@@ -16,7 +16,12 @@ from datetime import timedelta
 import pandas as pd
 import requests
 
-from mexcbot.calibration import load_trade_calibration, validate_trade_calibration_payload
+from mexcbot.calibration import (
+    format_trade_calibration_manifest,
+    load_trade_calibration,
+    summarize_trade_calibration,
+    validate_trade_calibration_payload,
+)
 from mexcbot.config import LiveConfig, env_bool, env_float, env_int
 from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
 from mexcbot.exchange import MexcClient
@@ -155,6 +160,27 @@ def _json_default(value: object) -> object:
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+def _audit_float(value: object, digits: int = 8) -> float:
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return round(number, digits)
+
+
+def _audit_json(payload: dict[str, object]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_json_default)
+
+
+def _slippage_bps(fill_price: float, reference_price: float | None) -> float:
+    reference = float(reference_price or 0.0)
+    if fill_price <= 0 or reference <= 0:
+        return 0.0
+    return round((fill_price / reference - 1.0) * 10_000.0, 4)
+
+
 def _trade_state_payload(trade: Trade) -> dict[str, object]:
     return {
         "symbol": trade.symbol,
@@ -197,6 +223,7 @@ class LiveBotRuntime:
         self.liquidity_blacklist: dict[str, float] = {}
         self.liquidity_fail_count: dict[str, int] = {}
         self.trade_calibration: dict = {}
+        self._calibration_manifest: dict[str, object] = {}
         self.daily_review: dict = {}
         self._last_calibration_refresh_at = 0.0
         self._last_daily_review_refresh_at = 0.0
@@ -853,6 +880,38 @@ class LiveBotRuntime:
         lines.extend(f"<code>{entry}</code>" for entry in self._recent_activity)
         return "\n".join(lines)[:4000]
 
+    def _calibration_manifest_line(self) -> str:
+        if not self._calibration_manifest:
+            return "Calibration: none loaded"
+        calibration_hash = str(self._calibration_manifest.get("calibration_hash") or "")[:12] or "n/a"
+        total_trades = int(self._calibration_manifest.get("total_trades", 0) or 0)
+        window_start = str(self._calibration_manifest.get("window_start") or "?")[:10]
+        window_end = str(self._calibration_manifest.get("window_end") or "?")[:10]
+        return f"Calibration: {calibration_hash} | {total_trades} trades | {window_start}..{window_end}"
+
+    def _log_boot_manifest(self, mode: str) -> None:
+        manifest = {
+            "mode": mode,
+            "state_file": self.config.state_file,
+            "strategies": list(self.config.strategies),
+            "max_open_positions": self.config.max_open_positions,
+            "strategy_allocations": {
+                "SCALPER": self.config.scalper_allocation_pct,
+                "MOONSHOT_POOL": self.config.moonshot_allocation_pct,
+                "TRINITY": self.config.trinity_allocation_pct,
+                "GRID": self.config.grid_allocation_pct,
+            },
+            "per_trade_budget_pct": {
+                "SCALPER": self.config.scalper_budget_pct,
+                "MOONSHOT": self.config.moonshot_budget_pct,
+                "REVERSAL": self.config.reversal_budget_pct,
+                "TRINITY": self.config.trinity_budget_pct,
+                "GRID": self.config.grid_budget_pct,
+            },
+            "calibration": dict(self._calibration_manifest),
+        }
+        log.info("[BOOT] %s", _audit_json(manifest))
+
     def _reset_runtime_guards(self) -> None:
         self._paused = False
         self._win_rate_pause_until = 0.0
@@ -917,6 +976,8 @@ class LiveBotRuntime:
         exit_qty: float,
         net_proceeds: float,
         fee_quote_qty: float = 0.0,
+        gross_quote_qty: float | None = None,
+        price_hint: float | None = None,
     ) -> dict:
         entry_cost = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * exit_qty))
         pnl_usdt = net_proceeds - entry_cost
@@ -930,6 +991,14 @@ class LiveBotRuntime:
         trade.qty = exit_qty
         trade.remaining_cost_usdt = 0.0
         closed = trade.to_dict()
+        closed = self._enrich_closed_audit_fields(
+            closed,
+            entry_cost=entry_cost,
+            net_proceeds=net_proceeds,
+            gross_quote_qty=gross_quote_qty,
+            exit_qty=exit_qty,
+            price_hint=price_hint,
+        )
         self.trade_history.append(closed)
         self._maybe_record_tax_lot_sell(
             symbol=trade.symbol,
@@ -941,6 +1010,7 @@ class LiveBotRuntime:
         self._record_symbol_cooldown(trade, reason)
         self._update_strategy_guards(closed)
         self._send_close_alert(closed)
+        self._log_exit_audit(closed)
         self._post_trade_analysis(closed)
         self._log_summary()
         return closed
@@ -961,6 +1031,8 @@ class LiveBotRuntime:
             exit_qty=float(trade.qty),
             net_proceeds=remaining_notional,
             fee_quote_qty=0.0,
+            gross_quote_qty=remaining_notional,
+            price_hint=exit_price,
         )
 
     def _position_remaining(self, trade: Trade, *, price_hint: float) -> tuple[float, float]:
@@ -1006,10 +1078,19 @@ class LiveBotRuntime:
             "exit_fee_usdt": round(execution.fee_quote_qty, 8),
             "is_partial": True,
         }
+        closed = self._enrich_closed_audit_fields(
+            closed,
+            entry_cost=entry_cost_alloc,
+            net_proceeds=net_proceeds,
+            gross_quote_qty=execution.gross_quote_qty,
+            exit_qty=qty_to_close,
+            price_hint=price_hint,
+        )
         trade.qty = round(max(0.0, trade.qty - qty_to_close), 12)
         trade.remaining_cost_usdt = round(max(0.0, remaining_cost_before - entry_cost_alloc), 8)
         self.trade_history.append(closed)
         self._send_close_alert(closed, partial=True, remaining_qty=trade.qty)
+        self._log_exit_audit(closed)
         self._post_trade_analysis(closed)
         self._log_summary()
         self._save_state()
@@ -1044,6 +1125,8 @@ class LiveBotRuntime:
                 exit_qty=qty_before,
                 net_proceeds=net_proceeds,
                 fee_quote_qty=execution.fee_quote_qty,
+                gross_quote_qty=execution.gross_quote_qty,
+                price_hint=current_price,
             )
             self._record_activity(f"TP order filled {trade.symbol}")
             return {"action": "exchange_closed", "closed": closed}
@@ -1515,11 +1598,12 @@ class LiveBotRuntime:
             f"Strategies: {', '.join(self.config.strategies)}\n"
             f"Thresholds: S {self._strategy_base_threshold('SCALPER'):.1f} | M {self._strategy_base_threshold('MOONSHOT'):.1f} | T {self._strategy_base_threshold('TRINITY'):.1f} | R {self._strategy_base_threshold('REVERSAL'):.1f}\n"
             f"Pools S/M/T/G {self.config.scalper_allocation_pct * 100:.0f}/{self.config.moonshot_allocation_pct * 100:.0f}/{self.config.trinity_allocation_pct * 100:.0f}/{self.config.grid_allocation_pct * 100:.0f}\n"
-            f"Trade caps S/M/T/G {self.config.scalper_budget_pct * 100:.1f}/{self.config.moonshot_budget_pct * 100:.1f}/{self.config.trinity_budget_pct * 100:.1f}/{self.config.grid_budget_pct * 100:.1f} | Max positions {self.config.max_open_positions}\n"
+            f"Trade caps S/M/R/T/G {self.config.scalper_budget_pct * 100:.1f}/{self.config.moonshot_budget_pct * 100:.1f}/{self.config.reversal_budget_pct * 100:.1f}/{self.config.trinity_budget_pct * 100:.1f}/{self.config.grid_budget_pct * 100:.1f} | Max positions {self.config.max_open_positions}\n"
             f"Cooldowns: scalper {self.config.scalper_symbol_cooldown_seconds}s | rotation {self.config.scalper_rotation_cooldown_seconds}s\n"
             f"Circuit breaker: WR<{self.config.win_rate_cb_threshold * 100:.0f}% over {self.config.win_rate_cb_window} trades | {self.config.win_rate_cb_pause_mins}min\n"
             f"Moon gate: {self.config.moonshot_btc_ema_gate:+.3f} reopen {self.config.moonshot_btc_gate_reopen:+.3f}\n"
             f"Adaptive: window {self.config.adaptive_window} | tighten {self.config.adaptive_tighten_step:.1f} | relax {self.config.adaptive_relax_step:.1f}\n"
+            f"{self._calibration_manifest_line()}\n"
             f"☠️ Blacklisted {dead_active} | {'⏸️ PAUSED' if self._paused else '▶️ RUNNING'}"
         )
         approved = self._approved_overrides_lines()
@@ -1544,6 +1628,7 @@ class LiveBotRuntime:
             f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b>\n"
             f"Budget: <b>${self.config.trade_budget:.2f}</b> | Max positions: <b>{self.config.max_open_positions}</b>\n"
             f"Thresholds: S {self._strategy_base_threshold('SCALPER'):.1f} | M {self._strategy_base_threshold('MOONSHOT'):.1f} | T {self._strategy_base_threshold('TRINITY'):.1f} | R {self._strategy_base_threshold('REVERSAL'):.1f}\n"
+            f"{self._calibration_manifest_line()}\n"
             f"<i>{self._commands_hint()}</i>"
         )
         self._record_activity("Startup notification sent")
@@ -1659,6 +1744,116 @@ class LiveBotRuntime:
             f"Worst: {worst_trade['symbol']} {float(worst_trade.get('pnl_pct', 0.0) or 0.0):+.2f}%"
         )
         self._record_activity("Weekly summary sent")
+
+    def _log_entry_audit(
+        self,
+        trade: Trade,
+        opportunity: Opportunity,
+        execution: object,
+        *,
+        allocation_usdt: float,
+        requested_qty: float,
+        tp_execution_mode: str,
+    ) -> None:
+        gross_quote_qty = float(getattr(execution, "gross_quote_qty", 0.0) or 0.0)
+        if gross_quote_qty <= 0:
+            gross_quote_qty = float(trade.entry_price * trade.qty)
+        entry_cost = float(trade.entry_cost_usdt or gross_quote_qty)
+        payload = {
+            "symbol": trade.symbol,
+            "strategy": trade.strategy,
+            "entry_signal": trade.entry_signal,
+            "score": _audit_float(trade.score, 4),
+            "order_id": trade.order_id,
+            "requested_qty": _audit_float(requested_qty, 12),
+            "filled_qty": _audit_float(trade.qty, 12),
+            "allocation_usdt": _audit_float(allocation_usdt, 4),
+            "avg_entry_price": _audit_float(trade.entry_price, 12),
+            "net_entry_price": _audit_float(entry_cost / trade.qty, 12) if trade.qty > 0 else 0.0,
+            "gross_quote_usdt": _audit_float(gross_quote_qty, 8),
+            "entry_fee_usdt": _audit_float(trade.entry_fee_usdt, 8),
+            "entry_slippage_bps": _slippage_bps(float(trade.entry_price), float(opportunity.price or 0.0)),
+            "tp_price": _audit_float(trade.tp_price, 12),
+            "sl_price": _audit_float(trade.sl_price, 12),
+            "tp_execution_mode": tp_execution_mode,
+            "strategy_pool_cap_usdt": _audit_float(opportunity.metadata.get("strategy_pool_cap_usdt"), 4),
+            "strategy_budget_pct": _audit_float(opportunity.metadata.get("strategy_budget_pct"), 6),
+            "kelly_mult": _audit_float(opportunity.metadata.get("kelly_mult"), 4),
+            "calibration_source": str(opportunity.metadata.get("calibration_source") or ""),
+        }
+        log.info("[ENTRY] %s", _audit_json(payload))
+
+    def _enrich_closed_audit_fields(
+        self,
+        closed: dict[str, object],
+        *,
+        entry_cost: float,
+        net_proceeds: float,
+        gross_quote_qty: float | None = None,
+        exit_qty: float | None = None,
+        price_hint: float | None = None,
+    ) -> dict[str, object]:
+        qty = float(exit_qty if exit_qty is not None else closed.get("qty", 0.0) or 0.0)
+        exit_price = float(closed.get("exit_price", 0.0) or 0.0)
+        entry_fee = float(closed.get("entry_fee_usdt", 0.0) or 0.0)
+        exit_fee = float(closed.get("exit_fee_usdt", 0.0) or 0.0)
+        exit_gross = float(gross_quote_qty or 0.0)
+        if exit_gross <= 0 and qty > 0 and exit_price > 0:
+            exit_gross = exit_price * qty
+        entry_gross = max(0.0, float(entry_cost) - entry_fee)
+        gross_pnl = exit_gross - entry_gross
+        net_pnl = float(net_proceeds) - float(entry_cost)
+        closed.update(
+            {
+                "entry_cost_usdt": _audit_float(entry_cost, 8),
+                "entry_gross_usdt": _audit_float(entry_gross, 8),
+                "exit_gross_usdt": _audit_float(exit_gross, 8),
+                "net_proceeds_usdt": _audit_float(net_proceeds, 8),
+                "gross_pnl_usdt": _audit_float(gross_pnl, 8),
+                "net_pnl_usdt": _audit_float(net_pnl, 8),
+                "total_fees_usdt": _audit_float(entry_fee + exit_fee, 8),
+                "net_entry_price": _audit_float(float(entry_cost) / qty, 12) if qty > 0 else 0.0,
+                "net_exit_price": _audit_float(float(net_proceeds) / qty, 12) if qty > 0 else 0.0,
+                "exit_slippage_bps": _slippage_bps(exit_price, price_hint),
+            }
+        )
+        return closed
+
+    def _log_exit_audit(self, closed: dict[str, object]) -> None:
+        payload = {
+            "symbol": str(closed.get("symbol") or ""),
+            "strategy": str(closed.get("strategy") or ""),
+            "entry_signal": str(closed.get("entry_signal") or ""),
+            "exit_reason": str(closed.get("exit_reason") or ""),
+            "entry_price": _audit_float(closed.get("entry_price"), 12),
+            "avg_exit_price": _audit_float(closed.get("exit_price"), 12),
+            "net_entry_price": _audit_float(closed.get("net_entry_price"), 12),
+            "net_exit_price": _audit_float(closed.get("net_exit_price"), 12),
+            "qty": _audit_float(closed.get("qty"), 12),
+            "gross_quote_usdt": _audit_float(closed.get("exit_gross_usdt"), 8),
+            "net_quote_usdt": _audit_float(closed.get("net_proceeds_usdt"), 8),
+            "entry_fee_usdt": _audit_float(closed.get("entry_fee_usdt"), 8),
+            "exit_fee_usdt": _audit_float(closed.get("exit_fee_usdt"), 8),
+            "total_fees_usdt": _audit_float(closed.get("total_fees_usdt"), 8),
+            "slippage_bps": _audit_float(closed.get("exit_slippage_bps"), 4),
+            "pnl_gross_usdt": _audit_float(closed.get("gross_pnl_usdt"), 8),
+            "pnl_net_usdt": _audit_float(closed.get("net_pnl_usdt"), 8),
+            "pnl_net_pct": _audit_float(closed.get("pnl_pct"), 4),
+            "is_partial": bool(closed.get("is_partial", False)),
+        }
+        log.info("[EXIT] %s", _audit_json(payload))
+
+    def _log_entry_block(self, opportunity: Opportunity, reason: str, **fields: object) -> None:
+        payload: dict[str, object] = {
+            "symbol": opportunity.symbol,
+            "strategy": opportunity.strategy,
+            "entry_signal": opportunity.entry_signal,
+            "score": _audit_float(opportunity.score, 4),
+            "reason": reason,
+        }
+        payload.update(fields)
+        log.info("[ENTRY_BLOCK] %s", _audit_json(payload))
+        self._record_activity(f"BLOCK {opportunity.strategy} {opportunity.symbol} {reason}")
 
     def _send_open_alert(self, trade: Trade) -> None:
         self._record_activity(f"OPEN {trade.strategy} {trade.symbol} score={trade.score:.1f}")
@@ -2001,8 +2196,9 @@ class LiveBotRuntime:
             file_path=self.config.calibration_file,
         )
         if not data:
-            if self.trade_calibration:
+            if self.trade_calibration or self._calibration_manifest:
                 self.trade_calibration = {}
+                self._calibration_manifest = {}
                 log.info("[CALIBRATION] Clearing cached crypto calibration because no source data is available")
             return
         ok, reason = validate_trade_calibration_payload(
@@ -2011,16 +2207,19 @@ class LiveBotRuntime:
             min_total_trades=self.config.calibration_min_total_trades,
         )
         if not ok:
-            if self.trade_calibration:
+            if self.trade_calibration or self._calibration_manifest:
                 self.trade_calibration = {}
+                self._calibration_manifest = {}
             log.info("[CALIBRATION] Ignoring crypto calibration from %s: %s", source or "unknown source", reason)
             return
+        manifest = summarize_trade_calibration(data, source=source)
+        previous_hash = str(self._calibration_manifest.get("calibration_hash") or "")
         self.trade_calibration = data
-        log.info(
-            "[CALIBRATION] Loaded crypto calibration from %s: %s trades",
-            source or "unknown source",
-            int(data.get("total_trades", 0) or 0),
-        )
+        self._calibration_manifest = manifest
+        if str(manifest.get("calibration_hash") or "") != previous_hash:
+            log.info("[CALIBRATION] Active manifest %s", format_trade_calibration_manifest(manifest))
+        else:
+            log.debug("[CALIBRATION] Active manifest unchanged %s", str(manifest.get("calibration_hash") or "")[:12])
 
     def refresh_daily_review(self, force: bool = False) -> None:
         now = time.time()
@@ -2226,6 +2425,9 @@ class LiveBotRuntime:
         return 1.0
 
     def _strategy_budget_pct(self, strategy: str) -> float:
+        resolved = strategy.upper()
+        if resolved == "REVERSAL":
+            return self.config.reversal_budget_pct
         pool = self._strategy_pool_key(strategy)
         if pool == "SCALPER":
             return self._dynamic_scalper_budget if self._dynamic_scalper_budget is not None else self.config.scalper_budget_pct
@@ -2560,11 +2762,12 @@ class LiveBotRuntime:
         pool_cap = total_equity * self._strategy_capital_pct(opportunity.strategy)
         per_trade_cap = pool_cap * self._strategy_budget_pct(opportunity.strategy) * allocation_mult
         available_pool_cap = self._strategy_available_capital(opportunity.strategy, total_equity=total_equity)
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
+        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
+        opportunity.metadata["strategy_available_cap_usdt"] = round(available_pool_cap, 4)
         capped_budget = min(per_trade_cap, available_pool_cap, available_balance)
         if capped_budget <= 0:
             return 0.0
-        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
-        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
         # Sprint memo composite multiplier (1.0 when all flags OFF).
         sprint_mult = self._sprint_sizing_multiplier(opportunity, total_equity=total_equity)
         if opportunity.strategy.upper() != "SCALPER":
@@ -2897,6 +3100,14 @@ class LiveBotRuntime:
             trade.sl_price,
             trade.entry_signal,
         )
+        self._log_entry_audit(
+            trade,
+            opportunity,
+            execution,
+            allocation_usdt=allocation_usdt,
+            requested_qty=requested_qty,
+            tp_execution_mode=tp_execution_mode,
+        )
         self._maybe_record_tax_lot_buy(
             symbol=trade.symbol,
             qty=float(trade.qty),
@@ -2937,9 +3148,11 @@ class LiveBotRuntime:
             if opportunity is None:
                 break
             if not self._passes_sprint_pretrade_gates(opportunity):
+                self._log_entry_block(opportunity, "pretrade_gate")
                 cycle_excluded.add(opportunity.symbol)
                 continue
             if not self._passes_liquidity_guard(opportunity, ticker_by_symbol=ticker_by_symbol):
+                self._log_entry_block(opportunity, "liquidity_guard")
                 cycle_excluded.add(opportunity.symbol)
                 continue
             allocation_usdt = self._allocation_usdt_for_opportunity_with_equity(
@@ -2948,6 +3161,14 @@ class LiveBotRuntime:
                 total_equity=total_equity or available_balance,
             )
             if allocation_usdt <= 0:
+                self._log_entry_block(
+                    opportunity,
+                    "strategy_pool_or_cash_exhausted",
+                    available_balance=_audit_float(available_balance, 4),
+                    total_equity=_audit_float(total_equity or available_balance, 4),
+                    pool_cap_usdt=_audit_float(opportunity.metadata.get("strategy_pool_cap_usdt"), 4),
+                    strategy_budget_pct=_audit_float(opportunity.metadata.get("strategy_budget_pct"), 6),
+                )
                 cycle_excluded.add(opportunity.symbol)
                 continue
             if self._correlation_cap_rejects(
@@ -2955,11 +3176,13 @@ class LiveBotRuntime:
                 allocation_usdt=allocation_usdt,
                 total_equity=total_equity or available_balance,
             ):
+                self._log_entry_block(opportunity, "correlation_cap", allocation_usdt=_audit_float(allocation_usdt, 4))
                 cycle_excluded.add(opportunity.symbol)
                 continue
             trade = self.open_position(opportunity, allocation_usdt=allocation_usdt)
             cycle_excluded.add(opportunity.symbol)
             if trade is None:
+                self._log_entry_block(opportunity, "buy_failed", allocation_usdt=_audit_float(allocation_usdt, 4))
                 continue
             self.open_trades.append(trade)
             self._send_open_alert(trade)
@@ -3054,6 +3277,8 @@ class LiveBotRuntime:
                         exit_qty=qty_before,
                         net_proceeds=price_hint * qty_before,
                         fee_quote_qty=0.0,
+                        gross_quote_qty=price_hint * qty_before,
+                        price_hint=price_hint,
                     )
                 break
 
@@ -3092,6 +3317,8 @@ class LiveBotRuntime:
                     exit_qty=exit_qty,
                     net_proceeds=net_proceeds,
                     fee_quote_qty=execution.fee_quote_qty,
+                    gross_quote_qty=execution.gross_quote_qty,
+                    price_hint=price_hint,
                 )
 
             time.sleep(CLOSE_RETRY_DELAY_SECONDS)
@@ -3144,6 +3371,8 @@ class LiveBotRuntime:
                     exit_qty=qty_before,
                     net_proceeds=total_proceeds,
                     fee_quote_qty=fee_quote_qty,
+                    gross_quote_qty=gross_quote_qty + max(0.0, remaining_notional),
+                    price_hint=price_hint,
                 )
 
             self._notify_once(
@@ -3164,6 +3393,8 @@ class LiveBotRuntime:
                 exit_qty=qty_before,
                 net_proceeds=max(0.0, qty_before * price_hint),
                 fee_quote_qty=fee_quote_qty,
+                gross_quote_qty=max(0.0, qty_before * price_hint),
+                price_hint=price_hint,
             )
 
         self._notify_once(
@@ -3222,10 +3453,19 @@ class LiveBotRuntime:
             "exit_fee_usdt": round(execution.fee_quote_qty, 8),
             "is_partial": True,
         }
+        closed = self._enrich_closed_audit_fields(
+            closed,
+            entry_cost=entry_cost_alloc,
+            net_proceeds=net_proceeds,
+            gross_quote_qty=execution.gross_quote_qty,
+            exit_qty=qty_to_close,
+            price_hint=price,
+        )
         trade.qty = round(trade.qty - qty_to_close, 12)
         trade.remaining_cost_usdt = round(max(0.0, remaining_cost_before - entry_cost_alloc), 8)
         self.trade_history.append(closed)
         self._send_close_alert(closed, partial=True, remaining_qty=trade.qty)
+        self._log_exit_audit(closed)
         self._post_trade_analysis(closed)
         self._log_summary()
         self._save_state()
@@ -3256,6 +3496,7 @@ class LiveBotRuntime:
             "Effective stop: per-strategy breakeven-chase (see exits.py profiles); "
             "Hard floor is an absolute backstop, not the normal exit path."
         )
+        self._log_boot_manifest(mode)
         self._flush_telegram_updates()
         self._send_startup_message()
         if not self.config.paper_trade:

@@ -383,7 +383,7 @@ def test_backtest_engine_retries_defensive_close_across_multiple_bars():
         taker_fill_ratio=0.5,
         synthetic_close_max_attempts=2,
         synthetic_retry_delay_bars=1,
-        moonshot_budget_pct=0.25,
+        reversal_budget_pct=0.25,
         reentry_cooldown_bars=100,
     )
 
@@ -696,7 +696,7 @@ def test_backtest_engine_rebalances_strategy_budget_multipliers_from_closed_trad
 
     engine._rebalance_budgets(closed_trades)
 
-    assert engine._dynamic_scalper_budget == 0.384
+    assert engine._dynamic_scalper_budget == 0.434
     assert engine._dynamic_moonshot_budget == 0.034
     assert engine._strategy_budget_multiplier("SCALPER") > 1.0
     assert engine._strategy_budget_multiplier("MOONSHOT") < 1.0
@@ -836,7 +836,7 @@ def test_backtest_engine_models_partial_maker_entry_fill():
 
     assert len(trades) == 1
     assert trades[0]["entry_fill_ratio"] == 0.5
-    assert trades[0]["qty"] < 0.26
+    assert trades[0]["qty"] < 0.27
     assert trades[0]["entry_fill_count"] == 1
     assert trades[0]["entry_fill_history"][0]["side"] == "BUY"
     assert trades[0]["entry_fill_history"][0]["execution_style"] == "maker"

@@ -82,7 +82,7 @@ class PriceMonitor:
     @classmethod
     def _log_reconnect(cls, exc: Exception, delay: int) -> None:
         if cls._is_clean_close(exc):
-            log.info(
+            log.debug(
                 "WS closed cleanly (%s: %s) — reconnect in %ss",
                 type(exc).__name__, exc, delay,
             )
@@ -128,7 +128,7 @@ class PriceMonitor:
                     close_timeout=5,
                     open_timeout=10,
                 ) as ws:
-                    log.info("WS price monitor connected")
+                    log.debug("WS price monitor connected")
                     backoff = 2
                     subscribed: set[str] = set()
                     last_ping = time.time()

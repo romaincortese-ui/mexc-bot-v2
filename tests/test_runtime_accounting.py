@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import time
 from datetime import datetime, timezone
@@ -258,13 +259,14 @@ def _config(**overrides) -> LiveConfig:
         moonshot_allocation_pct=0.45,
         trinity_allocation_pct=0.10,
         grid_allocation_pct=0.20,
-        scalper_budget_pct=0.37,
+        scalper_budget_pct=0.42,
         moonshot_budget_pct=0.048,
+        reversal_budget_pct=0.12,
         trinity_budget_pct=0.20,
         grid_budget_pct=0.40,
         perf_rebalance_trades=20,
         perf_scalper_floor=0.10,
-        perf_scalper_ceil=0.40,
+        perf_scalper_ceil=0.48,
         perf_moonshot_floor=0.02,
         perf_moonshot_ceil=0.14,
         perf_shift_step=0.028,
@@ -324,6 +326,25 @@ def test_close_position_uses_fill_notional_instead_of_ticker_snapshot():
     assert round(closed["pnl_pct"], 4) == round((-5.195 / 100.1) * 100.0, 4)
 
 
+def test_open_and_close_emit_structured_trade_audit_lines(caplog):
+    runtime = LiveBotRuntime(_config(), StubClient())
+    opportunity = _opportunity()
+
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        trade = runtime.open_position(opportunity, allocation_usdt=100.0)
+        assert trade is not None
+        closed = runtime.close_position(trade, "STOP_LOSS")
+
+    assert "[ENTRY]" in caplog.text
+    assert "[EXIT]" in caplog.text
+    assert '"symbol":"DOGEUSDT"' in caplog.text
+    assert closed["gross_pnl_usdt"] == -5.0
+    assert closed["net_pnl_usdt"] == -5.195
+    assert closed["total_fees_usdt"] == 0.195
+    assert closed["net_entry_price"] == 10.01
+    assert closed["net_exit_price"] == 9.4905
+
+
 def test_build_status_message_refreshes_fear_and_greed(monkeypatch):
     monkeypatch.setattr(runtime_module, "fetch_fear_and_greed", lambda: 21)
 
@@ -361,6 +382,27 @@ def test_build_status_message_includes_btc_trend_windows(monkeypatch):
     message = runtime._build_status_message()
 
     assert "BTC: 1h ▲+0.46% | 24h ▲+12.31%" in message
+
+
+def test_config_and_boot_manifest_include_active_calibration(caplog):
+    runtime = LiveBotRuntime(_config(), StubClient())
+    runtime._calibration_manifest = {
+        "source": "Redis key mexc_trade_calibration",
+        "calibration_hash": "abcdef1234567890",
+        "window_start": "2026-03-01T00:00:00+00:00",
+        "window_end": "2026-04-01T00:00:00+00:00",
+        "total_trades": 53,
+        "by_strategy": {"REVERSAL": {"trades": 8, "profit_factor": 3.16}},
+    }
+
+    message = runtime._build_config_message()
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        runtime._log_boot_manifest("LIVE TRADING")
+
+    assert "Calibration: abcdef123456 | 53 trades | 2026-03-01..2026-04-01" in message
+    assert "[BOOT]" in caplog.text
+    assert '"calibration_hash":"abcdef1234567890"' in caplog.text
+    assert '"REVERSAL":0.12' in caplog.text
 
 
 def test_build_review_message_shows_daily_review_suggestions():
@@ -468,12 +510,34 @@ def test_open_position_notifies_on_buy_failure():
 def test_refresh_trade_calibration_clears_cached_value_when_source_is_missing(monkeypatch):
     runtime = LiveBotRuntime(_config(), StubClient())
     runtime.trade_calibration = {"total_trades": 100}
+    runtime._calibration_manifest = {"calibration_hash": "old"}
 
     monkeypatch.setattr(runtime_module, "load_trade_calibration", lambda **kwargs: (None, None))
 
     runtime.refresh_trade_calibration(force=True)
 
     assert runtime.trade_calibration == {}
+    assert runtime._calibration_manifest == {}
+
+
+def test_refresh_trade_calibration_sets_active_manifest(monkeypatch):
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_start": "2026-03-01T00:00:00+00:00",
+        "window_end": "2026-04-01T00:00:00+00:00",
+        "total_trades": 60,
+        "by_strategy": {"REVERSAL": {"trades": 8, "profit_factor": 3.16}},
+    }
+    runtime = LiveBotRuntime(_config(), StubClient())
+
+    monkeypatch.setattr(runtime_module, "load_trade_calibration", lambda **kwargs: (payload, "Redis key mexc_trade_calibration"))
+
+    runtime.refresh_trade_calibration(force=True)
+
+    assert runtime.trade_calibration == payload
+    assert runtime._calibration_manifest["source"] == "Redis key mexc_trade_calibration"
+    assert runtime._calibration_manifest["total_trades"] == 60
+    assert runtime._calibration_manifest["by_strategy"]["REVERSAL"]["profit_factor"] == 3.16
 
 
 def test_refresh_daily_review_clears_cached_value_when_source_is_missing(monkeypatch):
@@ -619,6 +683,7 @@ def test_fill_open_slots_respects_strategy_pauses_and_symbol_cooldowns(monkeypat
     monkeypatch.setattr(runtime, "refresh_trade_calibration", lambda force=False: None)
     monkeypatch.setattr(runtime, "_update_market_regime", lambda: None)
     monkeypatch.setattr(runtime, "_update_moonshot_gate", lambda: None)
+    monkeypatch.setattr(runtime, "_passes_liquidity_guard", lambda opportunity, ticker_by_symbol=None: True)
 
     def fake_find_best_opportunity(client, config, exclude=None, open_symbols=None, calibration=None, threshold_overrides=None):
         captured["exclude"] = exclude
@@ -697,7 +762,7 @@ def test_rebalance_budgets_shifts_allocation_toward_better_strategy():
 
     runtime._rebalance_budgets()
 
-    assert runtime._dynamic_scalper_budget == 0.384
+    assert runtime._dynamic_scalper_budget == 0.434
     assert runtime._dynamic_moonshot_budget == 0.034
     assert runtime._strategy_budget_multiplier("SCALPER") > 1.0
     assert runtime._strategy_budget_multiplier("MOONSHOT") < 1.0
@@ -711,7 +776,7 @@ def test_scalper_kelly_sizing_reduces_low_conviction_allocation_below_budget_cap
 
     allocation = runtime._allocation_usdt_for_opportunity(opportunity, available_balance=1000.0)
 
-    assert allocation == 92.5
+    assert allocation == 105.0
     assert opportunity.metadata["kelly_mult"] == 0.5
 
 
@@ -727,7 +792,7 @@ def test_scalper_kelly_sizing_caps_high_conviction_allocation_at_budget_cap():
         total_equity=5000.0,
     )
 
-    assert allocation == 462.5
+    assert allocation == 525.0
     assert opportunity.metadata["kelly_mult"] == 1.5
 
 
@@ -769,6 +834,28 @@ def test_strategy_available_capital_uses_shared_moonshot_pool():
     assert available == 10.0
 
 
+def test_reversal_uses_dedicated_trade_cap_inside_moonshot_pool():
+    runtime = LiveBotRuntime(_config(), StubClient())
+    reversal = _opportunity(strategy="REVERSAL")
+    moonshot = _opportunity(strategy="MOONSHOT")
+
+    reversal_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
+        reversal,
+        available_balance=100.0,
+        total_equity=227.0,
+    )
+    moonshot_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
+        moonshot,
+        available_balance=100.0,
+        total_equity=227.0,
+    )
+
+    assert round(reversal_allocation, 3) == 12.258
+    assert round(moonshot_allocation, 3) == 4.903
+    assert reversal.metadata["strategy_budget_pct"] == 0.12
+    assert moonshot.metadata["strategy_budget_pct"] == 0.048
+
+
 def test_trinity_allocation_is_capped_by_trinity_pool_and_per_trade_budget_pct():
     runtime = LiveBotRuntime(_config(), StubClient())
     opportunity = _opportunity(strategy="TRINITY")
@@ -778,7 +865,7 @@ def test_trinity_allocation_is_capped_by_trinity_pool_and_per_trade_budget_pct()
     assert allocation == 2.0
 
 
-def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeypatch):
+def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeypatch, caplog):
     runtime = LiveBotRuntime(_config(strategies=["TRINITY"]), StubClient())
     existing = Trade(
         symbol="BTCUSDT",
@@ -800,6 +887,7 @@ def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeyp
     monkeypatch.setattr(runtime, "refresh_trade_calibration", lambda force=False: None)
     monkeypatch.setattr(runtime, "_update_market_regime", lambda: None)
     monkeypatch.setattr(runtime, "_update_moonshot_gate", lambda: None)
+    monkeypatch.setattr(runtime, "_passes_liquidity_guard", lambda opportunity, ticker_by_symbol=None: True)
 
     def fake_find_best_opportunity(client, config, exclude=None, open_symbols=None, calibration=None, threshold_overrides=None):
         captured["calls"] += 1
@@ -809,10 +897,13 @@ def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeyp
 
     monkeypatch.setattr("mexcbot.runtime.find_best_opportunity", fake_find_best_opportunity)
 
-    runtime._fill_open_slots()
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        runtime._fill_open_slots()
 
     assert len(runtime.open_trades) == 1
     assert captured["calls"] >= 2
+    assert "[ENTRY_BLOCK]" in caplog.text
+    assert "strategy_pool_or_cash_exhausted" in caplog.text
 
 
 def test_dead_coin_blacklist_trips_after_repeated_liquidity_failures():

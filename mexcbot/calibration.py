@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -236,6 +237,54 @@ def publish_trade_calibration(redis_url: str, redis_key: str, calibration: Mappi
     client = redis.from_url(redis_url)
     client.set(redis_key, json.dumps(calibration))
     return True
+
+
+def trade_calibration_hash(calibration: Mapping[str, Any]) -> str:
+    payload = {key: value for key, value in dict(calibration).items() if key != "calibration_hash"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def summarize_trade_calibration(calibration: Mapping[str, Any], *, source: str | None = None) -> dict[str, Any]:
+    by_strategy: dict[str, dict[str, float | int]] = {}
+    for strategy, metrics in dict(calibration.get("by_strategy", {})).items():
+        metric_map = dict(metrics or {})
+        by_strategy[str(strategy).upper()] = {
+            "trades": int(metric_map.get("trades", 0) or 0),
+            "profit_factor": round(float(metric_map.get("profit_factor", 0.0) or 0.0), 4),
+            "total_pnl": round(float(metric_map.get("total_pnl", 0.0) or 0.0), 4),
+            "expectancy": round(float(metric_map.get("expectancy", 0.0) or 0.0), 6),
+        }
+    return {
+        "source": source or "",
+        "calibration_hash": trade_calibration_hash(calibration),
+        "generated_at": str(calibration.get("generated_at") or ""),
+        "window_start": str(calibration.get("window_start") or ""),
+        "window_end": str(calibration.get("window_end") or ""),
+        "total_trades": int(calibration.get("total_trades", 0) or 0),
+        "by_strategy": by_strategy,
+    }
+
+
+def format_trade_calibration_manifest(manifest: Mapping[str, Any]) -> str:
+    if not manifest:
+        return "none loaded"
+    by_strategy = dict(manifest.get("by_strategy", {}) or {})
+    strategy_bits = []
+    for strategy, metrics in sorted(by_strategy.items()):
+        metric_map = dict(metrics or {})
+        strategy_bits.append(
+            f"{strategy}:n={int(metric_map.get('trades', 0) or 0)}/PF={float(metric_map.get('profit_factor', 0.0) or 0.0):.2f}"
+        )
+    strategies = ", ".join(strategy_bits) if strategy_bits else "no strategy metrics"
+    calibration_hash = str(manifest.get("calibration_hash") or "")[:12] or "n/a"
+    window_start = str(manifest.get("window_start") or "?")[:10]
+    window_end = str(manifest.get("window_end") or "?")[:10]
+    source = str(manifest.get("source") or "unknown source")
+    return (
+        f"hash={calibration_hash} source={source} window={window_start}..{window_end} "
+        f"trades={int(manifest.get('total_trades', 0) or 0)} strategies={strategies}"
+    )
 
 
 def validate_trade_calibration_payload(data: Mapping[str, Any], *, max_age_hours: float, min_total_trades: int) -> tuple[bool, str | None]:

@@ -6,7 +6,7 @@ import os
 from datetime import timezone
 from typing import Any
 
-from mexcbot.calibration import build_trade_calibration, publish_trade_calibration, write_trade_calibration
+from mexcbot.calibration import build_trade_calibration, publish_trade_calibration, summarize_trade_calibration, write_trade_calibration
 from backtest.config import BacktestConfig, parse_utc_datetime
 from backtest.data import HistoricalKlineProvider
 from backtest.engine import BacktestEngine
@@ -38,6 +38,19 @@ def build_run_summary(config: BacktestConfig) -> dict[str, object]:
         "initial_balance": config.initial_balance,
         "trade_budget": config.trade_budget,
         "max_open_positions": config.max_open_positions,
+        "strategy_allocations": {
+            "SCALPER": config.scalper_allocation_pct,
+            "MOONSHOT_POOL": config.moonshot_allocation_pct,
+            "TRINITY": config.trinity_allocation_pct,
+            "GRID": config.grid_allocation_pct,
+        },
+        "per_trade_budget_pct": {
+            "SCALPER": config.scalper_budget_pct,
+            "MOONSHOT": config.moonshot_budget_pct,
+            "REVERSAL": config.reversal_budget_pct,
+            "TRINITY": config.trinity_budget_pct,
+            "GRID": config.grid_budget_pct,
+        },
         "reentry_cooldown_bars": config.reentry_cooldown_bars,
         "output_dir": config.output_dir,
         "calibration_file": config.calibration_file,
@@ -86,11 +99,16 @@ def run_backtest(config: BacktestConfig) -> dict[str, Any]:
     )
     write_trade_calibration(config.calibration_file, calibration)
     published = publish_trade_calibration(config.redis_url, config.calibration_redis_key, calibration)
+    calibration_manifest = summarize_trade_calibration(
+        calibration,
+        source=f"{config.calibration_file} / Redis key {config.calibration_redis_key}",
+    )
     return {
         "equity_curve": equity_curve,
         "trades": trades,
         "report": report,
         "calibration": calibration,
+        "calibration_manifest": calibration_manifest,
         "published": published,
     }
 
@@ -126,6 +144,7 @@ def main() -> None:
                     "file": config.calibration_file,
                     "redis_key": config.calibration_redis_key,
                     "published": result["published"],
+                    "manifest": result["calibration_manifest"],
                 }
             },
             indent=2,

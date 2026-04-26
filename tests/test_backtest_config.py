@@ -83,3 +83,11 @@ def test_backtest_config_parses_synthetic_dust_sweep_knobs(monkeypatch: pytest.M
 
     assert config.synthetic_dust_sweep_enabled is True
     assert config.synthetic_dust_conversion_fee_rate == 0.08
+
+
+def test_backtest_config_parses_reversal_budget_pct(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("REVERSAL_BUDGET_PCT", "0.16")
+
+    config = BacktestConfig.from_env(now=datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
+
+    assert config.reversal_budget_pct == 0.16

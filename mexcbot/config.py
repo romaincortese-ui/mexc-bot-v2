@@ -111,6 +111,7 @@ class LiveConfig:
     grid_allocation_pct: float
     scalper_budget_pct: float
     moonshot_budget_pct: float
+    reversal_budget_pct: float
     trinity_budget_pct: float
     grid_budget_pct: float
     perf_rebalance_trades: int
@@ -204,13 +205,14 @@ class LiveConfig:
             moonshot_allocation_pct=env_float("MOONSHOT_ALLOCATION_PCT", 0.45),
             trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.10),
             grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.20),
-            scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.37),
+            scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.42),
             moonshot_budget_pct=env_float("MOONSHOT_BUDGET_PCT", 0.048),
+            reversal_budget_pct=env_float("REVERSAL_BUDGET_PCT", 0.12),
             trinity_budget_pct=env_float("TRINITY_BUDGET_PCT", 0.20),
             grid_budget_pct=env_float("GRID_BUDGET_PCT", 0.40),
             perf_rebalance_trades=env_int("PERF_REBALANCE_TRADES", 20),
             perf_scalper_floor=env_float("PERF_SCALPER_FLOOR", 0.10),
-            perf_scalper_ceil=env_float("PERF_SCALPER_CEIL", 0.40),
+            perf_scalper_ceil=env_float("PERF_SCALPER_CEIL", 0.48),
             perf_moonshot_floor=env_float("PERF_MOONSHOT_FLOOR", 0.02),
             perf_moonshot_ceil=env_float("PERF_MOONSHOT_CEIL", 0.14),
             perf_shift_step=env_float("PERF_SHIFT_STEP", 0.028),

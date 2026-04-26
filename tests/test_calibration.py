@@ -3,7 +3,10 @@ from datetime import datetime, timedelta, timezone
 from mexcbot.calibration import (
     apply_opportunity_calibration,
     build_trade_calibration,
+    format_trade_calibration_manifest,
     resolve_exit_profile_override,
+    summarize_trade_calibration,
+    trade_calibration_hash,
     validate_trade_calibration_payload,
 )
 from mexcbot.models import Opportunity
@@ -177,6 +180,30 @@ def test_validate_trade_calibration_payload_rejects_stale_or_small_samples():
 
     assert ok is False
     assert "insufficient sample" in str(reason)
+
+
+def test_trade_calibration_manifest_has_stable_hash_and_strategy_pf():
+    calibration = {
+        "generated_at": datetime(2026, 4, 1, tzinfo=timezone.utc).isoformat(),
+        "window_start": datetime(2026, 3, 1, tzinfo=timezone.utc).isoformat(),
+        "window_end": datetime(2026, 4, 1, tzinfo=timezone.utc).isoformat(),
+        "total_trades": 20,
+        "by_strategy": {
+            "REVERSAL": {"trades": 8, "profit_factor": 3.1567, "total_pnl": 6.91, "expectancy": 0.86375},
+            "GRID": {"trades": 12, "profit_factor": 1.18, "total_pnl": 1.14, "expectancy": 0.095},
+        },
+    }
+
+    first_hash = trade_calibration_hash(calibration)
+    second_hash = trade_calibration_hash({"calibration_hash": "old", **calibration})
+    manifest = summarize_trade_calibration(calibration, source="Redis key mexc_trade_calibration")
+    formatted = format_trade_calibration_manifest(manifest)
+
+    assert first_hash == second_hash
+    assert manifest["calibration_hash"] == first_hash
+    assert manifest["by_strategy"]["REVERSAL"]["profit_factor"] == 3.1567
+    assert "hash=" in formatted
+    assert "REVERSAL:n=8/PF=3.16" in formatted
 
 
 def test_resolve_exit_profile_override_clamps_adjustments_against_default_profile():

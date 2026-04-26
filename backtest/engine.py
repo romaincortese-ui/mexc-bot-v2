@@ -455,6 +455,9 @@ class BacktestEngine:
         return 1.0
 
     def _strategy_budget_pct(self, strategy: str) -> float:
+        resolved = strategy.upper()
+        if resolved == "REVERSAL":
+            return self.config.reversal_budget_pct
         pool = self._strategy_pool_key(strategy)
         if pool == "SCALPER":
             return self._dynamic_scalper_budget if self._dynamic_scalper_budget is not None else self.config.scalper_budget_pct
@@ -495,11 +498,12 @@ class BacktestEngine:
             total_equity=total_equity,
             open_trades=open_trades,
         )
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
+        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
+        opportunity.metadata["strategy_available_cap_usdt"] = round(available_pool_cap, 4)
         allocation = min(cash_balance, available_pool_cap, per_trade_cap)
         if allocation <= 0:
             return 0.0
-        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
-        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
         return allocation
 
     def _update_market_regime(self, timestamp: pd.Timestamp, btc_frame: pd.DataFrame | None) -> None:
