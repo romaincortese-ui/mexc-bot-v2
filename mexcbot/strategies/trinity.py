@@ -48,7 +48,7 @@ TRINITY_SL_MIN = env_float("TRINITY_SL_MIN", 0.03)
 TRINITY_SL_MAX = env_float("TRINITY_SL_MAX", 0.05)
 TRINITY_SL_ATR_MULT = env_float("TRINITY_SL_ATR_MULT", 2.5)
 
-TRINITY_MIN_SCORE = env_float("TRINITY_MIN_SCORE", 50.0)
+TRINITY_MIN_SCORE = env_float("TRINITY_MIN_SCORE", 60.0)
 
 
 def score_trinity_from_frame(

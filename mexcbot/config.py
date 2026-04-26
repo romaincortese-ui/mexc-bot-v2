@@ -40,6 +40,13 @@ def env_csv(name: str, default: str) -> list[str]:
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
 
 
+def default_state_file() -> str:
+    railway_markers = ("RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "RAILWAY_SERVICE_ID")
+    if any(os.getenv(name) for name in railway_markers):
+        return "/data/runtime_state.json"
+    return "runtime_state.json"
+
+
 @dataclass(slots=True)
 class LiveConfig:
     api_key: str
@@ -195,12 +202,12 @@ class LiveConfig:
             adaptive_min_offset=env_float("ADAPTIVE_MIN_OFFSET", -6.0),
             scalper_allocation_pct=env_float("SCALPER_ALLOCATION_PCT", 0.25),
             moonshot_allocation_pct=env_float("MOONSHOT_ALLOCATION_PCT", 0.45),
-            trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.20),
-            grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.10),
+            trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.10),
+            grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.20),
             scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.37),
             moonshot_budget_pct=env_float("MOONSHOT_BUDGET_PCT", 0.048),
             trinity_budget_pct=env_float("TRINITY_BUDGET_PCT", 0.20),
-            grid_budget_pct=env_float("GRID_BUDGET_PCT", 0.30),
+            grid_budget_pct=env_float("GRID_BUDGET_PCT", 0.40),
             perf_rebalance_trades=env_int("PERF_REBALANCE_TRADES", 20),
             perf_scalper_floor=env_float("PERF_SCALPER_FLOOR", 0.10),
             perf_scalper_ceil=env_float("PERF_SCALPER_CEIL", 0.40),
@@ -226,6 +233,6 @@ class LiveConfig:
             fear_greed_bear_block_grid=env_bool("FG_BEAR_BLOCK_GRID", True),
             grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
             grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
-            state_file=env_str("MEXCBOT_STATE_FILE", "runtime_state.json"),
+            state_file=env_str("MEXCBOT_STATE_FILE", default_state_file()),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
         )

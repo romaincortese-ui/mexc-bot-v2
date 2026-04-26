@@ -256,12 +256,12 @@ def _config(**overrides) -> LiveConfig:
         adaptive_min_offset=-8.0,
         scalper_allocation_pct=0.25,
         moonshot_allocation_pct=0.45,
-        trinity_allocation_pct=0.20,
-        grid_allocation_pct=0.10,
+        trinity_allocation_pct=0.10,
+        grid_allocation_pct=0.20,
         scalper_budget_pct=0.37,
         moonshot_budget_pct=0.048,
         trinity_budget_pct=0.20,
-        grid_budget_pct=0.30,
+        grid_budget_pct=0.40,
         perf_rebalance_trades=20,
         perf_scalper_floor=0.10,
         perf_scalper_ceil=0.40,
@@ -711,7 +711,7 @@ def test_scalper_kelly_sizing_reduces_low_conviction_allocation_below_budget_cap
 
     allocation = runtime._allocation_usdt_for_opportunity(opportunity, available_balance=1000.0)
 
-    assert allocation == 250.0
+    assert allocation == 92.5
     assert opportunity.metadata["kelly_mult"] == 0.5
 
 
@@ -727,7 +727,7 @@ def test_scalper_kelly_sizing_caps_high_conviction_allocation_at_budget_cap():
         total_equity=5000.0,
     )
 
-    assert allocation == 500.0
+    assert allocation == 462.5
     assert opportunity.metadata["kelly_mult"] == 1.5
 
 
@@ -775,7 +775,7 @@ def test_trinity_allocation_is_capped_by_trinity_pool_and_per_trade_budget_pct()
 
     allocation = runtime._allocation_usdt_for_opportunity_with_equity(opportunity, available_balance=100.0, total_equity=100.0)
 
-    assert allocation == 4.0
+    assert allocation == 2.0
 
 
 def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeypatch):
@@ -825,6 +825,21 @@ def test_dead_coin_blacklist_trips_after_repeated_liquidity_failures():
     assert allowed_second is False
     assert "DOGEUSDT" in runtime.liquidity_blacklist
     assert "DOGEUSDT" in runtime._excluded_symbols()
+
+
+def test_quantity_scale_reject_blacklists_symbol_after_failed_buy():
+    client = StubClient()
+    client.last_buy_error = "qty=2122.815 | 400 quantity scale is invalid"
+    runtime = LiveBotRuntime(_config(), client)
+    runtime.telegram = StubTelegram()
+    opportunity = _opportunity(strategy="GRID", symbol="GALAUSDT")
+    opportunity.price = 0.0032
+
+    trade = runtime.open_position(opportunity, allocation_usdt=6.8)
+
+    assert trade is None
+    assert "GALAUSDT" in runtime.liquidity_blacklist
+    assert "GALAUSDT" in runtime._excluded_symbols()
 
 
 def test_fill_open_slots_skips_candidate_that_fails_liquidity_guard(monkeypatch):

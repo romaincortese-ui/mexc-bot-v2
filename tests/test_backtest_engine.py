@@ -383,6 +383,7 @@ def test_backtest_engine_retries_defensive_close_across_multiple_bars():
         taker_fill_ratio=0.5,
         synthetic_close_max_attempts=2,
         synthetic_retry_delay_bars=1,
+        moonshot_budget_pct=0.25,
         reentry_cooldown_bars=100,
     )
 

@@ -283,8 +283,14 @@ def test_place_order_formats_market_quantity_from_market_lot_size(monkeypatch):
 
     monkeypatch.setattr(
         client,
-        "_symbol_filter",
-        lambda symbol, filter_type: {"minQty": "0.1", "stepSize": "0.1"} if filter_type in {"MARKET_LOT_SIZE", "LOT_SIZE"} else {},
+        "_symbol_info",
+        lambda symbol: {
+            "symbol": symbol,
+            "filters": [
+                {"filterType": "MARKET_LOT_SIZE", "minQty": "0.1", "stepSize": "0.1"},
+                {"filterType": "LOT_SIZE", "minQty": "0.1", "stepSize": "0.1"},
+            ],
+        },
     )
     monkeypatch.setattr(client, "private_post", lambda path, params=None: captured.setdefault("params", params) or {"status": "ok"})
 
@@ -351,6 +357,31 @@ def test_place_order_uses_base_asset_precision_if_base_size_precision_missing(mo
     client.place_order("TESTUSDT", "BUY", 1.234567, "MARKET")
 
     assert captured["params"]["quantity"] == "1.2345"
+
+
+def test_place_order_applies_quantity_scale_over_lot_filter(monkeypatch):
+    client = MexcClient(DummyConfig())
+    captured = {}
+
+    monkeypatch.setattr(
+        client,
+        "_symbol_info",
+        lambda symbol: {
+            "symbol": symbol,
+            "quantityScale": 0,
+            "baseAssetPrecision": 3,
+            "filters": [
+                {"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+                {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001"},
+            ],
+        },
+    )
+    monkeypatch.setattr(client, "private_post", lambda path, params=None: captured.setdefault("params", params) or {"status": "ok"})
+
+    client.place_order("GALAUSDT", "BUY", 2122.815, "MARKET")
+
+    assert captured["params"]["quantity"] == "2122"
+    assert client.get_lot_size("GALAUSDT")["stepSize"] == "1"
 
 
 def test_place_limit_sell_returns_order_id(monkeypatch):

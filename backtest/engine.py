@@ -436,6 +436,72 @@ class BacktestEngine:
             return effective / self.config.moonshot_budget_pct if self.config.moonshot_budget_pct > 0 else 1.0
         return 1.0
 
+    def _strategy_pool_key(self, strategy: str) -> str:
+        resolved = strategy.upper()
+        if resolved in {"MOONSHOT", "REVERSAL", "PRE_BREAKOUT"}:
+            return "MOONSHOT"
+        return resolved
+
+    def _strategy_capital_pct(self, strategy: str) -> float:
+        pool = self._strategy_pool_key(strategy)
+        if pool == "SCALPER":
+            return self.config.scalper_allocation_pct
+        if pool == "MOONSHOT":
+            return self.config.moonshot_allocation_pct
+        if pool == "TRINITY":
+            return self.config.trinity_allocation_pct
+        if pool == "GRID":
+            return self.config.grid_allocation_pct
+        return 1.0
+
+    def _strategy_budget_pct(self, strategy: str) -> float:
+        pool = self._strategy_pool_key(strategy)
+        if pool == "SCALPER":
+            return self._dynamic_scalper_budget if self._dynamic_scalper_budget is not None else self.config.scalper_budget_pct
+        if pool == "MOONSHOT":
+            return self._dynamic_moonshot_budget if self._dynamic_moonshot_budget is not None else self.config.moonshot_budget_pct
+        if pool == "TRINITY":
+            return self.config.trinity_budget_pct
+        if pool == "GRID":
+            return self.config.grid_budget_pct
+        return 1.0
+
+    def _used_strategy_capital(self, strategy: str, open_trades: list[dict]) -> float:
+        pool = self._strategy_pool_key(strategy)
+        total = 0.0
+        for trade in open_trades:
+            if self._strategy_pool_key(str(trade.get("strategy") or "")) != pool:
+                continue
+            total += float(trade.get("remaining_cost_usdt") or trade.get("entry_cost_usdt") or 0.0)
+        return total
+
+    def _strategy_available_capital(self, strategy: str, *, total_equity: float, open_trades: list[dict]) -> float:
+        cap = total_equity * self._strategy_capital_pct(strategy)
+        return max(0.0, cap - self._used_strategy_capital(strategy, open_trades))
+
+    def _allocation_usdt_for_candidate(
+        self,
+        opportunity: Opportunity,
+        *,
+        cash_balance: float,
+        total_equity: float,
+        open_trades: list[dict],
+    ) -> float:
+        allocation_mult = float(opportunity.metadata.get("allocation_mult", 1.0) or 1.0)
+        pool_cap = total_equity * self._strategy_capital_pct(opportunity.strategy)
+        per_trade_cap = pool_cap * self._strategy_budget_pct(opportunity.strategy) * allocation_mult
+        available_pool_cap = self._strategy_available_capital(
+            opportunity.strategy,
+            total_equity=total_equity,
+            open_trades=open_trades,
+        )
+        allocation = min(cash_balance, available_pool_cap, per_trade_cap)
+        if allocation <= 0:
+            return 0.0
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
+        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
+        return allocation
+
     def _update_market_regime(self, timestamp: pd.Timestamp, btc_frame: pd.DataFrame | None) -> None:
         if btc_frame is None or btc_frame.empty:
             self._market_regime_mult = 1.0
@@ -947,9 +1013,13 @@ class BacktestEngine:
             for best, data_key in scored_candidates:
                 if len(open_trades) >= self.config.max_open_positions or cash_balance <= 0:
                     break
-                allocation_mult = float(best.metadata.get("allocation_mult", 1.0) or 1.0)
-                strategy_mult = self._strategy_budget_multiplier(best.strategy) if strategy_mode else 1.0
-                allocation = min(cash_balance, self.config.trade_budget * allocation_mult * strategy_mult)
+                total_equity = self._mark_to_market_equity(cash_balance, pending_dust_credits, open_trades, data, timestamp)
+                allocation = self._allocation_usdt_for_candidate(
+                    best,
+                    cash_balance=cash_balance,
+                    total_equity=total_equity,
+                    open_trades=open_trades,
+                )
                 if allocation <= 0:
                     break
                 tp_pct = best.tp_pct if best.tp_pct is not None else self.config.take_profit_pct

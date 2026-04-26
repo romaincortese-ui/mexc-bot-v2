@@ -162,13 +162,14 @@ def test_exit_profile_override_updates_trade_management_behavior():
     }
     initialize_exit_state(trade, strategy="SCALPER", opened_at=trade["opened_at"])
 
-    assert trade["partial_tp_ratio"] == 0.0
+    assert trade["partial_tp_ratio"] == 0.3
+    assert trade["partial_tp_price"] == 101.8
 
     action = evaluate_trade_action(
         trade,
         current_price=101.7,
         current_time=trade["opened_at"] + timedelta(minutes=10),
-        bar_high=101.8,
+        bar_high=101.7,
         bar_low=101.2,
     )
 
@@ -204,8 +205,8 @@ def test_scalper_partial_tp_caps_ratio_for_high_score_setup():
 
     initialize_exit_state(trade, strategy="SCALPER", opened_at=trade["opened_at"])
 
-    assert trade["partial_tp_ratio"] == 0.0
-    assert trade["partial_tp_price"] is None
+    assert trade["partial_tp_ratio"] == 0.3
+    assert trade["partial_tp_price"] == 100.89999999999999
 
 
 def test_scalper_signal_profiles_share_unified_timeout():

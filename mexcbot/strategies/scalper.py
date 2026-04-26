@@ -83,6 +83,10 @@ SCALPER_TP_AUTO_MAX_MATURITY = 0.72
 SCALPER_TP_AUTO_MAX_REGIME_MULT = 1.08
 SCALPER_TP_AUTO_OPEN_POS_TIGHTEN = 0.10
 SCALPER_TP_AUTO_OVERSOLD_BLOCK = True
+SCALPER_PARTIAL_TP_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_MIN_SCORE", 45.0)
+SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE", 55.0)
+SCALPER_PARTIAL_TP_RATIO_CAP = env_float("SCALPER_PARTIAL_TP_RATIO_CAP", 0.30)
+SCALPER_PARTIAL_TP_PCT = env_float("SCALPER_PARTIAL_TP_PCT", 0.018)
 
 SCALPER_SL_CAP = env_float("SCALPER_SL_CAP", 0.12)
 SCALPER_SL_FLOOR = env_float("SCALPER_SL_FLOOR", 0.08)
@@ -102,8 +106,8 @@ SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
         "breakeven_activation_pct": 0.006,
         "trail_activation_pct": 1.0,
         "trail_pct": 0.025,
-        "partial_tp_trigger_pct": 0.0,
-        "partial_tp_ratio": 0.0,
+        "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+        "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
         "floor_chase": 1,
         "floor_buffer_pct": 0.008,
         "flat_max_minutes": 720,
@@ -116,8 +120,8 @@ SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
         "breakeven_activation_pct": 0.006,
         "trail_activation_pct": 1.0,
         "trail_pct": 0.025,
-        "partial_tp_trigger_pct": 0.0,
-        "partial_tp_ratio": 0.0,
+        "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+        "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
         "floor_chase": 1,
         "floor_buffer_pct": 0.010,
         "flat_max_minutes": 960,
@@ -130,8 +134,8 @@ SCALPER_SIGNAL_PROFILES: dict[str, dict[str, float | int]] = {
         "breakeven_activation_pct": 0.006,
         "trail_activation_pct": 1.0,
         "trail_pct": 0.020,
-        "partial_tp_trigger_pct": 0.0,
-        "partial_tp_ratio": 0.0,
+        "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+        "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
         "floor_chase": 1,
         "floor_buffer_pct": 0.008,
         "flat_max_minutes": 720,
@@ -327,13 +331,19 @@ def resolve_scalper_tp_execution_mode(
     return "exchange" if qualifies else "internal"
 
 
-def _scalper_exit_profile(entry_signal: str, atr_pct: float, base_trail_pct: float) -> tuple[float, float, dict[str, float | int]]:
+def _scalper_exit_profile(entry_signal: str, atr_pct: float, base_trail_pct: float, score: float) -> tuple[float, float, dict[str, float | int]]:
     signal = entry_signal.upper()
     profile = dict(SCALPER_SIGNAL_PROFILES.get(signal, SCALPER_SIGNAL_PROFILES["TREND"]))
     tp_pct = min(SCALPER_TP_CAP, max(float(profile["tp_min"]), atr_pct * float(profile["tp_atr_mult"])))
     sl_pct = max(SCALPER_SL_FLOOR, min(SCALPER_SL_CAP, atr_pct * SCALPER_SL_ATR_MULT))
     sl_pct = maybe_apply_atr_stops_v2(sl_pct, strategy="SCALPER", atr_pct=atr_pct)
     profile["trail_pct"] = round(min(float(profile["trail_pct"]), base_trail_pct), 6)
+    min_score = SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE if signal == "OVERSOLD" else SCALPER_PARTIAL_TP_MIN_SCORE
+    if score < min_score:
+        profile["partial_tp_trigger_pct"] = 0.0
+        profile["partial_tp_ratio"] = 0.0
+    else:
+        profile["partial_tp_ratio"] = min(float(profile.get("partial_tp_ratio", 0.0) or 0.0), SCALPER_PARTIAL_TP_RATIO_CAP)
     return round(tp_pct, 6), round(sl_pct, 6), profile
 
 
@@ -462,7 +472,7 @@ def score_symbol_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: f
         return None
 
     base_trail_pct = round(min(0.050, max(0.015, atr_pct * params["trail_atr_mult"])), 6)
-    tp_pct, sl_pct, exit_profile_override = _scalper_exit_profile(entry_signal, atr_pct, base_trail_pct)
+    tp_pct, sl_pct, exit_profile_override = _scalper_exit_profile(entry_signal, atr_pct, base_trail_pct, score)
     return Opportunity(
         symbol=symbol,
         score=score,

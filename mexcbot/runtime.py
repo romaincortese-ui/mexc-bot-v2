@@ -286,6 +286,7 @@ class LiveBotRuntime:
         if self._state_path is None:
             return
         if not self._state_path.exists():
+            log.info("State file %s not found; starting with empty runtime state", self._state_path)
             return
         try:
             payload = json.loads(self._state_path.read_text(encoding="utf-8"))
@@ -353,9 +354,18 @@ class LiveBotRuntime:
             return
 
         self._purge_cooldowns()
-        if self.open_trades:
-            self._record_activity(f"Restored {len(self.open_trades)} open trade(s) from state")
-            self._restore_approved_review_overrides()
+        restored_open = len(self.open_trades)
+        restored_closed = len(self.trade_history)
+        active_blacklist = sum(1 for expires_at in self.liquidity_blacklist.values() if expires_at > time.time())
+        log.info(
+            "Restored runtime state from %s: %d open trade(s), %d closed trade(s), %d blacklisted symbol(s)",
+            self._state_path,
+            restored_open,
+            restored_closed,
+            active_blacklist,
+        )
+        self._record_activity(f"Restored {restored_open} open trade(s) from state; closed={restored_closed}")
+        self._restore_approved_review_overrides()
 
     def _notify(self, message: str, *, parse_mode: str = "HTML") -> None:
         self.telegram.send_message(message, parse_mode=parse_mode)
@@ -1672,6 +1682,16 @@ class LiveBotRuntime:
             f"Reason: {error_text}"
         )
 
+    def _blacklist_quantity_scale_reject(self, opportunity: Opportunity) -> None:
+        error_text = str(getattr(self.client, "last_buy_error", "") or "").lower()
+        if "quantity scale is invalid" not in error_text:
+            return
+        expires_at = time.time() + self.config.dead_coin_blacklist_hours * 3600
+        self.liquidity_blacklist[opportunity.symbol] = expires_at
+        self.liquidity_fail_count.pop(opportunity.symbol, None)
+        self._record_activity(f"Execution blacklist {opportunity.symbol} quantity scale")
+        self._save_state()
+
     def _send_close_alert(self, closed: dict, *, partial: bool = False, remaining_qty: float | None = None) -> None:
         prefix = "Partial" if partial else "Closed"
         remainder = f"\nRemaining qty {remaining_qty:.6f}" if partial and remaining_qty is not None else ""
@@ -2205,6 +2225,18 @@ class LiveBotRuntime:
             return self.config.grid_allocation_pct
         return 1.0
 
+    def _strategy_budget_pct(self, strategy: str) -> float:
+        pool = self._strategy_pool_key(strategy)
+        if pool == "SCALPER":
+            return self._dynamic_scalper_budget if self._dynamic_scalper_budget is not None else self.config.scalper_budget_pct
+        if pool == "MOONSHOT":
+            return self._dynamic_moonshot_budget if self._dynamic_moonshot_budget is not None else self.config.moonshot_budget_pct
+        if pool == "TRINITY":
+            return self.config.trinity_budget_pct
+        if pool == "GRID":
+            return self.config.grid_budget_pct
+        return 1.0
+
     def _used_strategy_capital(self, strategy: str) -> float:
         pool = self._strategy_pool_key(strategy)
         total = 0.0
@@ -2525,18 +2557,14 @@ class LiveBotRuntime:
 
     def _allocation_usdt_for_opportunity_with_equity(self, opportunity: Opportunity, *, available_balance: float, total_equity: float) -> float:
         allocation_mult = float(opportunity.metadata.get("allocation_mult", 1.0) or 1.0)
-        pool = self._strategy_pool_key(opportunity.strategy)
-        if pool == "TRINITY":
-            per_trade_cap = total_equity * self.config.trinity_allocation_pct * self.config.trinity_budget_pct
-        elif pool == "GRID":
-            per_trade_cap = total_equity * self.config.grid_allocation_pct * self.config.grid_budget_pct
-        else:
-            strategy_mult = self._strategy_budget_multiplier(opportunity.strategy)
-            per_trade_cap = self.config.trade_budget * allocation_mult * strategy_mult
+        pool_cap = total_equity * self._strategy_capital_pct(opportunity.strategy)
+        per_trade_cap = pool_cap * self._strategy_budget_pct(opportunity.strategy) * allocation_mult
         available_pool_cap = self._strategy_available_capital(opportunity.strategy, total_equity=total_equity)
         capped_budget = min(per_trade_cap, available_pool_cap, available_balance)
         if capped_budget <= 0:
             return 0.0
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
+        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
         # Sprint memo composite multiplier (1.0 when all flags OFF).
         sprint_mult = self._sprint_sizing_multiplier(opportunity, total_equity=total_equity)
         if opportunity.strategy.upper() != "SCALPER":
@@ -2552,7 +2580,7 @@ class LiveBotRuntime:
 
         kelly_mult = self._kelly_multiplier(opportunity)
         risk_per_trade = min(SCALPER_RISK_PER_TRADE * kelly_mult, KELLY_RISK_CAP)
-        risk_budget = available_balance * risk_per_trade / sl_pct
+        risk_budget = total_equity * risk_per_trade / sl_pct
         allocation = min(risk_budget, capped_budget) * sprint_mult
         opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
         opportunity.metadata["risk_budget_usdt"] = round(allocation, 4)
@@ -2795,6 +2823,7 @@ class LiveBotRuntime:
         use_maker = opportunity.strategy != "REVERSAL"
         order = self.client.place_buy_order(opportunity.symbol, requested_qty, use_maker=use_maker)
         if order is None:
+            self._blacklist_quantity_scale_reject(opportunity)
             self._send_buy_failure_alert(opportunity, requested_qty=requested_qty, allocation_usdt=allocation_usdt)
             return None
         execution = self.client.resolve_order_execution(

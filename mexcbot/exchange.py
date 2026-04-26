@@ -61,20 +61,74 @@ class MexcClient:
                 return filter_row
         return {}
 
+    def _decimal_text(self, value: Decimal) -> str:
+        return format(value.normalize(), "f")
+
+    def _precision_step(self, precision: Any) -> Decimal | None:
+        try:
+            precision_int = int(precision)
+        except (TypeError, ValueError):
+            return None
+        if precision_int < 0:
+            return None
+        return Decimal("1").scaleb(-precision_int)
+
+    def _quantity_precision_step(self, item: dict[str, Any]) -> Decimal | None:
+        candidates: list[Decimal] = []
+        base_size_precision = str(item.get("baseSizePrecision") or "").strip()
+        if base_size_precision:
+            try:
+                base_size_step = Decimal(base_size_precision)
+            except Exception:
+                base_size_step = Decimal("0")
+            if base_size_step > 0:
+                candidates.append(base_size_step)
+            elif base_size_precision in {"0", "0.0"}:
+                candidates.append(Decimal("1"))
+        for key in ("quantityScale", "quantityPrecision", "baseAssetPrecision"):
+            step = self._precision_step(item.get(key))
+            if step is not None:
+                candidates.append(step)
+        return max(candidates) if candidates else None
+
+    def _effective_lot_size(self, symbol: str, filter_type: str) -> dict[str, Any]:
+        item = self._symbol_info(symbol)
+        size_filter: dict[str, Any] = {}
+        for filter_row in item.get("filters", []):
+            if filter_row.get("filterType") == filter_type:
+                size_filter = dict(filter_row)
+                break
+        if not size_filter and filter_type != "LOT_SIZE":
+            for filter_row in item.get("filters", []):
+                if filter_row.get("filterType") == "LOT_SIZE":
+                    size_filter = dict(filter_row)
+                    break
+
+        precision_step = self._quantity_precision_step(item)
+        fallback = precision_step if precision_step is not None else Decimal("0.001")
+        try:
+            step_decimal = Decimal(str(size_filter.get("stepSize", fallback)))
+        except Exception:
+            step_decimal = fallback
+        if step_decimal <= 0:
+            step_decimal = fallback
+        if precision_step is not None:
+            step_decimal = max(step_decimal, precision_step)
+        try:
+            min_decimal = Decimal(str(size_filter.get("minQty", step_decimal)))
+        except Exception:
+            min_decimal = step_decimal
+        if min_decimal <= 0:
+            min_decimal = step_decimal
+        min_decimal = max(min_decimal, step_decimal)
+        size_filter["minQty"] = self._decimal_text(min_decimal)
+        size_filter["stepSize"] = self._decimal_text(step_decimal)
+        return size_filter
+
     def _fallback_lot_size(self, symbol: str) -> dict[str, Any]:
         item = self._symbol_info(symbol)
-        base_size_precision = str(item.get("baseSizePrecision") or "").strip()
-        if base_size_precision and base_size_precision not in {"0", "0.0"}:
-            return {"minQty": base_size_precision, "stepSize": base_size_precision}
-
-        base_precision = item.get("baseAssetPrecision")
-        try:
-            precision_int = int(base_precision)
-        except (TypeError, ValueError):
-            precision_int = 3
-        precision_int = max(0, precision_int)
-        derived_step = Decimal("1").scaleb(-precision_int)
-        step_text = format(derived_step.normalize(), "f")
+        derived_step = self._quantity_precision_step(item) or Decimal("0.001")
+        step_text = self._decimal_text(derived_step)
         return {"minQty": step_text, "stepSize": step_text}
 
     def _normalize_qty(self, qty: float, step: str | float, min_qty: str | float) -> float:
@@ -97,7 +151,7 @@ class MexcClient:
 
     def _order_qty_payload(self, symbol: str, qty: float, *, order_type: str) -> tuple[float, str]:
         filter_type = "MARKET_LOT_SIZE" if order_type.upper() == "MARKET" else "LOT_SIZE"
-        size_filter = self._symbol_filter(symbol, filter_type) or self._symbol_filter(symbol, "LOT_SIZE") or self._fallback_lot_size(symbol)
+        size_filter = self._effective_lot_size(symbol, filter_type)
         step_size = size_filter.get("stepSize", "0.001")
         min_qty = size_filter.get("minQty", step_size)
         normalized_qty = self._normalize_qty(qty, step_size, min_qty)
@@ -216,10 +270,7 @@ class MexcClient:
         return (best_ask - best_bid) / mid
 
     def get_lot_size(self, symbol: str) -> dict[str, Any]:
-        filter_row = self._symbol_filter(symbol, "LOT_SIZE")
-        if filter_row:
-            return filter_row
-        return self._fallback_lot_size(symbol)
+        return self._effective_lot_size(symbol, "LOT_SIZE")
 
     def get_price_filter(self, symbol: str) -> dict[str, Any]:
         filter_row = self._symbol_filter(symbol, "PRICE_FILTER")

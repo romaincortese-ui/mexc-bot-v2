@@ -31,6 +31,7 @@ SCALPER_PROG_TIGHTEN = env_float("SCALPER_PROG_TIGHTEN", 0.30)
 SCALPER_PARTIAL_TP_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_MIN_SCORE", 45.0)
 SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE", 55.0)
 SCALPER_PARTIAL_TP_RATIO_CAP = env_float("SCALPER_PARTIAL_TP_RATIO_CAP", 0.30)
+SCALPER_PARTIAL_TP_PCT = env_float("SCALPER_PARTIAL_TP_PCT", 0.018)
 SCALPER_PEAK_DROP_PCT = env_float("SCALPER_PEAK_DROP_PCT", 0.015)            # 1.5% drop from peak after breakeven
 SCALPER_PEAK_DROP_ATR_MULT = env_float("SCALPER_PEAK_DROP_ATR_MULT", 0.0)    # disabled for scalper; keep fixed drop
 MOONSHOT_PEAK_DROP_PCT = env_float("MOONSHOT_PEAK_DROP_PCT", 0.015)          # 1.5% drop from peak after breakeven
@@ -123,8 +124,8 @@ DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
         "breakeven_activation_pct": env_float("SCALPER_BREAKEVEN_ACT", 0.006),
         "trail_activation_pct": env_float("SCALPER_TRAIL_ACT", 1.0),
         "trail_pct": env_float("SCALPER_TRAIL_PCT", 0.025),
-        "partial_tp_trigger_pct": 0.0,
-        "partial_tp_ratio": 0.0,
+        "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+        "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
         "floor_chase": 1,
         "flat_max_minutes": env_int("SCALPER_FLAT_MINS", 720),
         "flat_range_pct": env_float("SCALPER_FLAT_RANGE", 0.015),
@@ -172,8 +173,8 @@ SIGNAL_EXIT_PROFILE_OVERLAYS: dict[str, dict[str, dict[str, float | int]]] = {
             "breakeven_activation_pct": 0.006,
             "trail_activation_pct": 1.0,
             "trail_pct": 0.025,
-            "partial_tp_trigger_pct": 0.0,
-            "partial_tp_ratio": 0.0,
+            "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+            "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
             "flat_max_minutes": 720,
             "flat_range_pct": 0.015,
             "flat_min_profit_pct": 0.005,
@@ -182,8 +183,8 @@ SIGNAL_EXIT_PROFILE_OVERLAYS: dict[str, dict[str, dict[str, float | int]]] = {
             "breakeven_activation_pct": 0.006,
             "trail_activation_pct": 1.0,
             "trail_pct": 0.025,
-            "partial_tp_trigger_pct": 0.0,
-            "partial_tp_ratio": 0.0,
+            "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+            "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
             "flat_max_minutes": 960,
             "flat_range_pct": 0.020,
             "flat_min_profit_pct": 0.008,
@@ -192,8 +193,8 @@ SIGNAL_EXIT_PROFILE_OVERLAYS: dict[str, dict[str, dict[str, float | int]]] = {
             "breakeven_activation_pct": 0.006,
             "trail_activation_pct": 1.0,
             "trail_pct": 0.020,
-            "partial_tp_trigger_pct": 0.0,
-            "partial_tp_ratio": 0.0,
+            "partial_tp_trigger_pct": SCALPER_PARTIAL_TP_PCT,
+            "partial_tp_ratio": SCALPER_PARTIAL_TP_RATIO_CAP,
             "flat_max_minutes": 720,
             "flat_range_pct": 0.015,
             "flat_min_profit_pct": 0.005,
@@ -399,8 +400,15 @@ def initialize_exit_state(
     if trade.get("atr_pct") is None and atr_pct is not None:
         trade["atr_pct"] = atr_pct
     if strategy_name == "SCALPER":
-        trade["partial_tp_ratio"] = 0.0
-        trade["partial_tp_price"] = None
+        min_score = SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE if entry_signal.upper() == "OVERSOLD" else SCALPER_PARTIAL_TP_MIN_SCORE
+        score = float(trade.get("score") or 0.0)
+        if score < min_score or float(trade.get("partial_tp_ratio") or 0.0) <= 0:
+            trade["partial_tp_ratio"] = 0.0
+            trade["partial_tp_price"] = None
+        else:
+            trade["partial_tp_ratio"] = min(float(trade.get("partial_tp_ratio") or 0.0), SCALPER_PARTIAL_TP_RATIO_CAP)
+            if trade.get("partial_tp_price") is None:
+                trade["partial_tp_price"] = entry_price * (1 + SCALPER_PARTIAL_TP_PCT)
     return trade
 
 
@@ -710,7 +718,7 @@ def evaluate_trade_action(
         if atr_pct is not None and atr_mult > 0:
             peak_drop_pct = max(peak_drop_pct, atr_pct * atr_mult)
         drop_from_peak = (highest_price - current_price) / highest_price if highest_price > 0 else 0.0
-        current_above_breakeven = current_price >= calculate_true_breakeven(entry_price)
+        current_above_breakeven = current_price >= entry_price
         if drop_from_peak >= peak_drop_pct and current_above_breakeven:
             return {"action": "exit", "reason": "PROTECT_STOP", "price": current_price}
 

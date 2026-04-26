@@ -200,8 +200,9 @@ def _moonshot_exit_profile(
 
 
 def _moonshot_social_enabled() -> bool:
-    # Disabled: Anthropic API reserved for post-trade loss analysis only
-    return False
+    if not env_bool("WEB_SEARCH_ENABLED", False):
+        return False
+    return bool(env_str("ANTHROPIC_API_KEY", "").strip())
 
 
 def _parse_json_object(text: str) -> dict[str, object] | None:
