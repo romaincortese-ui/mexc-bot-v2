@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 import hashlib
 import hmac
 import logging
 import math
+import random
+import re
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -20,11 +23,29 @@ from mexcbot.marketdata import build_kline_frame
 log = logging.getLogger(__name__)
 
 ACCOUNT_SNAPSHOT_TTL = 15.0
+ACCOUNT_DATA_TTL = env_float("MEXC_ACCOUNT_DATA_TTL", 30.0)
+ACCOUNT_FAILURE_COOLDOWN_SECONDS = env_float("MEXC_ACCOUNT_FAILURE_COOLDOWN_SECONDS", 120.0)
 CHASE_LIMIT_TIMEOUT = env_float("CHASE_LIMIT_TIMEOUT", 2.5)
 CHASE_LIMIT_RETRIES = env_int("CHASE_LIMIT_RETRIES", 3)
 USE_MAKER_ORDERS = env_bool("USE_MAKER_ORDERS", True)
 MAKER_ORDER_TIMEOUT_SEC = env_float("MAKER_ORDER_TIMEOUT_SEC", 2.5)
 MEXC_RECV_WINDOW_MS = env_int("MEXC_RECV_WINDOW_MS", 5000)
+MEXC_PRIVATE_RETRY_ATTEMPTS = env_int("MEXC_PRIVATE_RETRY_ATTEMPTS", 2)
+MEXC_PRIVATE_RETRY_BACKOFF_SECONDS = env_float("MEXC_PRIVATE_RETRY_BACKOFF_SECONDS", 0.75)
+MEXC_PRIVATE_RETRY_MAX_BACKOFF_SECONDS = env_float("MEXC_PRIVATE_RETRY_MAX_BACKOFF_SECONDS", 5.0)
+MEXC_PRIVATE_WEIGHT_LIMIT_PER_MINUTE = env_int("MEXC_PRIVATE_WEIGHT_LIMIT_PER_MINUTE", 900)
+MEXC_PRIVATE_WEIGHT_BUFFER = env_int("MEXC_PRIVATE_WEIGHT_BUFFER", 50)
+MEXC_PRIVATE_RATE_MAX_WAIT_SECONDS = env_float("MEXC_PRIVATE_RATE_MAX_WAIT_SECONDS", 5.0)
+PRIVATE_RATE_WINDOW_SECONDS = 60.0
+SENSITIVE_QUERY_RE = re.compile(r"(?i)(signature=)[^&\s)]+")
+
+
+class MexcPrivateRequestError(RuntimeError):
+    def __init__(self, message: str, *, path: str, retry_after: float = 0.0, transient: bool = True):
+        super().__init__(message)
+        self.path = path
+        self.retry_after = max(0.0, float(retry_after or 0.0))
+        self.transient = transient
 
 
 @dataclass(slots=True)
@@ -45,7 +66,149 @@ class MexcClient:
         self.config = config
         self.session = requests.Session()
         self._account_snapshot_cache = {"at": 0.0, "free_usdt": 0.0, "total_equity": 0.0}
+        self._account_data_cache: dict[str, Any] = {"at": 0.0, "data": {}}
+        self._account_failure_cooldown_until = 0.0
+        self._last_account_error = ""
+        self._private_request_events: deque[tuple[float, int]] = deque()
+        self._private_rate_limited_until = 0.0
         self.last_buy_error = ""
+
+    def _sanitize_error_text(self, value: object) -> str:
+        text = str(value)
+        text = SENSITIVE_QUERY_RE.sub(r"\1<redacted>", text)
+        return text.replace(self.config.api_secret, "<redacted>") if self.config.api_secret else text
+
+    def _private_endpoint_weight(self, path: str) -> int:
+        if path == "/api/v3/account":
+            return 10
+        if path == "/api/v3/openOrders":
+            return 3
+        if path == "/api/v3/myTrades":
+            return 5
+        return 1
+
+    def _prune_private_rate_events(self, now: float) -> None:
+        cutoff = now - PRIVATE_RATE_WINDOW_SECONDS
+        while self._private_request_events and self._private_request_events[0][0] <= cutoff:
+            self._private_request_events.popleft()
+
+    def _private_rate_used(self, now: float | None = None) -> int:
+        current = time.time() if now is None else now
+        self._prune_private_rate_events(current)
+        return sum(weight for _at, weight in self._private_request_events)
+
+    def _private_rate_wait_seconds(self, path: str, now: float | None = None) -> float:
+        current = time.time() if now is None else now
+        self._prune_private_rate_events(current)
+        if self._private_rate_limited_until > current:
+            return self._private_rate_limited_until - current
+        limit = max(1, MEXC_PRIVATE_WEIGHT_LIMIT_PER_MINUTE - max(0, MEXC_PRIVATE_WEIGHT_BUFFER))
+        weight = self._private_endpoint_weight(path)
+        used = sum(event_weight for _at, event_weight in self._private_request_events)
+        if used + weight <= limit:
+            return 0.0
+        running = used
+        for event_at, event_weight in self._private_request_events:
+            running -= event_weight
+            if running + weight <= limit:
+                return max(0.0, event_at + PRIVATE_RATE_WINDOW_SECONDS - current)
+        return PRIVATE_RATE_WINDOW_SECONDS
+
+    def get_private_rate_limit_status(self) -> dict[str, float | int]:
+        now = time.time()
+        used = self._private_rate_used(now)
+        limit = max(1, MEXC_PRIVATE_WEIGHT_LIMIT_PER_MINUTE - max(0, MEXC_PRIVATE_WEIGHT_BUFFER))
+        return {
+            "used_weight_1m": used,
+            "limit_weight_1m": limit,
+            "remaining_weight_1m": max(0, limit - used),
+            "cooldown_seconds": max(0.0, self._private_rate_limited_until - now),
+        }
+
+    def _wait_for_private_budget(self, path: str) -> None:
+        wait_seconds = self._private_rate_wait_seconds(path)
+        if wait_seconds <= 0:
+            return
+        if wait_seconds > MEXC_PRIVATE_RATE_MAX_WAIT_SECONDS:
+            raise MexcPrivateRequestError(
+                f"MEXC private rate budget exhausted for {path}; next local retry in {wait_seconds:.1f}s",
+                path=path,
+                retry_after=wait_seconds,
+            )
+        log.warning("MEXC private rate budget near limit for %s; waiting %.1fs", path, wait_seconds)
+        time.sleep(wait_seconds)
+
+    def _record_private_request_weight(self, path: str) -> None:
+        now = time.time()
+        self._prune_private_rate_events(now)
+        self._private_request_events.append((now, self._private_endpoint_weight(path)))
+
+    def _parse_retry_after(self, response: requests.Response | None) -> float:
+        if response is None:
+            return 0.0
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        if retry_after is None:
+            return 0.0
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _update_private_rate_headers(self, response: requests.Response) -> None:
+        headers = getattr(response, "headers", {}) or {}
+        used_values: list[int] = []
+        for key in (
+            "X-MBX-USED-WEIGHT-1M",
+            "X-MBX-USED-WEIGHT",
+            "X-MEXC-USED-WEIGHT-1M",
+            "X-MEXC-USED-WEIGHT",
+        ):
+            value = headers.get(key) or headers.get(key.lower())
+            if value is None:
+                continue
+            try:
+                used_values.append(int(float(value)))
+            except (TypeError, ValueError):
+                continue
+        retry_after = self._parse_retry_after(response)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        limit = max(1, MEXC_PRIVATE_WEIGHT_LIMIT_PER_MINUTE - max(0, MEXC_PRIVATE_WEIGHT_BUFFER))
+        if retry_after > 0 or status_code in {418, 429}:
+            self._private_rate_limited_until = max(self._private_rate_limited_until, time.time() + max(retry_after, 60.0 if status_code in {418, 429} else 0.0))
+        elif used_values and max(used_values) >= limit:
+            self._private_rate_limited_until = max(self._private_rate_limited_until, time.time() + PRIVATE_RATE_WINDOW_SECONDS)
+
+    def _is_retryable_private_failure(self, method: str, response: requests.Response | None, exc: Exception | None = None) -> bool:
+        if method.lower() != "get":
+            return False
+        if exc is not None:
+            return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+        if response is None:
+            return False
+        return int(getattr(response, "status_code", 0) or 0) in {408, 418, 429, 500, 502, 503, 504}
+
+    def _private_retry_delay(self, attempt: int, response: requests.Response | None = None, retry_after: float = 0.0) -> float:
+        header_delay = self._parse_retry_after(response)
+        if retry_after > 0:
+            header_delay = max(header_delay, retry_after)
+        if header_delay > 0:
+            return min(MEXC_PRIVATE_RETRY_MAX_BACKOFF_SECONDS, header_delay)
+        base = max(0.0, MEXC_PRIVATE_RETRY_BACKOFF_SECONDS)
+        jitter = random.uniform(0.0, base / 3.0) if base > 0 else 0.0
+        return min(MEXC_PRIVATE_RETRY_MAX_BACKOFF_SECONDS, base * (2 ** max(0, attempt)) + jitter)
+
+    def _build_private_error(self, method: str, path: str, message: str, *, response: requests.Response | None = None, retry_after: float = 0.0) -> MexcPrivateRequestError:
+        status_code = int(getattr(response, "status_code", 0) or 0) if response is not None else 0
+        transient = status_code in {0, 408, 418, 429, 500, 502, 503, 504}
+        rate_status = self.get_private_rate_limit_status()
+        safe_message = self._sanitize_error_text(message)
+        if retry_after <= 0 and response is not None:
+            retry_after = self._parse_retry_after(response)
+        if retry_after > 0:
+            safe_message = f"{safe_message} | next retry in {retry_after:.1f}s"
+        safe_message = f"MEXC private {method.upper()} {path} failed: {safe_message} | rate={rate_status}"
+        return MexcPrivateRequestError(safe_message, path=path, retry_after=retry_after, transient=transient)
 
     def _symbol_info(self, symbol: str) -> dict[str, Any]:
         info = self.public_get("/api/v3/exchangeInfo")
@@ -192,25 +355,50 @@ class MexcClient:
         return diagnostics
 
     def _request_private(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
-        items = self._canonical_private_items(params)
-        payload = items + [("signature", self._sign(items))]
-        response = self.session.request(
-            method,
-            self.config.base_url + path,
-            params=payload,
-            headers={"X-MEXC-APIKEY": self.config.api_key},
-            timeout=10,
-        )
-        if not response.ok:
-            body = response.text[:500] if response.text else ""
+        attempts = max(1, MEXC_PRIVATE_RETRY_ATTEMPTS if method.lower() == "get" else 1)
+        for attempt in range(attempts):
+            items = self._canonical_private_items(params)
+            payload = items + [("signature", self._sign(items))]
+            try:
+                self._wait_for_private_budget(path)
+                self._record_private_request_weight(path)
+                response = self.session.request(
+                    method,
+                    self.config.base_url + path,
+                    params=payload,
+                    headers={"X-MEXC-APIKEY": self.config.api_key},
+                    timeout=10,
+                )
+            except MexcPrivateRequestError:
+                raise
+            except requests.RequestException as exc:
+                retryable = self._is_retryable_private_failure(method, None, exc)
+                if retryable and attempt < attempts - 1:
+                    delay = self._private_retry_delay(attempt)
+                    log.warning("MEXC private %s %s transient error; retrying in %.1fs: %s", method.upper(), path, delay, self._sanitize_error_text(exc))
+                    time.sleep(delay)
+                    continue
+                raise self._build_private_error(method, path, str(exc)) from exc
+
+            self._update_private_rate_headers(response)
+            if response.ok:
+                return response.json()
+
+            body = getattr(response, "text", "")[:500] if getattr(response, "text", "") else ""
             diagnostics = self.get_private_request_diagnostics(path, params)
             diagnostics.pop("query", None)
-            log.error("MEXC private %s failed: %s | body=%s | diag=%s", method.upper(), path, body, diagnostics)
-            raise requests.HTTPError(
-                f"{response.status_code} {response.reason} for {path} | body={body} | diag={diagnostics}",
-                response=response,
-            )
-        return response.json()
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            reason = str(getattr(response, "reason", "") or "")
+            message = f"{status_code} {reason} for {path} | body={body} | diag={diagnostics}"
+            retryable = self._is_retryable_private_failure(method, response)
+            if retryable and attempt < attempts - 1:
+                delay = self._private_retry_delay(attempt, response)
+                log.warning("MEXC private %s %s returned %s; retrying in %.1fs", method.upper(), path, status_code, delay)
+                time.sleep(delay)
+                continue
+            error = self._build_private_error(method, path, message, response=response)
+            log.error("%s", error)
+            raise error
 
     def public_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         response = self.session.get(self.config.base_url + path, params=params or {}, timeout=10)
@@ -438,7 +626,7 @@ class MexcClient:
                 "requested": [],
             }
 
-        account = self.private_get("/api/v3/account")
+        account = self.get_account_data(force_refresh=True, allow_stale=False)
         balances = account.get("balances", []) if isinstance(account, dict) else []
         candidates = {
             str(balance.get("asset") or ""): float(balance.get("free", 0.0) or 0.0)
@@ -539,6 +727,68 @@ class MexcClient:
                 time.sleep(0.5 * (attempt + 1))
         return None
 
+    def get_account_endpoint_status(self) -> dict[str, object]:
+        now = time.time()
+        cached_at = float(self._account_data_cache.get("at", 0.0) or 0.0)
+        return {
+            "cooldown_seconds": max(0.0, self._account_failure_cooldown_until - now),
+            "next_retry_at": self._account_failure_cooldown_until if self._account_failure_cooldown_until > now else 0.0,
+            "cache_age_seconds": max(0.0, now - cached_at) if cached_at > 0 else None,
+            "last_error": self._last_account_error,
+            "rate": self.get_private_rate_limit_status(),
+        }
+
+    def get_account_data(self, *, force_refresh: bool = False, allow_stale: bool = True) -> dict[str, Any]:
+        if self.config.paper_trade:
+            total = float(getattr(self.config, "trade_budget", 0.0) or 0.0)
+            return {"balances": [{"asset": "USDT", "free": str(total), "locked": "0"}]}
+
+        now = time.time()
+        cached_at = float(self._account_data_cache.get("at", 0.0) or 0.0)
+        cached_data = dict(self._account_data_cache.get("data", {}) or {})
+        if not force_refresh and cached_at > 0 and now - cached_at < ACCOUNT_DATA_TTL:
+            return cached_data
+
+        cooldown_left = self._account_failure_cooldown_until - now
+        if cooldown_left > 0:
+            if allow_stale and cached_data:
+                log.warning("MEXC account endpoint cooling down %.1fs; using cached account payload", cooldown_left)
+                return cached_data
+            raise MexcPrivateRequestError(
+                f"MEXC account endpoint cooling down after failure; next retry in {cooldown_left:.1f}s | last_error={self._last_account_error}",
+                path="/api/v3/account",
+                retry_after=cooldown_left,
+            )
+
+        try:
+            data = self.private_get("/api/v3/account")
+        except MexcPrivateRequestError as exc:
+            self._last_account_error = self._sanitize_error_text(exc)
+            cooldown = max(ACCOUNT_FAILURE_COOLDOWN_SECONDS, exc.retry_after)
+            self._account_failure_cooldown_until = time.time() + cooldown
+            if allow_stale and cached_data:
+                log.warning("MEXC account fetch failed; using stale cached account payload for %.1fs: %s", cooldown, self._last_account_error)
+                return cached_data
+            raise
+        except Exception as exc:
+            self._last_account_error = self._sanitize_error_text(exc)
+            self._account_failure_cooldown_until = time.time() + ACCOUNT_FAILURE_COOLDOWN_SECONDS
+            if allow_stale and cached_data:
+                log.warning("MEXC account fetch failed; using stale cached account payload: %s", self._last_account_error)
+                return cached_data
+            raise MexcPrivateRequestError(
+                f"MEXC account endpoint unavailable: {self._last_account_error}",
+                path="/api/v3/account",
+                retry_after=ACCOUNT_FAILURE_COOLDOWN_SECONDS,
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise MexcPrivateRequestError("MEXC account endpoint returned a non-object payload", path="/api/v3/account", transient=False)
+        self._account_data_cache = {"at": time.time(), "data": data}
+        self._account_failure_cooldown_until = 0.0
+        self._last_account_error = ""
+        return data
+
     def get_live_account_snapshot(self, force_refresh: bool = False) -> dict[str, float]:
         if self.config.paper_trade:
             total = float(getattr(self.config, "trade_budget", 0.0) or 0.0)
@@ -550,7 +800,7 @@ class MexcClient:
             return cached
 
         try:
-            data = self.private_get("/api/v3/account")
+            data = self.get_account_data(force_refresh=force_refresh, allow_stale=True)
             balances = data.get("balances", []) if isinstance(data, dict) else []
             free_usdt = 0.0
             total_equity = 0.0
@@ -597,7 +847,7 @@ class MexcClient:
             return 0.0
         asset = symbol[:-4] if symbol.endswith("USDT") else symbol
         try:
-            data = self.private_get("/api/v3/account")
+            data = self.get_account_data(force_refresh=False, allow_stale=False)
         except Exception as exc:
             log.error("Failed to fetch balance for %s: %s", symbol, exc)
             return 0.0
@@ -688,7 +938,7 @@ class MexcClient:
             return self.config.trade_budget
         if asset == "USDT":
             return float(self.get_live_account_snapshot().get("free_usdt", 0.0) or 0.0)
-        data = self.private_get("/api/v3/account")
+        data = self.get_account_data(force_refresh=False, allow_stale=True)
         for balance in data.get("balances", []):
             if balance.get("asset") == asset:
                 return float(balance.get("free", 0.0) or 0.0)

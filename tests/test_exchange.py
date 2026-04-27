@@ -3,7 +3,9 @@ import hmac
 from urllib.parse import urlencode
 
 import pytest
+import requests
 
+import mexcbot.exchange as exchange_module
 from mexcbot.exchange import MexcClient
 
 
@@ -116,6 +118,58 @@ def test_get_private_request_diagnostics_masks_key_and_omits_secret(monkeypatch)
     assert diagnostics["path"] == "/api/v3/account"
     assert "secret" not in str(diagnostics).lower()
     assert diagnostics["signature_prefix"]
+
+
+def test_private_request_error_sanitizes_signature_from_connection_error(monkeypatch):
+    client = MexcClient(DummyConfig())
+    monkeypatch.setattr(exchange_module, "MEXC_PRIVATE_RETRY_ATTEMPTS", 1)
+
+    def fake_request(method, url, params=None, headers=None, timeout=None):
+        raise requests.ConnectionError(
+            "HTTPSConnectionPool(host='api.mexc.com', port=443): Max retries exceeded with url: "
+            "/api/v3/account?recvWindow=5000&timestamp=1777309271518&signature=fc01cb7bcec914ce23dc"
+        )
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+
+    with pytest.raises(exchange_module.MexcPrivateRequestError) as exc_info:
+        client.private_get("/api/v3/account")
+
+    message = str(exc_info.value)
+    assert "signature=<redacted>" in message
+    assert "fc01cb7b" not in message
+
+
+def test_get_account_data_uses_stale_cache_during_failure_cooldown(monkeypatch):
+    client = MexcClient(DummyConfig())
+    now = [1000.0]
+    calls = []
+    monkeypatch.setattr(exchange_module.time, "time", lambda: now[0])
+
+    def fake_private_get(path, params=None):
+        calls.append(path)
+        if len(calls) == 1:
+            return {"balances": [{"asset": "USDT", "free": "80", "locked": "0"}]}
+        raise exchange_module.MexcPrivateRequestError(
+            "MEXC private GET /api/v3/account failed: url=/api/v3/account?signature=<redacted>",
+            path="/api/v3/account",
+            retry_after=30,
+        )
+
+    monkeypatch.setattr(client, "private_get", fake_private_get)
+
+    fresh = client.get_account_data(force_refresh=True, allow_stale=False)
+    now[0] += 60.0
+    stale = client.get_account_data(force_refresh=True, allow_stale=True)
+
+    assert fresh == stale
+    assert calls == ["/api/v3/account", "/api/v3/account"]
+    status = client.get_account_endpoint_status()
+    assert float(status["cooldown_seconds"]) > 0
+
+    with pytest.raises(exchange_module.MexcPrivateRequestError):
+        client.get_account_data(force_refresh=True, allow_stale=False)
+    assert calls == ["/api/v3/account", "/api/v3/account"]
 
 
 def test_get_live_account_snapshot_counts_locked_balances_and_marks_non_usdt_assets(monkeypatch):

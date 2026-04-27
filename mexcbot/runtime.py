@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from html import escape
 import json
 import logging
 import logging.handlers
@@ -89,6 +90,8 @@ USE_REVIEW_VALIDATION = env_int("USE_REVIEW_VALIDATION", 0)
 # strategies get RECONCILE_DEFAULT_SL_PCT (0.10 = -10%), tighter than the
 # global HARD_SL_FLOOR_PCT (0.20) and the old STOP_LOSS_PCT default (0.40).
 RECONCILE_DEFAULT_SL_PCT = env_float("RECONCILE_DEFAULT_SL_PCT", 0.10)
+RECONCILE_MIN_INTERVAL_SECONDS = env_float("RECONCILE_MIN_INTERVAL_SECONDS", 300.0)
+RECONCILE_FAILURE_COOLDOWN_SECONDS = env_float("RECONCILE_FAILURE_COOLDOWN_SECONDS", 300.0)
 DEFENSIVE_EXIT_REASONS = {
     "STOP_LOSS",
     "BREAKEVEN_STOP",
@@ -248,6 +251,8 @@ class LiveBotRuntime:
         self._last_daily_summary_date = ""
         self._last_dust_sweep_date = ""
         self._last_weekly_summary_key = ""
+        self._last_reconcile_attempt_at = 0.0
+        self._reconcile_cooldown_until = 0.0
         self._session_anchor_equity: float | None = None
         self._daily_anchor_equity: float | None = None
         self._daily_anchor_date = ""
@@ -587,6 +592,26 @@ class LiveBotRuntime:
                 continue
             mins_left = max(1, math.ceil((expires_at - now_ts) / 60.0))
             lines.append(f"⛔ {symbol} symbol gate ({mins_left} min)")
+        return lines
+
+    def _integration_status_lines(self) -> list[str]:
+        status_fn = getattr(self.client, "get_account_endpoint_status", None)
+        if not callable(status_fn):
+            return []
+        try:
+            status = status_fn()
+        except Exception:
+            return []
+        if not isinstance(status, dict):
+            return []
+        lines: list[str] = []
+        account_cooldown = float(status.get("cooldown_seconds", 0.0) or 0.0)
+        if account_cooldown > 0:
+            lines.append(f"⚠️ MEXC account cooldown ({math.ceil(account_cooldown)}s)")
+        rate = status.get("rate") if isinstance(status.get("rate"), dict) else {}
+        rate_cooldown = float(rate.get("cooldown_seconds", 0.0) or 0.0) if isinstance(rate, dict) else 0.0
+        if rate_cooldown > 0:
+            lines.append(f"⚠️ MEXC private API rate cooldown ({math.ceil(rate_cooldown)}s)")
         return lines
 
     def _commands_hint(self) -> str:
@@ -1656,6 +1681,7 @@ class LiveBotRuntime:
             "━━━━━━━━━━━━━━━",
         ]
         lines.extend(self._pause_lines())
+        lines.extend(self._integration_status_lines())
         if lines[-1] != "━━━━━━━━━━━━━━━":
             lines.append("━━━━━━━━━━━━━━━")
         if not self.open_trades:
@@ -2232,15 +2258,50 @@ class LiveBotRuntime:
             tp_order_id=tp_order_id,
         )
 
-    def _reconcile_open_positions(self, *, notify: bool = False) -> dict[str, int]:
+    def _reconcile_open_positions(self, *, notify: bool = False, force: bool = False) -> dict[str, object]:
+        tracked_symbols: list[str] = [trade.symbol for trade in self.open_trades]
+        base_stats: dict[str, object] = {
+            "stale": 0,
+            "untracked": 0,
+            "orphaned": 0,
+            "tracked": len(tracked_symbols),
+            "tracked_symbols": tracked_symbols,
+            "skipped": 0,
+            "reason": "",
+        }
         if self.config.paper_trade:
-            return {"stale": 0, "untracked": 0, "orphaned": 0, "tracked": len(self.open_trades), "tracked_symbols": []}
+            return base_stats
+
+        now_ts = time.time()
+        if not force and self._reconcile_cooldown_until > now_ts:
+            wait_seconds = self._reconcile_cooldown_until - now_ts
+            reason = f"reconcile cooling down after private API failure; next retry in {wait_seconds:.0f}s"
+            if notify:
+                self._record_activity("Reconcile deferred: cooldown")
+            return {**base_stats, "skipped": 1, "reason": reason}
+        if not force and self._last_reconcile_attempt_at > 0 and now_ts - self._last_reconcile_attempt_at < RECONCILE_MIN_INTERVAL_SECONDS:
+            wait_seconds = RECONCILE_MIN_INTERVAL_SECONDS - (now_ts - self._last_reconcile_attempt_at)
+            reason = f"automatic reconcile interval active; next retry in {wait_seconds:.0f}s"
+            return {**base_stats, "skipped": 1, "reason": reason}
+        account_status_fn = getattr(self.client, "get_account_endpoint_status", None)
+        if not force and callable(account_status_fn):
+            status = account_status_fn()
+            cooldown_seconds = float(status.get("cooldown_seconds", 0.0) or 0.0) if isinstance(status, dict) else 0.0
+            if cooldown_seconds > 0:
+                reason = f"MEXC account endpoint cooling down; next retry in {cooldown_seconds:.0f}s"
+                return {**base_stats, "skipped": 1, "reason": reason}
+
+        self._last_reconcile_attempt_at = now_ts
         stale = 0
         untracked = 0
         orphaned = 0
         tracked_symbols: list[str] = []
         try:
-            account = self.client.private_get("/api/v3/account")
+            get_account_data = getattr(self.client, "get_account_data", None)
+            if callable(get_account_data):
+                account = get_account_data(force_refresh=force, allow_stale=False)
+            else:
+                account = self.client.private_get("/api/v3/account")
             balances = {
                 str(balance.get("asset") or ""): float(balance.get("free", 0.0) or 0.0) + float(balance.get("locked", 0.0) or 0.0)
                 for balance in account.get("balances", [])
@@ -2304,14 +2365,25 @@ class LiveBotRuntime:
             if stale or untracked or orphaned:
                 self._save_state()
         except Exception as exc:
-            log.error("Reconcile failed: %s", exc)
-            self._notify_once("reconcile-failed", f"⚠️ <b>Reconcile failed</b>\n{str(exc)[:200]}")
+            self._reconcile_cooldown_until = time.time() + RECONCILE_FAILURE_COOLDOWN_SECONDS
+            sanitizer = getattr(self.client, "_sanitize_error_text", None)
+            safe_error = sanitizer(exc) if callable(sanitizer) else str(exc)
+            safe_error = safe_error[:300]
+            log.error("Reconcile failed: %s", safe_error)
+            self._record_activity("Reconcile failed: private API")
+            self._notify_once(
+                "reconcile-failed",
+                f"⚠️ <b>Reconcile failed</b>\n{escape(safe_error)}\nNext retry in {RECONCILE_FAILURE_COOLDOWN_SECONDS:.0f}s.",
+            )
+            return {**base_stats, "skipped": 1, "reason": safe_error}
         return {
             "stale": stale,
             "untracked": untracked,
             "orphaned": orphaned,
             "tracked": len(tracked_symbols),
             "tracked_symbols": tracked_symbols,
+            "skipped": 0,
+            "reason": "",
         }
 
     def _handle_telegram_commands(self) -> None:
@@ -2433,7 +2505,11 @@ class LiveBotRuntime:
                 self._record_activity(f"Emergency close closed={closed} failed={failed}")
                 self._notify(f"✅ Closed {closed} position(s)." + (f" Failed: {failed}." if failed else ""))
             elif text.startswith("/reconcile"):
-                stats = self._reconcile_open_positions(notify=True)
+                stats = self._reconcile_open_positions(notify=True, force=True)
+                if int(stats.get("skipped", 0) or 0):
+                    reason = str(stats.get("reason") or "MEXC account endpoint unavailable")
+                    self._notify("🔧 <b>Reconcile deferred</b>\n" + escape(reason[:500]))
+                    continue
                 tracked_symbols = stats.get("tracked_symbols") or []
                 tracked_count = int(stats.get("tracked", 0) or 0)
                 lines = [

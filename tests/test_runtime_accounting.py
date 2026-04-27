@@ -1725,6 +1725,29 @@ def test_reconcile_reconstructs_untracked_holding_into_open_trades():
     assert any("Reconciled holdings" in text for text, _mode in runtime.telegram.sent_messages)
 
 
+def test_reconcile_defers_during_account_endpoint_cooldown():
+    client = StubClient()
+    runtime = LiveBotRuntime(_config(), client)
+
+    calls = []
+
+    def get_account_endpoint_status():
+        return {"cooldown_seconds": 45.0, "rate": {}}
+
+    def get_account_data(force_refresh: bool = False, allow_stale: bool = True):
+        calls.append((force_refresh, allow_stale))
+        raise AssertionError("account endpoint should not be called while cooling down")
+
+    client.get_account_endpoint_status = get_account_endpoint_status
+    client.get_account_data = get_account_data
+
+    stats = runtime._reconcile_open_positions()
+
+    assert stats["skipped"] == 1
+    assert "cooling down" in str(stats["reason"])
+    assert calls == []
+
+
 def test_daily_summary_reports_previous_utc_day_at_midnight():
     runtime = LiveBotRuntime(_config(telegram_chat_id="12345"), StubClient())
     runtime.telegram = StubTelegram()
