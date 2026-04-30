@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from mexcbot.event_overlay import (
     UnlockEvent,
+    evaluate_event_state_overlay,
     evaluate_exchange_inflow_gate,
     evaluate_stablecoin_flow_gate,
     evaluate_unlock_gate,
@@ -87,3 +88,45 @@ def test_small_exchange_inflow_ignored():
     d = evaluate_exchange_inflow_gate(btc_inflow_1h=500.0)
     assert d.risk_off is False
     assert d.sizing_multiplier == 1.0
+
+
+# ---- Composite state ----------------------------------------------------
+
+def test_event_state_overlay_combines_active_risks():
+    state = {
+        "generated_at": BASE.isoformat(),
+        "ttl_seconds": 1800,
+        "stablecoin_supply_change_24h_frac": -0.012,
+        "btc_exchange_inflow_1h": 7_500,
+        "unlock_events": [
+            {
+                "symbol": "ENAUSDT",
+                "unlock_at": (BASE + timedelta(hours=24)).isoformat(),
+                "pct_of_circulating": 0.03,
+            }
+        ],
+        "events": [
+            {"scope": "market", "direction": "risk_off", "severity": 0.60, "title": "exchange enforcement"}
+        ],
+    }
+
+    d = evaluate_event_state_overlay(symbol="ENAUSDT", now=BASE, state=state)
+
+    assert d.sizing_multiplier == 0.5 * 0.7 * 0.5 * 0.7
+    assert "unlock_within_72h:1_event(s)" in d.reasons
+    assert "stable_supply_shrinking:-0.0120<=-0.01" in d.reasons
+    assert "exchange_inflow_spike:7500>=5000.0" in d.reasons
+    assert "crypto_event_risk:0.60" in d.reasons
+
+
+def test_event_state_overlay_fails_open_when_stale():
+    state = {
+        "generated_at": (BASE - timedelta(hours=2)).isoformat(),
+        "ttl_seconds": 1800,
+        "market_risk_score": 1.0,
+    }
+
+    d = evaluate_event_state_overlay(symbol="BTCUSDT", now=BASE, state=state)
+
+    assert d.sizing_multiplier == 1.0
+    assert d.reasons == ()

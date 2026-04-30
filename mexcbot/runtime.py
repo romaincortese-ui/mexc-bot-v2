@@ -27,6 +27,7 @@ from mexcbot.config import LiveConfig, env_bool, env_float, env_int
 from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
 from mexcbot.exchange import MexcClient
 from mexcbot.exits import evaluate_trade_action
+from mexcbot.event_overlay import evaluate_event_state_overlay
 from mexcbot.indicators import calc_ema
 from mexcbot.marketdata import fetch_fear_and_greed
 from mexcbot.models import Opportunity, Trade
@@ -83,6 +84,11 @@ USE_FIFO_TAX_LOTS = env_int("USE_FIFO_TAX_LOTS", 0)
 # §2.10 Review override validator — reject Anthropic-approved overrides when
 # the backing review does not meet OOS profit-factor and sample thresholds.
 USE_REVIEW_VALIDATION = env_int("USE_REVIEW_VALIDATION", 0)
+USE_CRYPTO_EVENT_OVERLAY = env_int("USE_CRYPTO_EVENT_OVERLAY", env_int("USE_EVENT_OVERLAY", 1))
+CRYPTO_EVENT_REDIS_KEY = os.environ.get("CRYPTO_EVENT_REDIS_KEY", "mexc:crypto_event_intelligence").strip()
+CRYPTO_EVENT_STATE_FILE = os.environ.get("CRYPTO_EVENT_STATE_FILE", "").strip()
+CRYPTO_EVENT_REFRESH_SECONDS = env_float("CRYPTO_EVENT_REFRESH_SECONDS", 300.0)
+CRYPTO_EVENT_STALE_SECONDS = env_int("CRYPTO_EVENT_STALE_SECONDS", 1800)
 # SL applied when we reconcile an untracked position (manually-opened, orphaned,
 # or surviving a bot restart without recoverable state). Must not be looser than
 # what the strategy would have picked, or we silently widen real risk on restart.
@@ -262,6 +268,8 @@ class LiveBotRuntime:
         self._approved_review_overrides: dict[str, dict[str, object]] = {}
         self._recent_activity: deque[str] = deque(maxlen=RECENT_ACTIVITY_LIMIT)
         self._telegram_alert_timestamps: dict[str, float] = {}
+        self._crypto_event_state: dict[str, object] | None = None
+        self._last_crypto_event_refresh_at = 0.0
         # §2.9 FIFO lot ledger — created lazily when flag is enabled.
         self._fifo_lot_ledger = None
         self._state_path = Path(self.config.state_file) if self.config.state_file else None
@@ -2935,7 +2943,65 @@ class LiveBotRuntime:
         mult *= self._drawdown_kill_multiplier()
         mult *= self._fee_tier_multiplier()
         mult *= self._weekend_flatten_multiplier()
+        mult *= self._crypto_event_overlay_multiplier(opportunity)
         return max(0.0, mult)
+
+    def _refresh_crypto_event_state(self) -> None:
+        if not USE_CRYPTO_EVENT_OVERLAY:
+            return
+        now_ts = time.time()
+        if now_ts - self._last_crypto_event_refresh_at < max(30.0, CRYPTO_EVENT_REFRESH_SECONDS):
+            return
+        self._last_crypto_event_refresh_at = now_ts
+        if CRYPTO_EVENT_STATE_FILE:
+            try:
+                self._crypto_event_state = json.loads(Path(CRYPTO_EVENT_STATE_FILE).read_text(encoding="utf-8"))
+            except Exception as exc:
+                log.debug("Crypto event state file load failed: %s", exc)
+            return
+        if not self.config.redis_url or not CRYPTO_EVENT_REDIS_KEY:
+            return
+        try:
+            import redis
+
+            client = redis.Redis.from_url(self.config.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
+            raw = client.get(CRYPTO_EVENT_REDIS_KEY)
+            if not raw:
+                return
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            payload = json.loads(str(raw))
+            if isinstance(payload, dict):
+                self._crypto_event_state = payload
+        except Exception as exc:
+            log.debug("Crypto event Redis load failed: %s", exc)
+
+    def _crypto_event_overlay_multiplier(self, opportunity: Opportunity) -> float:
+        if not USE_CRYPTO_EVENT_OVERLAY:
+            opportunity.metadata.pop("event_overlay_mult", None)
+            opportunity.metadata.pop("event_overlay_reasons", None)
+            return 1.0
+        self._refresh_crypto_event_state()
+        try:
+            decision = evaluate_event_state_overlay(
+                symbol=opportunity.symbol,
+                now=datetime.now(timezone.utc),
+                state=self._crypto_event_state,
+                stale_after_seconds=CRYPTO_EVENT_STALE_SECONDS,
+            )
+        except Exception as exc:
+            log.debug("Crypto event overlay evaluation failed for %s: %s", opportunity.symbol, exc)
+            return 1.0
+        if decision.reasons:
+            opportunity.metadata["event_overlay_mult"] = round(decision.sizing_multiplier, 4)
+            opportunity.metadata["event_overlay_reasons"] = list(decision.reasons)
+            if decision.state_age_seconds is not None:
+                opportunity.metadata["event_overlay_state_age_seconds"] = round(decision.state_age_seconds, 1)
+        else:
+            opportunity.metadata.pop("event_overlay_mult", None)
+            opportunity.metadata.pop("event_overlay_reasons", None)
+            opportunity.metadata.pop("event_overlay_state_age_seconds", None)
+        return max(0.0, min(1.0, float(decision.sizing_multiplier)))
 
     def _existing_exposures_for_corr(self, total_equity: float) -> dict:
         if total_equity <= 0:
