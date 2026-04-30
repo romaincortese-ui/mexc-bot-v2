@@ -23,8 +23,19 @@ _PROD_FLAG_DEFAULTS = {
 for _key, _value in _PROD_FLAG_DEFAULTS.items():
     os.environ.setdefault(_key, _value)
 
-from mexcbot.runtime import run_bot  # noqa: E402  (import after env-var setup)
+
+def main() -> None:
+    role = os.environ.get("MEXC_BOT_ROLE", "trading").strip().lower()
+    if role in {"crypto_events", "crypto-events", "event_intelligence", "event-intelligence"}:
+        from run_crypto_event_intelligence import main as run_crypto_event_intelligence
+
+        run_crypto_event_intelligence()
+        return
+
+    from mexcbot.runtime import run_bot
+
+    run_bot()
 
 
 if __name__ == "__main__":
-    run_bot()
+    main()
