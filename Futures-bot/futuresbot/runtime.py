@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import math
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from futuresbot.models import FuturesPosition
 from futuresbot.review import load_daily_review
 from futuresbot.strategy import score_btc_futures_setup
 from futuresbot.calibration import apply_signal_calibration
+from futuresbot.event_overlay import evaluate_crypto_event_overlay
 
 
 log = logging.getLogger(__name__)
@@ -58,6 +60,25 @@ class FuturesRuntime:
         self._symbols_validated = False
         # Funding-rate cache: symbol -> (timestamp, rate). Refreshed lazily every hour.
         self._funding_cache: dict[str, tuple[float, float]] = {}
+        # P1 §8 (assessment): per-cycle gate-block aggregator. Populated by
+        # ``_fetch_signal`` and consumed by ``_log_cycle_summary`` to emit a
+        # single ``[CYCLE_SUMMARY]`` line instead of one ``[GATE_BLOCK]`` line
+        # per (cycle x symbol). Drastically reduces log volume on Railway and
+        # makes the "why isn't it trading?" signal unambiguous to the operator.
+        self._last_cycle_gate_blocks: dict[str, str] = {}
+        self._cycle_counter: int = 0
+        # Sprint 3 §3.9 — rolling slippage attribution store (lazy).
+        self._slippage_store: Any | None = None
+        # P1 (third assessment) §5 #1+#2 — resolved per-symbol taker fee rate
+        # used by the live cost-budget RR gate. Populated by
+        # ``_emit_contract_specs`` at boot from the MEXC contract-detail
+        # endpoint, with a documented fallback chain (api > default) so the
+        # strategy gate stops silently using the global env default for
+        # symbols where the venue reports a different rate.
+        self._symbol_taker_fee: dict[str, tuple[float, str]] = {}
+        self._crypto_event_state: dict[str, Any] | None = None
+        self._last_crypto_event_refresh_at = 0.0
+        self._last_crypto_event_error_at = 0.0
         self._load_state()
 
     # ------------------------------------------------------------------
@@ -114,6 +135,30 @@ class FuturesRuntime:
         self._recent_activity.appendleft(f"{timestamp} {message}")
 
     def _log_cycle_summary(self, *, price: float, signal: dict[str, Any] | None) -> None:
+        # P1 §8 — emit gate-block aggregate first so the "why didn't we trade?"
+        # answer sits next to the cycle outcome, not buried in a wall of
+        # per-symbol [GATE_BLOCK] INFO lines.
+        if self._last_cycle_gate_blocks:
+            reason_counts: dict[str, int] = {}
+            for reason in self._last_cycle_gate_blocks.values():
+                # Strip the "=<n><120" tail so cycles where the bar count drifts
+                # by 1 don't fragment the histogram (e.g. insufficient_1h_bars=65
+                # vs =66 collapse to one bucket).
+                bucket = reason.split("=", 1)[0] if "=" in reason else reason
+                reason_counts[bucket] = reason_counts.get(bucket, 0) + 1
+            histogram = ",".join(
+                f"{name}:{count}" for name, count in sorted(
+                    reason_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            )
+            log.info(
+                "[CYCLE_SUMMARY] cycle=%d symbols=%d gate_blocks=%d histogram={%s} signal=%s",
+                self._cycle_counter,
+                len(self._active_symbols),
+                len(self._last_cycle_gate_blocks),
+                histogram,
+                "yes" if signal is not None else "no",
+            )
         if self.open_position is not None:
             pnl_usdt = self._position_pnl_usdt(self.open_position, price)
             log.info(
@@ -139,6 +184,200 @@ class FuturesRuntime:
             price,
             self._paused,
         )
+
+    # ------------------------------------------------------------------
+    # P1 §6 #5 — cross-bot funding-observations publisher.
+    # Synergy with the spot bot (mexc-bot-v2): the futures bot already polls
+    # MEXC perp funding rates for its own funding gate, so publishing those
+    # observations to Redis lets the spot bot's
+    # ``mexcbot/funding_carry.evaluate_carry_entry`` size a real carry sleeve
+    # without standing up its own perp connector. The futures bot stays
+    # single-venue and directional; the spot bot owns the carry leg.
+    # ------------------------------------------------------------------
+    def _publish_funding_observations(self) -> None:
+        # Default-ON. Opt out with USE_FUNDING_OBSERVATIONS_PUBLISH=0.
+        import os as _os
+
+        if _os.environ.get("USE_FUNDING_OBSERVATIONS_PUBLISH", "1").strip().lower() in {
+            "0", "false", "no", "off", ""
+        }:
+            return
+        if not self.config.redis_url:
+            return
+        if not self._funding_cache:
+            return
+        try:
+            from futuresbot.funding_publisher import (
+                build_payload,
+                observations_from_cache,
+                publish_via_url,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("Funding publisher import failed: %s", exc)
+            return
+        try:
+            observations = observations_from_cache(self._funding_cache)
+            if not observations:
+                return
+            payload = build_payload(observations)
+            ok = publish_via_url(
+                self.config.redis_url,
+                payload,
+                key=self.config.funding_observations_redis_key,
+                ttl_seconds=900,
+            )
+            if ok:
+                log.info(
+                    "[FUNDING_PUBLISH] key=%s symbols=%d ttl=900s",
+                    self.config.funding_observations_redis_key,
+                    len(observations),
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("Funding publisher loop step failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # P1 §6 #9 — boot-time MEXC contract spec log line.
+    # The existing Gate B B4 validator emits [EXCHANGE_SPEC_OK] but does not
+    # include the per-symbol details an operator needs to debug a 400 reject
+    # (contract size, min volume, price unit). We add an explicit per-symbol
+    # CONTRACT_SPEC line on every boot so this is observable.
+    #
+    # P1 (third assessment) §5 #1+#2 — also resolves and persists the per-
+    # symbol taker-fee rate for the cost-budget RR gate. The MEXC public
+    # ``/contract/detail`` endpoint returns ``takerFeeRate`` for some
+    # contracts (BTC, ETH at 1 bp on this account's tier) and omits it for
+    # others (XAUT, PEPE, TAO, SILVER). When the API value is missing or
+    # implausibly low (< 2 bp — almost certainly a maker rate or
+    # promotional override that won't survive a stop-out), we fall back to
+    # the venue default ``MEXC_PERP_DEFAULT_TAKER_FEE_RATE`` (default
+    # 0.0004 = 4 bp, MEXC's standard taker tier). Source is logged
+    # explicitly (``src=api`` / ``src=default`` / ``src=default_low_api``)
+    # so operators can audit fee assumptions without reading the source.
+    # ------------------------------------------------------------------
+    _DEFAULT_TAKER_FEE_RATE = float(os.environ.get("MEXC_PERP_DEFAULT_TAKER_FEE_RATE", "0.0004") or "0.0004")
+    # Below this threshold we treat the API value as "implausibly low"
+    # (almost certainly a maker rate mis-mapped or a tier promo that won't
+    # survive a stop-out) and fall back to the venue default. MEXC's
+    # cheapest published perp taker tier is 2 bp; 1 bp is the maker rate.
+    _IMPLAUSIBLE_TAKER_FEE_FLOOR = 0.0002
+
+    @staticmethod
+    def _coerce_fee_rate(raw: Any) -> float | None:
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0.0 or value > 0.01:
+            # 1% taker is well above any plausible perp tier; treat as junk.
+            return None
+        return value
+
+    @staticmethod
+    def _normalize_symbol_for_env(symbol: str) -> str:
+        return "".join(ch if ch.isalnum() else "_" for ch in symbol.upper())
+
+    def _resolve_taker_fee(self, contract: dict[str, Any]) -> tuple[float, str, float | None]:
+        """Return ``(taker_fee_rate, source, raw_api_value_or_None)``.
+
+        ``source`` is one of:
+
+        - ``api`` — venue returned a plausible taker rate; used as-is.
+        - ``default_low_api`` — venue returned a value below
+          ``_IMPLAUSIBLE_TAKER_FEE_FLOOR`` (likely a maker-rate or promo);
+          we fall back to the venue default to keep cost-budget RR honest.
+        - ``default`` — venue returned no taker field at all.
+        """
+
+        api_taker = self._coerce_fee_rate(
+            contract.get("takerFeeRate")
+            if "takerFeeRate" in contract
+            else contract.get("taker_fee_rate")
+        )
+        if api_taker is None:
+            return self._DEFAULT_TAKER_FEE_RATE, "default", None
+        if api_taker < self._IMPLAUSIBLE_TAKER_FEE_FLOOR:
+            return self._DEFAULT_TAKER_FEE_RATE, "default_low_api", api_taker
+        return api_taker, "api", api_taker
+
+    def _emit_contract_specs(self) -> None:
+        for sym in self._active_symbols:
+            try:
+                contract = self.client.get_contract_detail(sym)
+            except Exception as exc:
+                log.warning("[CONTRACT_SPEC] symbol=%s lookup_failed=%s", sym, exc)
+                # Even on lookup failure, seed the per-symbol fee with the
+                # venue default so the cost-budget gate has something safe.
+                self._symbol_taker_fee[sym.upper()] = (self._DEFAULT_TAKER_FEE_RATE, "default")
+                os.environ[
+                    f"COST_BUDGET_TAKER_FEE_RATE_{self._normalize_symbol_for_env(sym)}"
+                ] = f"{self._DEFAULT_TAKER_FEE_RATE:.6f}"
+                continue
+            if not isinstance(contract, dict) or not contract:
+                log.warning("[CONTRACT_SPEC] symbol=%s empty_contract_detail", sym)
+                self._symbol_taker_fee[sym.upper()] = (self._DEFAULT_TAKER_FEE_RATE, "default")
+                os.environ[
+                    f"COST_BUDGET_TAKER_FEE_RATE_{self._normalize_symbol_for_env(sym)}"
+                ] = f"{self._DEFAULT_TAKER_FEE_RATE:.6f}"
+                continue
+            try:
+                contract_size = float(contract.get("contractSize") or 0.0)
+            except (TypeError, ValueError):
+                contract_size = 0.0
+            min_vol = contract.get("minVol") or contract.get("min_vol") or "?"
+            price_unit = contract.get("priceUnit") or contract.get("price_unit") or "?"
+            vol_unit = contract.get("volUnit") or contract.get("vol_unit") or "?"
+            max_lev = contract.get("maxLeverage") or contract.get("max_leverage") or "?"
+            api_maker = self._coerce_fee_rate(
+                contract.get("makerFeeRate")
+                if "makerFeeRate" in contract
+                else contract.get("maker_fee_rate")
+            )
+            taker_resolved, taker_src, api_taker_raw = self._resolve_taker_fee(contract)
+            self._symbol_taker_fee[sym.upper()] = (taker_resolved, taker_src)
+            # Push the resolved rate into a per-symbol env var so the
+            # strategy-level cost-budget gate (which is a pure function
+            # without a runtime handle) can pick it up without further
+            # plumbing. Format kept identical to the global env var so the
+            # gate's float-parse path is reused.
+            os.environ[
+                f"COST_BUDGET_TAKER_FEE_RATE_{self._normalize_symbol_for_env(sym)}"
+            ] = f"{taker_resolved:.6f}"
+            log.info(
+                "[CONTRACT_SPEC] symbol=%s contract_size=%s min_vol=%s price_unit=%s "
+                "vol_unit=%s max_leverage=%s taker_fee_rate=%.6f src=%s "
+                "api_taker_fee_rate=%s api_maker_fee_rate=%s",
+                sym,
+                contract_size,
+                min_vol,
+                price_unit,
+                vol_unit,
+                max_lev,
+                taker_resolved,
+                taker_src,
+                "?" if api_taker_raw is None else f"{api_taker_raw:.6f}",
+                "?" if api_maker is None else f"{api_maker:.6f}",
+            )
+            if taker_src == "default_low_api":
+                log.warning(
+                    "[CONTRACT_SPEC] symbol=%s api_taker_fee_rate=%.6f below "
+                    "implausible-low floor=%.4f; using default=%.6f to keep "
+                    "cost-budget RR honest. Override with "
+                    "MEXC_PERP_DEFAULT_TAKER_FEE_RATE if your venue tier is "
+                    "genuinely below %.4f.",
+                    sym,
+                    api_taker_raw or 0.0,
+                    self._IMPLAUSIBLE_TAKER_FEE_FLOOR,
+                    self._DEFAULT_TAKER_FEE_RATE,
+                    self._IMPLAUSIBLE_TAKER_FEE_FLOOR,
+                )
+
+    def get_symbol_taker_fee_rate(self, symbol: str) -> float:
+        """Return the resolved per-symbol taker fee rate (post-fallback)."""
+
+        rate, _src = self._symbol_taker_fee.get(symbol.upper(), (self._DEFAULT_TAKER_FEE_RATE, "default"))
+        return float(rate)
 
     def _notify(self, message: str, *, parse_mode: str = "HTML") -> None:
         self.telegram.send_message(message, parse_mode=parse_mode)
@@ -170,7 +409,6 @@ class FuturesRuntime:
             return f"{v:,.4f}"
         if mag > 0.0:
             formatted = f"{v:.8f}"
-            # Trim trailing zeros but keep at least 2 decimals for readability
             if "." in formatted:
                 formatted = formatted.rstrip("0")
                 if formatted.endswith("."):
@@ -754,20 +992,82 @@ class FuturesRuntime:
         )
         self._last_calibration_refresh_at = now_ts
         if data is None:
-            self.calibration = None
-            log.info("No futures calibration found at %s", self.config.calibration_file)
-            return
-        valid, _reason = validate_trade_calibration_payload(
-            data,
-            max_age_hours=self.config.calibration_max_age_hours,
-            min_total_trades=self.config.calibration_min_total_trades,
-        )
-        self.calibration = data if valid else None
-        if valid:
+            primary_reason = "no payload found"
+            primary_valid = False
+        else:
+            primary_valid, primary_reason = validate_trade_calibration_payload(
+                data,
+                max_age_hours=self.config.calibration_max_age_hours,
+                min_total_trades=self.config.calibration_min_total_trades,
+            )
+        if data is not None and primary_valid:
+            self.calibration = data
             log.info("Loaded futures calibration from %s", source or self.config.calibration_file)
             self._record_activity("Calibration loaded")
         else:
-            log.info("Ignoring futures calibration from %s: stale or insufficient sample", source or self.config.calibration_file)
+            # P1 (third assessment) §5 #3 — when the live (rolling 60-day)
+            # calibration fails the freshness or sample-size gate (a frequent
+            # occurrence early in a deployment or after a long outage),
+            # consult a long-window backtest "seed" calibration before
+            # falling through to ``self.calibration = None``. The seed has
+            # ≥90 days of synthetic trades so it always clears the sample
+            # floor; the freshness gate is intentionally bypassed for the
+            # seed because a stale seed is strictly preferable to no
+            # calibration at all.
+            seed_data: dict[str, Any] | None = None
+            seed_source: str | None = None
+            seed_reason: str | None = None
+            seed_key = getattr(self.config, "calibration_seed_redis_key", "") or ""
+            if seed_key:
+                seed_data, seed_source = load_trade_calibration(
+                    redis_url=self.config.redis_url,
+                    redis_key=seed_key,
+                    file_path="",  # seed lives only in Redis; no file fallback
+                )
+                if seed_data is not None:
+                    seed_valid, seed_reason = validate_trade_calibration_payload(
+                        seed_data,
+                        max_age_hours=float("inf"),  # freshness intentionally relaxed
+                        min_total_trades=self.config.calibration_min_total_trades,
+                    )
+                else:
+                    seed_valid = False
+                    seed_reason = "no seed payload found"
+            else:
+                seed_valid = False
+            if seed_valid and seed_data is not None:
+                self.calibration = seed_data
+                log.warning(
+                    "[CALIBRATION_SEED_FALLBACK] live calibration rejected (%s); "
+                    "using seed from %s instead.",
+                    primary_reason or "stale or insufficient sample",
+                    seed_source or seed_key,
+                )
+                self._record_activity("Calibration loaded from seed (live invalid)")
+            else:
+                self.calibration = None
+                if data is None and not seed_key:
+                    log.info("No futures calibration found at %s", self.config.calibration_file)
+                else:
+                    # Surface BOTH rejection reasons so the operator can act
+                    # on the right side (live-cron freshness vs seed
+                    # population) without having to read the validator.
+                    log.warning(
+                        "Ignoring futures calibration from %s: %s; seed_key=%s seed_reason=%s",
+                        source or self.config.calibration_file,
+                        primary_reason or "stale or insufficient sample",
+                        seed_key or "(disabled)",
+                        seed_reason or "not consulted",
+                    )
+        # Sprint 3 §3.4 — walk-forward stability gate. When enabled, reject
+        # calibration payloads whose OOS PF drops >40% vs IS or fails the
+        # absolute OOS PF floor. Neuters self.calibration -> None so the
+        # strategy falls back to threshold defaults.
+        if self.calibration is not None and self._flag("USE_WALK_FORWARD_GATE"):
+            if not self._walk_forward_gate_passes(self.trade_history):
+                log.info("Calibration rejected by walk-forward gate")
+                self._record_activity("Calibration rejected (walk-forward)")
+                self.calibration = None
 
     def refresh_daily_review(self, *, force: bool = False) -> None:
         now_ts = time.time()
@@ -872,6 +1172,29 @@ class FuturesRuntime:
             }
         )
         self.trade_history.append(trade)
+        # P2 §6 #13 — structured JSON audit line for after-the-fact P&L
+        # reconstruction independent of broker statements.
+        self._emit_audit_event(
+            "EXIT",
+            {
+                "symbol": position.symbol,
+                "side": position.side,
+                "entry_price": float(position.entry_price),
+                "exit_price": float(exit_price),
+                "contracts": int(position.contracts),
+                "base_qty": float(position.base_qty),
+                "leverage": int(position.leverage),
+                "margin_usdt": float(position.margin_usdt),
+                "gross_pnl_usdt": float(gross_pnl),
+                "fees_usdt": float(fees),
+                "pnl_usdt": float(pnl),
+                "pnl_pct": float(trade["pnl_pct"]),
+                "entry_signal": position.entry_signal,
+                "exit_reason": reason,
+                "opened_at": position.opened_at.isoformat(),
+                "closed_at": trade["exit_time"],
+            },
+        )
         self._notify(self._close_message(trade))
         self._record_activity(f"Closed {position.side} {position.symbol}: {reason} ${pnl:+.2f}")
 
@@ -1007,7 +1330,17 @@ class FuturesRuntime:
                     rate = float(payload)
             self._funding_cache[sym] = (now_ts, rate)
         if abs(rate) > cap:
-            log.info("Skipping %s: funding rate %.5f exceeds cap %.5f", sym, rate, cap)
+            # Gate B B2 (memo 1 §7): structured [FUNDING_BLOCK] so ops can
+            # distinguish funding-gate rejections from other skip reasons and
+            # measure blocked-trade rate against realised funding PnL.
+            direction = "long" if rate > 0 else "short"
+            log.info(
+                "[FUNDING_BLOCK] symbol=%s funding_rate=%.5f cap=%.5f direction=%s",
+                sym,
+                rate,
+                cap,
+                direction,
+            )
             return False
         return True
 
@@ -1017,9 +1350,21 @@ class FuturesRuntime:
     def _fetch_signal(self) -> dict[str, Any] | None:
         if self._available_slots() <= 0:
             return None
+        # P1 §8 — reset the per-cycle aggregator at the start of every scan.
+        self._cycle_counter += 1
+        self._last_cycle_gate_blocks = {}
         end = int(time.time())
-        start = end - 900 * 260
+        # P0 fix (assessment §1): the strategy resamples 15m -> 1h and requires
+        # >=120 1h bars (see strategy.score_btc_futures_setup / diagnose_setup_rejection).
+        # The previous 900*260 window (~65h) made the bar-count gate mathematically
+        # unreachable on every cycle, blocking every symbol with
+        # `insufficient_1h_bars=65<120` and producing zero trades. 900*720 = 180h
+        # (~7.5d) yields ~180 1h bars after resample, giving a 1.5x margin of
+        # safety over the 120 minimum and adequate warm-up for ATR/ADX/EMA100.
+        start = end - 900 * 720
         best: tuple[float, Any] | None = None
+        crypto_event_state = self._refresh_crypto_event_state()
+        event_now = datetime.now(timezone.utc)
         for sym in self._active_symbols:
             if sym in self.open_positions:
                 continue
@@ -1038,7 +1383,37 @@ class FuturesRuntime:
             except Exception as exc:
                 log.warning("Futures klines fetch failed for %s: %s", sym, exc)
                 continue
-            raw_signal = score_btc_futures_setup(frame, scoped)
+            event_scan_decision = evaluate_crypto_event_overlay(
+                crypto_event_state,
+                symbol=sym,
+                now=event_now,
+                stale_seconds=int(self.config.crypto_event_stale_seconds),
+                min_abs_bias=float(self.config.crypto_event_min_abs_bias),
+                threshold_relief_points=float(self.config.crypto_event_threshold_relief),
+                score_boost_points=float(self.config.crypto_event_score_boost),
+                adverse_score_penalty_points=float(self.config.crypto_event_adverse_score_penalty),
+            )
+            scoring_config = scoped
+            if self.config.crypto_event_overlay_enabled and event_scan_decision.threshold_relief > 0:
+                scoring_config = dataclasses.replace(
+                    scoped,
+                    min_confidence_score=max(1.0, scoped.min_confidence_score - event_scan_decision.threshold_relief),
+                )
+                log.info(
+                    "Crypto event threshold relief for %s: %.2f points (bias=%.2f)",
+                    sym,
+                    event_scan_decision.threshold_relief,
+                    event_scan_decision.bias_score,
+                )
+            raw_signal = score_btc_futures_setup(frame, scoring_config)
+            # Sprint 3 §3.2 — mean-reversion fallback. When regime is CHOP (or the
+            # primary coil-breakout scorer returned nothing) and
+            # USE_MEAN_REVERSION=1, attempt a mean-reversion signal via the pure
+            # Bollinger+RSI module. Uses the 1h frame resampled from the 15m feed.
+            if self._flag("USE_MEAN_REVERSION"):
+                mr_signal = self._mean_reversion_candidate(sym, scoring_config, frame, raw_signal)
+                if mr_signal is not None:
+                    raw_signal = mr_signal
             if raw_signal is None:
                 # Gate A A5 (memo 1 §7): structured gate-block telemetry so the
                 # operator can distinguish "market was quiet" from "filters are
@@ -1049,7 +1424,15 @@ class FuturesRuntime:
                     reason = diagnose_setup_rejection(frame, scoped)
                 except Exception as diag_exc:  # pragma: no cover — defensive
                     reason = f"diagnostic_error={type(diag_exc).__name__}"
+                # Track in the per-cycle aggregator (P1 §8). Keep the per-symbol
+                # INFO line as well so individual symbol diagnoses remain visible
+                # at debug-grain; volume reduction comes from the consolidated
+                # CYCLE_SUMMARY line that follows.
+                self._last_cycle_gate_blocks[sym] = reason
                 log.info("[GATE_BLOCK] symbol=%s reason=%s", sym, reason)
+                continue
+            raw_signal = self._apply_crypto_event_overlay(raw_signal, crypto_event_state, event_now)
+            if raw_signal is None:
                 continue
             calibrated = apply_signal_calibration(
                 raw_signal,
@@ -1060,6 +1443,25 @@ class FuturesRuntime:
             )
             if calibrated is None:
                 log.info("Signal scan: %s rejected by calibration/threshold", sym)
+                continue
+            # Sprint 3 §3.3 — regime gate. When USE_REGIME_CLASSIFIER=1, reject
+            # signals whose side is blocked by the current portfolio regime
+            # (e.g. longs in TREND_DOWN, anything in VOL_SHOCK). Mean-reversion
+            # signals carry a metadata flag that swaps the strategy kind.
+            regime = self._classify_regime(frame)
+            strategy_kind = (
+                "mean_reversion"
+                if (calibrated.metadata or {}).get("strategy") == "mean_reversion"
+                else "coil_breakout"
+            )
+            if regime is not None and not self._regime_allows(regime, calibrated.side, strategy_kind):
+                log.info(
+                    "Signal scan: %s %s blocked by regime %s (%s)",
+                    sym,
+                    calibrated.side,
+                    regime.label,
+                    regime.reason,
+                )
                 continue
             log.info(
                 "Signal scan accepted for %s: side=%s entry_signal=%s leverage=x%s score=%.1f certainty=%.0f%%",
@@ -1077,6 +1479,827 @@ class FuturesRuntime:
             return None
         return best[1].to_dict()
 
+    def _refresh_crypto_event_state(self) -> dict[str, Any] | None:
+        if not getattr(self.config, "crypto_event_overlay_enabled", True):
+            return None
+        if not self.config.redis_url or not self.config.crypto_event_redis_key:
+            return None
+        now = time.monotonic()
+        if (
+            self._crypto_event_state is not None
+            and now - self._last_crypto_event_refresh_at < self.config.crypto_event_refresh_seconds
+        ):
+            return self._crypto_event_state
+        self._last_crypto_event_refresh_at = now
+        try:
+            import redis
+
+            client = redis.from_url(self.config.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0)
+            raw = client.get(self.config.crypto_event_redis_key)
+            if raw is None:
+                self._crypto_event_state = None
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            parsed = json.loads(raw)
+            self._crypto_event_state = parsed if isinstance(parsed, dict) else None
+            return self._crypto_event_state
+        except Exception as exc:
+            if now - self._last_crypto_event_error_at >= 900:
+                log.warning("Crypto event state refresh failed; continuing without event boost: %s", exc)
+                self._last_crypto_event_error_at = now
+            return self._crypto_event_state
+
+    def _apply_crypto_event_overlay(self, signal: Any, state: dict[str, Any] | None, now: datetime) -> Any | None:
+        if not getattr(self.config, "crypto_event_overlay_enabled", True):
+            return signal
+        decision = evaluate_crypto_event_overlay(
+            state,
+            symbol=signal.symbol,
+            side=signal.side,
+            now=now,
+            stale_seconds=int(self.config.crypto_event_stale_seconds),
+            min_abs_bias=float(self.config.crypto_event_min_abs_bias),
+            threshold_relief_points=float(self.config.crypto_event_threshold_relief),
+            score_boost_points=float(self.config.crypto_event_score_boost),
+            adverse_score_penalty_points=float(self.config.crypto_event_adverse_score_penalty),
+        )
+        if decision.reason == "no_fresh_crypto_event_state":
+            return signal
+        metadata = {
+            **(signal.metadata or {}),
+            **decision.metadata,
+            "crypto_event_reason": decision.reason,
+        }
+        if not decision.allowed:
+            log.info(
+                "Signal scan: %s %s blocked by crypto event overlay (%s bias=%.2f)",
+                signal.symbol,
+                signal.side,
+                decision.reason,
+                decision.bias_score,
+            )
+            return None
+        score = max(0.0, float(signal.score) + float(decision.score_offset))
+        if abs(decision.score_offset) > 1e-9:
+            log.info(
+                "Crypto event overlay %s for %s %s: score %.1f -> %.1f",
+                decision.reason,
+                signal.symbol,
+                signal.side,
+                signal.score,
+                score,
+            )
+        return dataclasses.replace(signal, score=round(score, 2), metadata=metadata)
+
+    # ------------------------------------------------------------------
+    # Sprint 1 helpers — all no-ops unless the matching env flag is set.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _flag(name: str) -> bool:
+        import os
+
+        return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        import os
+
+        try:
+            raw = os.environ.get(name)
+            if raw is None or raw.strip() == "":
+                return default
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _apply_session_leverage_cap(self, leverage: int) -> int:
+        """§2.8 — clamp leverage by current UTC session. No-op when flag off."""
+
+        if not self._flag("USE_SESSION_LEVERAGE"):
+            return leverage
+        try:
+            from futuresbot.session_leverage import session_policy
+
+            hour = datetime.now(timezone.utc).hour
+            full_cap = int(self._env_float("SESSION_FULL_LEVERAGE_CAP", self.config.leverage_max))
+            asia_cap = int(self._env_float("SESSION_ASIA_LEVERAGE_CAP", 5))
+            policy = session_policy(
+                hour,
+                full_leverage_cap=full_cap,
+                asia_leverage_cap=asia_cap,
+            )
+            capped = min(leverage, policy.leverage_cap)
+            if capped != leverage:
+                log.info(
+                    "Session %s capped leverage %d -> %d", policy.session, leverage, capped
+                )
+            return max(1, capped)
+        except Exception as exc:
+            log.debug("Session leverage cap skipped: %s", exc)
+            return leverage
+
+    def _drawdown_size_multiplier(self) -> float:
+        """§2.7 — return size multiplier in [0,1] from portfolio drawdown state."""
+
+        if not self._flag("USE_DRAWDOWN_KILL"):
+            return 1.0
+        try:
+            from futuresbot.drawdown_kill import compute_drawdown_state
+
+            curve = self._build_equity_curve()
+            if not curve:
+                return 1.0
+            state = compute_drawdown_state(
+                curve,
+                soft_pct=self._env_float("DRAWDOWN_SOFT_PCT", 0.08),
+                hard_pct=self._env_float("DRAWDOWN_HALT_PCT", 0.15),
+            )
+            if state.label == "HALT":
+                if not self._paused:
+                    self._paused = True
+                    self._notify_once(
+                        "futures_dd_halt",
+                        f"⛔ <b>Futures Drawdown HALT</b> [{self._mode_label()}]\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"90d DD {state.dd_90d:.1%} exceeded halt threshold. New entries paused.",
+                    )
+                return 0.0
+            if state.label == "THROTTLE":
+                self._notify_once(
+                    "futures_dd_throttle",
+                    f"⚠️ <b>Futures Drawdown THROTTLE</b> [{self._mode_label()}]\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"30d DD {state.dd_30d:.1%} — position sizes halved.",
+                )
+            return state.size_multiplier
+        except Exception as exc:
+            log.debug("Drawdown kill helper skipped: %s", exc)
+            return 1.0
+
+    def _build_equity_curve(self) -> list[tuple[float, float]]:
+        """Reconstruct a cumulative-equity timeseries from closed trades.
+
+        Starting NAV = ``margin_budget_usdt``; each closed trade adds its
+        realised P&L. Returns ``[(unix_ts, nav_usdt), ...]`` sorted ascending.
+        """
+
+        baseline = float(self.config.margin_budget_usdt)
+        if baseline <= 0 or not self.trade_history:
+            return []
+        points: list[tuple[float, float]] = []
+        running = baseline
+        for trade in self.trade_history:
+            pnl = 0.0
+            for key in ("pnl_usdt", "pnl", "realized_pnl"):
+                raw = trade.get(key)
+                if raw is None:
+                    continue
+                try:
+                    pnl = float(raw)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            ts_raw = trade.get("closed_at") or trade.get("exit_time") or trade.get("timestamp")
+            ts_value: float | None = None
+            if isinstance(ts_raw, (int, float)):
+                ts_value = float(ts_raw)
+            elif isinstance(ts_raw, str) and ts_raw:
+                try:
+                    ts_value = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    ts_value = None
+            if ts_value is None:
+                continue
+            running += pnl
+            points.append((ts_value, running))
+        points.sort(key=lambda pair: pair[0])
+        return points
+
+    def _apply_nav_risk_sizing(
+        self,
+        *,
+        entry_price: float,
+        sl_price: float,
+        contract_size: float,
+        available_margin: float,
+        size_multiplier: float,
+    ) -> tuple[int, int] | None:
+        """§2.1 — NAV-anchored sizing. Returns ``(contracts, leverage)`` or None.
+
+        No-op (returns None → caller uses legacy path) when flag is off or
+        inputs are unusable.
+        """
+
+        if not self._flag("USE_NAV_RISK_SIZING"):
+            return None
+        try:
+            from futuresbot.nav_risk_sizing import compute_nav_risk_sizing
+
+            nav = float(self.config.margin_budget_usdt)
+            risk_pct = self._env_float("NAV_RISK_PCT", 0.01) * max(0.0, size_multiplier)
+            lev_min = int(self._env_float("NAV_LEVERAGE_MIN", 5))
+            lev_max = int(self._env_float("NAV_LEVERAGE_MAX", 10))
+            result = compute_nav_risk_sizing(
+                nav_usdt=nav,
+                entry_price=entry_price,
+                sl_price=sl_price,
+                contract_size=contract_size,
+                risk_pct=risk_pct,
+                leverage_min=lev_min,
+                leverage_max=lev_max,
+                available_margin_usdt=available_margin,
+            )
+            if result is None:
+                return None
+            return result.qty_contracts, result.applied_leverage
+        except Exception as exc:
+            log.debug("NAV risk sizing helper skipped: %s", exc)
+            return None
+
+    def _liq_buffer_force_close(self, position: FuturesPosition, current_price: float) -> bool:
+        """§2.5 — force-close when distance-to-liquidation < threshold ATRs.
+
+        Returns True if the position was closed. No-op when flag is off or the
+        position model does not expose a liquidation price.
+        """
+
+        if not self._flag("USE_LIQ_BUFFER_GUARD"):
+            return False
+        liq_price = getattr(position, "liq_price", None)
+        if liq_price is None:
+            liq_price = getattr(position, "liquidation_price", None)
+        try:
+            liq_value = float(liq_price) if liq_price is not None else 0.0
+        except (TypeError, ValueError):
+            liq_value = 0.0
+        if liq_value <= 0:
+            # Approximate from isolated-margin formula: ≈ entry × (1 − 1/lev) for long,
+            # entry × (1 + 1/lev) for short. Conservative — treats maintenance-margin
+            # buffer as zero.
+            if position.leverage <= 0:
+                return False
+            if position.side == "LONG":
+                liq_value = position.entry_price * (1.0 - 1.0 / position.leverage)
+            else:
+                liq_value = position.entry_price * (1.0 + 1.0 / position.leverage)
+        atr = self._env_float(f"FUTURES_{position.symbol.replace('_', '')}_ATR", 0.0)
+        if atr <= 0:
+            # Fall back to a simple percent buffer: if price within X% of liq, close.
+            pct_buffer = self._env_float("LIQ_BUFFER_PCT", 0.005)
+            distance_pct = abs(current_price - liq_value) / current_price if current_price > 0 else 0.0
+            if distance_pct < pct_buffer:
+                self._force_close_position(reason="LIQ_BUFFER", symbol=position.symbol)
+                return True
+            return False
+        try:
+            from futuresbot.liq_buffer import should_force_close
+
+            threshold = self._env_float("LIQ_BUFFER_ATR_THRESHOLD", 2.0)
+            check = should_force_close(
+                entry_price=position.entry_price,
+                liq_price=liq_value,
+                current_price=current_price,
+                atr=atr,
+                side=position.side,
+                threshold_atr=threshold,
+            )
+            if check.force_close:
+                log.warning(
+                    "Liq-buffer force-close %s: distance %.2f ATR < %.2f",
+                    position.symbol,
+                    check.distance_atr,
+                    threshold,
+                )
+                self._force_close_position(reason="LIQ_BUFFER", symbol=position.symbol)
+                return True
+        except Exception as exc:
+            log.debug("Liq buffer check skipped for %s: %s", position.symbol, exc)
+        return False
+
+    def _current_funding_rate(self, scoped: "FuturesConfig") -> float:
+        """Return the cached 8h funding rate for ``scoped.symbol`` or 0.0.
+
+        Shares the ``_funding_cache`` populated by ``_funding_gate_ok`` so the
+        settlement-window gate and stop-multiplier logic do not trigger extra
+        REST calls. A fresh fetch is attempted only if nothing is cached.
+        """
+
+        sym = scoped.symbol
+        now_ts = time.time()
+        cached = self._funding_cache.get(sym)
+        if cached is not None and now_ts - cached[0] < 600.0:
+            return float(cached[1])
+        rate = 0.0
+        fetcher = getattr(self.client, "get_funding_rate", None)
+        if callable(fetcher):
+            try:
+                payload = fetcher(sym)
+            except Exception as exc:
+                log.debug("Futures funding rate fetch failed for %s: %s", sym, exc)
+                payload = None
+            if isinstance(payload, dict):
+                raw = payload.get("fundingRate") or payload.get("funding_rate") or payload.get("rate") or 0.0
+                try:
+                    rate = float(raw)
+                except (TypeError, ValueError):
+                    rate = 0.0
+            elif isinstance(payload, (int, float)):
+                rate = float(payload)
+        self._funding_cache[sym] = (now_ts, rate)
+        return rate
+
+    def _funding_entry_ok(self, scoped: "FuturesConfig", side: str) -> bool:
+        """§2.3 — block entries in the pre-funding window unless we *receive*."""
+
+        if not self._flag("USE_FUNDING_AWARE_ENTRY"):
+            return True
+        try:
+            from futuresbot.funding_policy import evaluate_entry
+
+            rate = self._current_funding_rate(scoped)
+            block_window = int(self._env_float("FUNDING_BLOCK_WINDOW_SECONDS", 120))
+            decision = evaluate_entry(
+                side=side,
+                funding_rate_8h=rate,
+                now=datetime.now(timezone.utc),
+                block_window_seconds=block_window,
+            )
+            if not decision.allowed:
+                log.info(
+                    "Skipping %s %s: %s (rate=%.5f, %ss to settlement)",
+                    scoped.symbol,
+                    side,
+                    decision.reason,
+                    rate,
+                    decision.seconds_to_settlement,
+                )
+            return decision.allowed
+        except Exception as exc:
+            log.debug("Funding entry gate skipped for %s: %s", scoped.symbol, exc)
+            return True
+
+    def _adjust_sl_for_funding(
+        self,
+        *,
+        scoped: "FuturesConfig",
+        side: str,
+        entry_price: float,
+        sl_price: float,
+    ) -> float:
+        """§2.9 — scale the stop-loss distance by the funding-regime multiplier."""
+
+        if not self._flag("USE_FUNDING_STOP_MULT"):
+            return sl_price
+        try:
+            from futuresbot.funding_policy import stop_multiplier_for_funding
+
+            rate = self._current_funding_rate(scoped)
+            threshold = self._env_float("FUNDING_HIGH_THRESHOLD", 0.0006)
+            crowded = self._env_float("FUNDING_CROWDED_STOP_MULT", 0.7)
+            counter = self._env_float("FUNDING_COUNTER_STOP_MULT", 1.2)
+            policy = stop_multiplier_for_funding(
+                side=side,
+                funding_rate_8h=rate,
+                high_funding_threshold=threshold,
+                crowded_stop_mult=crowded,
+                counter_stop_mult=counter,
+            )
+            if policy.stop_multiplier == 1.0:
+                return sl_price
+            distance = abs(entry_price - sl_price) * policy.stop_multiplier
+            new_sl = entry_price - distance if side.upper() == "LONG" else entry_price + distance
+            log.info(
+                "Funding %s stop mult %.2f: SL %.4f -> %.4f",
+                policy.label,
+                policy.stop_multiplier,
+                sl_price,
+                new_sl,
+            )
+            return new_sl
+        except Exception as exc:
+            log.debug("Funding stop multiplier skipped: %s", exc)
+            return sl_price
+
+    # ------------------------------------------------------------------
+    # Sprint 3 helpers — regime classifier + slippage attribution.
+    # All no-ops unless the matching env flag is set.
+    # ------------------------------------------------------------------
+    def _classify_regime(self, frame_15m: "pd.DataFrame | None") -> Any | None:
+        """§3.3 — classify current regime from a 15m OHLCV frame.
+
+        Returns a ``RegimeClassification`` or None (flag off / insufficient
+        data). Callers must tolerate None.
+        """
+
+        if not self._flag("USE_REGIME_CLASSIFIER"):
+            return None
+        if frame_15m is None or len(frame_15m) < 260:
+            return None
+        try:
+            from futuresbot.indicators import calc_adx, resample_ohlcv
+            from futuresbot.regime_classifier import classify_regime
+
+            frame_1h = resample_ohlcv(frame_15m, "1h")
+            if len(frame_1h) < 30:
+                return None
+            close = frame_1h["close"].astype(float)
+            # 20d slope from daily close (240 1h bars ≈ 10d; use what we have).
+            lookback = min(len(close) - 1, 480)  # up to 20d of 1h bars
+            slope = (float(close.iloc[-1]) / float(close.iloc[-lookback - 1])) - 1.0
+            adx_series = calc_adx(frame_1h, 14)
+            adx = float(adx_series.iloc[-1])
+            # Realised-vol percentile: rolling 20-bar std of log returns vs
+            # its own trailing distribution.
+            import numpy as np
+
+            log_ret = np.log(close / close.shift(1)).dropna()
+            if len(log_ret) < 40:
+                return None
+            rv = log_ret.rolling(20).std().dropna()
+            current = float(rv.iloc[-1])
+            pct = float((rv <= current).mean() * 100.0)
+            vol_shock_pct = self._env_float("REGIME_VOL_SHOCK_PCT", 90.0)
+            chop_adx = self._env_float("REGIME_CHOP_ADX_MAX", 18.0)
+            chop_vol_pct = self._env_float("REGIME_CHOP_VOL_PCT_MAX", 30.0)
+            trend_slope = self._env_float("REGIME_TREND_SLOPE_ABS", 0.02)
+            return classify_regime(
+                slope_20d=slope,
+                adx_1h=adx,
+                realised_vol_pct=pct,
+                trend_slope_abs_threshold=trend_slope,
+                chop_adx_max=chop_adx,
+                chop_vol_pct_max=chop_vol_pct,
+                vol_shock_pct_min=vol_shock_pct,
+            )
+        except Exception as exc:
+            log.debug("Regime classifier skipped: %s", exc)
+            return None
+
+    def _regime_allows(self, classification: Any, side: str, strategy: str = "coil_breakout") -> bool:
+        """Return True if the signal passes the regime filter.
+
+        When ``classification`` is None (flag off or insufficient data) we
+        always pass — Sprint 3 behaviour is opt-in.
+        """
+
+        if classification is None:
+            return True
+        try:
+            from futuresbot.regime_classifier import signal_allowed
+
+            return signal_allowed(classification, side=side, strategy=strategy)
+        except Exception:
+            return True
+
+    # ----- Sprint 3 §3.2 mean-reversion fallback ----------------------------
+    def _mean_reversion_candidate(
+        self,
+        symbol: str,
+        scoped: "FuturesConfig",
+        frame_15m: "pd.DataFrame",
+        primary: Any,
+    ) -> Any | None:
+        """Return a ``FuturesSignal``-shaped payload for a mean-reversion setup.
+
+        Only fires when the regime classifier flags CHOP. Returns None if the
+        regime isn't CHOP, frames are too short, or no valid MR setup.
+        """
+
+        try:
+            from futuresbot.mean_reversion import score_mean_reversion_setup
+            from futuresbot.indicators import resample_ohlcv
+            from futuresbot.models import FuturesSignal
+
+            regime = self._classify_regime(frame_15m)
+            if regime is None or regime.label != "CHOP":
+                return None
+            frame_1h = resample_ohlcv(frame_15m, "1h")
+            sig = score_mean_reversion_setup(frame_1h)
+            if sig is None:
+                return None
+            # Build a minimal FuturesSignal so downstream calibration /
+            # cost-budget / regime code treats it uniformly with coil-breakout.
+            sl_distance_pct = abs(sig.entry_price - sig.sl_price) / max(sig.entry_price, 1e-9)
+            tp_distance_pct = abs(sig.tp_price - sig.entry_price) / max(sig.entry_price, 1e-9)
+            # Score mean-reversion setups on how stretched the band is (sigma)
+            # and how extreme RSI is. Keep it conservative (70-85 range) so
+            # calibration thresholds can filter.
+            rsi_extremity = abs(sig.rsi - 50.0) / 50.0  # 0..1
+            score = 60.0 + 15.0 * min(sig.band_distance_sigma / 2.5, 1.0) + 15.0 * rsi_extremity
+            # Pick leverage cap mid-range; mean-reversion is smaller-move,
+            # higher-frequency; stay conservative.
+            leverage = max(scoped.leverage_min, min(scoped.leverage_max, 5))
+            return FuturesSignal(
+                symbol=symbol,
+                side=sig.side,
+                score=round(score, 2),
+                certainty=0.55,
+                entry_price=round(sig.entry_price, 4),
+                tp_price=round(sig.tp_price, 4),
+                sl_price=round(sig.sl_price, 4),
+                leverage=leverage,
+                entry_signal="MEAN_REVERSION",
+                metadata={
+                    "strategy": "mean_reversion",
+                    "rsi": round(sig.rsi, 2),
+                    "band_distance_sigma": round(sig.band_distance_sigma, 3),
+                    "sl_distance_pct": round(sl_distance_pct, 6),
+                    "tp_distance_pct": round(tp_distance_pct, 6),
+                },
+            )
+        except Exception as exc:
+            log.debug("Mean-reversion candidate skipped: %s", exc)
+            return None
+
+    # ----- Sprint 3 §3.4 walk-forward calibration gate ----------------------
+    def _walk_forward_gate_passes(self, trade_history: list[dict[str, Any]]) -> bool:
+        """80/20 time split over closed trades; reject if OOS degrades too much."""
+
+        try:
+            from futuresbot.walk_forward import WalkForwardMetrics, evaluate_walk_forward
+
+            min_total = int(self._env_float("WALK_FORWARD_MIN_TRADES", 50))
+            if len(trade_history) < min_total:
+                return True  # not enough data — fall open
+            ordered = sorted(
+                trade_history,
+                key=lambda t: str(t.get("exit_time") or t.get("entry_time") or ""),
+            )
+            cutoff = int(len(ordered) * 0.8)
+            is_slice = ordered[:cutoff]
+            oos_slice = ordered[cutoff:]
+            if not oos_slice:
+                return True
+
+            def _pf(trades: list[dict[str, Any]]) -> tuple[int, float, float, float]:
+                if not trades:
+                    return 0, 0.0, 0.0, 0.0
+                pnls = [float(t.get("pnl_usdt") or 0.0) for t in trades]
+                wins = sum(p for p in pnls if p > 0)
+                losses = -sum(p for p in pnls if p < 0)
+                pf = (wins / losses) if losses > 0 else 999.0
+                wr = sum(1 for p in pnls if p > 0) / len(pnls)
+                exp = sum(pnls) / len(pnls)
+                return len(pnls), pf, wr, exp
+
+            is_n, is_pf, is_wr, is_exp = _pf(is_slice)
+            oos_n, oos_pf, oos_wr, oos_exp = _pf(oos_slice)
+            gate = evaluate_walk_forward(
+                is_metrics=WalkForwardMetrics(trades=is_n, profit_factor=is_pf, win_rate=is_wr, expectancy=is_exp),
+                oos_metrics=WalkForwardMetrics(trades=oos_n, profit_factor=oos_pf, win_rate=oos_wr, expectancy=oos_exp),
+                min_oos_pf=self._env_float("WALK_FORWARD_MIN_OOS_PF", 1.15),
+                min_oos_trades=int(self._env_float("WALK_FORWARD_MIN_OOS_TRADES", 20)),
+                max_is_oos_degradation=self._env_float("WALK_FORWARD_MAX_DEGRADATION", 0.40),
+            )
+            if not gate.accepted:
+                log.info("Walk-forward gate failed: %s", gate.reason)
+            return bool(gate.accepted)
+        except Exception as exc:
+            log.debug("Walk-forward gate skipped: %s", exc)
+            return True
+
+    # ----- Sprint 3 §3.9 slippage attribution -------------------------------
+    def _ensure_slippage_store(self) -> Any:
+        if self._slippage_store is None:
+            try:
+                from futuresbot.slippage_attribution import SlippageAttribution
+
+                window = self._env_float("SLIPPAGE_WINDOW_DAYS", 7.0)
+                self._slippage_store = SlippageAttribution(window_days=window)
+            except Exception:
+                return None
+        return self._slippage_store
+
+    def _record_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quoted_price: float,
+        fill_price: float,
+        maker: bool,
+        leverage: int,
+    ) -> None:
+        """Record a fill for weekly slippage attribution. No-op unless flag on."""
+
+        if not self._flag("USE_SLIPPAGE_ATTRIBUTION"):
+            return
+        store = self._ensure_slippage_store()
+        if store is None:
+            return
+        try:
+            from futuresbot.slippage_attribution import FillRecord
+            from futuresbot.funding_policy import seconds_to_next_settlement
+
+            now = datetime.now(timezone.utc)
+            store.record(
+                FillRecord(
+                    timestamp=now,
+                    symbol=symbol,
+                    side=side,
+                    quoted_price=float(quoted_price),
+                    fill_price=float(fill_price),
+                    maker=bool(maker),
+                    seconds_to_funding=float(seconds_to_next_settlement(now)),
+                    leverage=int(leverage),
+                )
+            )
+        except Exception as exc:
+            log.debug("Slippage record skipped: %s", exc)
+
+    # ----- Sprint 3 §3.5 maker-first entry ladder ---------------------------
+    def _attempt_maker_ladder(
+        self,
+        *,
+        symbol: str,
+        side: int,
+        side_name: str,
+        contracts: int,
+        leverage: int,
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+    ) -> tuple[str, dict[str, Any], bool] | None:
+        """Place a post-only limit; poll for fill; cancel on timeout.
+
+        Returns ``(order_id, detail, maker_filled=True)`` on maker fill.
+        Returns None on timeout/error so caller falls back to market order.
+        No-op (returns None) unless USE_MAKER_LADDER=1.
+        """
+
+        if not self._flag("USE_MAKER_LADDER"):
+            return None
+        try:
+            from futuresbot.maker_ladder import (
+                MakerLadderConfig,
+                decide_next_action,
+            )
+            from futuresbot.funding_policy import seconds_to_next_settlement
+
+            ticker = self.client.get_ticker(symbol) or {}
+            best_bid = float(ticker.get("bid1") or 0.0)
+            best_ask = float(ticker.get("ask1") or 0.0)
+            if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+                return None
+            tick_size = self._env_float(f"TICK_SIZE_{symbol.replace('_','')}", 0.01)
+            cfg = MakerLadderConfig()
+            now_utc = datetime.now(timezone.utc)
+            seconds_to_funding = float(seconds_to_next_settlement(now_utc))
+            signal_ts = time.time()
+            working_order_id: str | None = None
+            polls = 0
+            max_polls = int(self._env_float("MAKER_LADDER_MAX_POLLS", 8))
+            poll_interval = self._env_float("MAKER_LADDER_POLL_SECONDS", 0.5)
+            while polls < max_polls:
+                elapsed = time.time() - signal_ts
+                # Refresh quote.
+                tick = self.client.get_ticker(symbol) or {}
+                bb = float(tick.get("bid1") or best_bid)
+                ba = float(tick.get("ask1") or best_ask)
+                # Check current working order for fill.
+                filled = False
+                if working_order_id:
+                    detail = self.client.get_order(working_order_id) or {}
+                    if float(detail.get("dealVol") or 0) >= contracts:
+                        log.info("Maker ladder: filled %s order=%s", symbol, working_order_id)
+                        return working_order_id, detail, True
+                decision = decide_next_action(
+                    side=side_name,
+                    seconds_since_signal=elapsed,
+                    best_bid=bb,
+                    best_ask=ba,
+                    tick_size=tick_size,
+                    seconds_to_funding=seconds_to_funding,
+                    filled=filled,
+                    config=cfg,
+                )
+                if decision.action == "ABORT":
+                    log.info("Maker ladder abort: %s", decision.reason)
+                    break
+                if decision.action == "CROSS_TAKER":
+                    # Cancel working order then let caller place market.
+                    if working_order_id:
+                        try:
+                            self.client.cancel_order(working_order_id)
+                        except Exception:
+                            pass
+                    log.info("Maker ladder crossing: %s", decision.reason)
+                    return None
+                if decision.action in ("POST_MAKER", "REPOST_MAKER"):
+                    if working_order_id:
+                        try:
+                            self.client.cancel_order(working_order_id)
+                        except Exception:
+                            pass
+                        working_order_id = None
+                    try:
+                        order = self.client.place_order(
+                            symbol=symbol,
+                            side=side,
+                            vol=contracts,
+                            leverage=leverage,
+                            order_type=2,  # post-only maker
+                            price=float(decision.price),
+                            open_type=self.config.open_type,
+                            position_mode=self.config.position_mode,
+                            take_profit_price=tp_price,
+                            stop_loss_price=sl_price,
+                        )
+                        working_order_id = str(order.get("orderId") or "") or None
+                        log.info(
+                            "Maker ladder post: %s %s @ %s (%s)",
+                            symbol,
+                            side_name,
+                            decision.price,
+                            decision.reason,
+                        )
+                    except Exception as post_exc:
+                        log.debug("Maker post failed, falling back to market: %s", post_exc)
+                        return None
+                polls += 1
+                time.sleep(poll_interval)
+            # Exhausted polls without fill.
+            if working_order_id:
+                try:
+                    self.client.cancel_order(working_order_id)
+                except Exception:
+                    pass
+            return None
+        except Exception as exc:
+            log.debug("Maker ladder skipped: %s", exc)
+            return None
+
+    # ----- Sprint 3 §3.6 portfolio VaR --------------------------------------
+    def _portfolio_var_accepts(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        notional_usdt: float,
+    ) -> bool:
+        """Check candidate position against cross-symbol VaR cap.
+
+        Returns True if acceptable (or flag off / insufficient inputs).
+        Default model: per-symbol annualised vol from env
+        ``PORTFOLIO_VAR_VOL_<SYM>`` (fallback 0.8 for majors) and a single
+        default cross-correlation ``PORTFOLIO_VAR_CORR`` (fallback 0.85).
+        """
+
+        if not self._flag("USE_PORTFOLIO_VAR"):
+            return True
+        try:
+            from futuresbot.portfolio_var import PositionWeight, check_new_position
+
+            import os
+
+            nav = float(self.config.margin_budget_usdt) * float(self.config.max_concurrent_positions)
+            if nav <= 0:
+                return True
+            default_vol = self._env_float("PORTFOLIO_VAR_DEFAULT_VOL", 0.80)
+            default_corr = self._env_float("PORTFOLIO_VAR_DEFAULT_CORR", 0.85)
+            cap = self._env_float("PORTFOLIO_VAR_CAP_VOL", 0.08)
+            all_symbols = list(self.open_positions.keys()) + [symbol]
+            annualised_vol: dict[str, float] = {}
+            for sym in all_symbols:
+                raw = os.environ.get(f"PORTFOLIO_VAR_VOL_{sym.replace('_', '')}")
+                annualised_vol[sym] = float(raw) if raw else default_vol
+            correlation: dict[tuple[str, str], float] = {}
+            for i, a in enumerate(all_symbols):
+                for b in all_symbols[i + 1:]:
+                    correlation[(a, b)] = default_corr
+            existing = []
+            for sym, pos in self.open_positions.items():
+                sign = 1.0 if pos.side == "LONG" else -1.0
+                existing.append(PositionWeight(symbol=sym, signed_notional_usdt=sign * pos.contracts * pos.contract_size * pos.entry_price))
+            cand_sign = 1.0 if side.upper() == "LONG" else -1.0
+            cand = PositionWeight(symbol=symbol, signed_notional_usdt=cand_sign * notional_usdt)
+            check = check_new_position(
+                existing=existing,
+                candidate=cand,
+                nav_usdt=nav,
+                annualised_vol=annualised_vol,
+                correlation=correlation,
+                cap_vol=cap,
+            )
+            if not check.accepted:
+                log.info("Portfolio VaR blocks %s %s: %s", symbol, side, check.reason)
+            return bool(check.accepted)
+        except Exception as exc:
+            log.debug("Portfolio VaR skipped: %s", exc)
+            return True
+
+    # ----- P2 §6 #11 — carry/basis monitor decommission -----------------
+    # The legacy ``_monitor_quarter2_funding_carry`` and ``_monitor_quarter2_basis``
+    # Telegram-alert paths were removed per the assessment's product decision
+    # (option 1 of §3.3). The futures bot is single-venue and directional; the
+    # carry leg lives in the spot bot ``mexc-bot-v2`` which now consumes funding
+    # observations published by ``_publish_funding_observations`` (P1 §6 #5).
+    # Operators who set the legacy ``USE_FUNDING_CARRY_MONITOR`` /
+    # ``USE_BASIS_TRADE_MONITOR`` env flags receive a one-time deprecation
+    # warning at boot (see ``_warn_deprecated_monitor_flags``) instead of an
+    # always-on Telegram noise loop.
+
     def _enter_trade(self, signal_payload: dict[str, Any]) -> bool:
         side_name = str(signal_payload["side"])
         side = 1 if side_name == "LONG" else 3
@@ -1086,10 +2309,46 @@ class FuturesRuntime:
         if symbol in self.open_positions:
             return False
         scoped = self._config_for_symbol(symbol)
+        # Sprint 2 §2.3 — pre-funding-settlement gate.
+        if not self._funding_entry_ok(scoped, side_name):
+            return False
+        # Sprint 2 §2.9 — funding-regime stop-loss adjustment. Mutates the
+        # payload so the order submitted to the exchange reflects the new SL.
+        original_sl = float(signal_payload.get("sl_price") or 0.0)
+        adjusted_sl = self._adjust_sl_for_funding(
+            scoped=scoped,
+            side=side_name,
+            entry_price=entry_price,
+            sl_price=original_sl,
+        )
+        if adjusted_sl != original_sl:
+            signal_payload["sl_price"] = adjusted_sl
         contract = self.client.get_contract_detail(symbol)
         contract_size = float(contract.get("contractSize", 0.0001) or 0.0001)
         margin_budget = scoped.margin_budget_usdt
-        contracts = int((margin_budget * leverage / entry_price) / contract_size)
+        # Sprint 1 §2.8 — session-aligned leverage cap (no-op when flag off).
+        leverage = self._apply_session_leverage_cap(leverage)
+        # Sprint 1 §2.7 — portfolio drawdown kill (returns size_multiplier in [0,1]).
+        size_multiplier = self._drawdown_size_multiplier()
+        if size_multiplier <= 0:
+            log.info("Futures signal skipped for %s: drawdown HALT gate active", symbol)
+            return False
+        # Sprint 1 §2.1 — NAV-anchored sizing. Replaces the legacy
+        # (margin_budget × leverage / price) formula when USE_NAV_RISK_SIZING=1.
+        sl_price_for_sizing = float(signal_payload.get("sl_price") or 0.0)
+        nav_sized = self._apply_nav_risk_sizing(
+            entry_price=entry_price,
+            sl_price=sl_price_for_sizing,
+            contract_size=contract_size,
+            available_margin=margin_budget,
+            size_multiplier=size_multiplier,
+        )
+        if nav_sized is not None:
+            contracts, leverage = nav_sized
+        else:
+            contracts = int((margin_budget * leverage / entry_price) / contract_size)
+            if size_multiplier < 1.0:
+                contracts = max(0, int(contracts * size_multiplier))
         min_vol = int(float(contract.get("minVol", 1) or 1))
         if contracts < min_vol:
             log.info("Futures signal skipped: contracts below min volume")
@@ -1107,6 +2366,14 @@ class FuturesRuntime:
                 projected_margin,
                 cap,
             )
+            return False
+        # Sprint 3 §3.6 — cross-symbol VaR cap (no-op unless flag on).
+        projected_notional = contracts * contract_size * entry_price
+        if not self._portfolio_var_accepts(
+            symbol=symbol,
+            side=side_name,
+            notional_usdt=projected_notional,
+        ):
             return False
         if self.config.paper_trade:
             position = FuturesPosition(
@@ -1128,6 +2395,15 @@ class FuturesRuntime:
                 metadata=dict(signal_payload.get("metadata", {}) or {}),
             )
             self._register_position(position)
+            self._log_entry_fill(
+                position=position,
+                intended_price=entry_price,
+                fill_price=entry_price,
+                mode="paper",
+                order_id="PAPER",
+                maker_filled=False,
+                scoped=scoped,
+            )
             self._notify(self._entry_message(position))
             self._record_activity(f"Opened {side_name} {symbol} x{leverage} (paper)")
             self._save_state()
@@ -1137,21 +2413,46 @@ class FuturesRuntime:
         except Exception:
             pass
         self.client.change_leverage(symbol=symbol, leverage=leverage, position_type=1 if side_name == "LONG" else 2, open_type=self.config.open_type)
-        order = self.client.place_order(
+        # Sprint 3 §3.5 — try maker-ladder first; on timeout/failure, fall back
+        # to taker market order (original behaviour). No-op unless flag on.
+        maker_result = self._attempt_maker_ladder(
             symbol=symbol,
             side=side,
-            vol=contracts,
+            side_name=side_name,
+            contracts=contracts,
             leverage=leverage,
-            order_type=5,
-            open_type=self.config.open_type,
-            position_mode=self.config.position_mode,
-            take_profit_price=float(signal_payload["tp_price"]),
-            stop_loss_price=float(signal_payload["sl_price"]),
+            entry_price=entry_price,
+            tp_price=float(signal_payload["tp_price"]),
+            sl_price=float(signal_payload["sl_price"]),
         )
-        order_id = str(order.get("orderId") or "")
-        detail = self.client.get_order(order_id) if order_id else {}
+        if maker_result is not None:
+            order_id, detail, maker_filled = maker_result
+        else:
+            order = self.client.place_order(
+                symbol=symbol,
+                side=side,
+                vol=contracts,
+                leverage=leverage,
+                order_type=5,
+                open_type=self.config.open_type,
+                position_mode=self.config.position_mode,
+                take_profit_price=float(signal_payload["tp_price"]),
+                stop_loss_price=float(signal_payload["sl_price"]),
+            )
+            order_id = str(order.get("orderId") or "")
+            detail = self.client.get_order(order_id) if order_id else {}
+            maker_filled = False
         position_id = str(detail.get("positionId") or "")
         fill_price = float(detail.get("dealAvgPrice") or entry_price)
+        # Sprint 3 §3.9 — record entry slippage for weekly attribution report.
+        self._record_fill(
+            symbol=symbol,
+            side=side_name,
+            quoted_price=entry_price,
+            fill_price=fill_price,
+            maker=maker_filled,
+            leverage=leverage,
+        )
         position = FuturesPosition(
             symbol=symbol,
             side=side_name,
@@ -1171,16 +2472,170 @@ class FuturesRuntime:
             metadata=dict(signal_payload.get("metadata", {}) or {}),
         )
         self._register_position(position)
+        self._log_entry_fill(
+            position=position,
+            intended_price=entry_price,
+            fill_price=fill_price,
+            mode="live",
+            order_id=order_id,
+            maker_filled=maker_filled,
+            scoped=scoped,
+        )
         self._notify(self._entry_message(position))
         self._record_activity(f"Opened {side_name} {symbol} x{leverage} (live)")
         self._save_state()
         return True
+
+    def _log_entry_fill(
+        self,
+        *,
+        position: "FuturesPosition",
+        intended_price: float,
+        fill_price: float,
+        mode: str,
+        order_id: str,
+        maker_filled: bool,
+        scoped: "FuturesConfig",
+    ) -> None:
+        """Gate B B2 (memo 1 §7): structured [ENTRY] audit line per fill.
+
+        One line, key=value, covering everything needed to reconcile the
+        backtest cost model against live microstructure: intended vs filled
+        price, signed slippage in bps, leverage used, position size in
+        contracts/notional/margin, and the current 8h funding rate so
+        post-hoc funding accrual can be estimated from hold duration.
+        """
+
+        try:
+            intended = float(intended_price) if intended_price else 0.0
+            fill = float(fill_price) if fill_price else intended
+            if intended > 0:
+                raw_bps = (fill - intended) / intended * 10_000.0
+                slippage_bps = raw_bps if position.side == "LONG" else -raw_bps
+            else:
+                slippage_bps = 0.0
+            notional = float(position.contracts) * float(position.contract_size) * fill
+            funding_rate = 0.0
+            try:
+                funding_rate = float(self._current_funding_rate(scoped))
+            except Exception:
+                funding_rate = 0.0
+            log.info(
+                "[ENTRY] symbol=%s side=%s mode=%s maker=%s intended=%s fill=%s "
+                "slippage_bps=%+.2f leverage=x%d contracts=%d notional_usdt=%.2f "
+                "margin_usdt=%.4f funding_8h=%+.5f score=%.2f order=%s",
+                position.symbol,
+                position.side,
+                mode,
+                "true" if maker_filled else "false",
+                self._format_price(intended),
+                self._format_price(fill),
+                slippage_bps,
+                int(position.leverage),
+                int(position.contracts),
+                notional,
+                float(position.margin_usdt),
+                funding_rate,
+                float(position.score),
+                order_id or "",
+            )
+            # P2 §6 #13 — companion JSON audit event with the same fields.
+            self._emit_audit_event(
+                "ENTRY",
+                {
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "mode": mode,
+                    "maker_filled": bool(maker_filled),
+                    "intended_price": float(intended),
+                    "fill_price": float(fill),
+                    "slippage_bps": float(slippage_bps),
+                    "leverage": int(position.leverage),
+                    "contracts": int(position.contracts),
+                    "notional_usdt": float(notional),
+                    "margin_usdt": float(position.margin_usdt),
+                    "funding_rate_8h": float(funding_rate),
+                    "score": float(position.score),
+                    "certainty": float(position.certainty),
+                    "entry_signal": position.entry_signal,
+                    "order_id": order_id or "",
+                    "opened_at": position.opened_at.isoformat(),
+                },
+            )
+        except Exception as exc:  # pragma: no cover — never block an entry on log failure
+            log.debug("Entry fill log skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # P2 §6 #13 — structured trade audit log.
+    # Each lifecycle event (ENTRY / EXIT / FUNDING / FEE / etc.) produces a
+    # single ``[AUDIT] {json}`` line. JSON is sorted-keys + compact-separators
+    # so downstream log-shippers can parse without ambiguity. The emitter is
+    # best-effort: a malformed payload must never block trading.
+    # ------------------------------------------------------------------
+    def _emit_audit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        try:
+            import json as _json
+
+            envelope = {
+                "schema_version": 1,
+                "event_type": str(event_type).upper(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
+                "mode": "paper" if self.config.paper_trade else "live",
+                "payload": payload,
+            }
+            log.info("[AUDIT] %s", _json.dumps(envelope, separators=(",", ":"), sort_keys=True, default=str))
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("Audit emit failed event=%s: %s", event_type, exc)
+
+    # ------------------------------------------------------------------
+    # P2 §6 #11 — boot-time deprecation warning for the legacy in-bot
+    # carry/basis monitor flags. Operators who still set these get a single
+    # warning pointing them at the new spot-bot consumer instead of the
+    # decommissioned Telegram alerts.
+    # ------------------------------------------------------------------
+    def _warn_deprecated_monitor_flags(self) -> None:
+        import os as _os
+
+        deprecated = []
+        for name in ("USE_FUNDING_CARRY_MONITOR", "USE_BASIS_TRADE_MONITOR"):
+            if _os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}:
+                deprecated.append(name)
+        if not deprecated:
+            return
+        log.warning(
+            "[DEPRECATED] %s is set but the in-bot Telegram carry/basis monitor "
+            "was decommissioned in P2 (assessment §6 #11). Funding intelligence "
+            "is now published to Redis via _publish_funding_observations and "
+            "consumed by the spot bot mexc-bot-v2. Unset these env flags.",
+            ",".join(deprecated),
+        )
+
+    # ------------------------------------------------------------------
+    # P2 §6 #12 — boot-time warning when SILVER_USDT / XAUT_USDT are in the
+    # active symbol list. The assessment recommends dropping these from a
+    # momentum bot until a session-aware mean-reversion sleeve exists; the
+    # warning is non-blocking so operators can opt in deliberately.
+    # ------------------------------------------------------------------
+    def _warn_unsuitable_symbols(self) -> None:
+        unsuitable = {"SILVER_USDT", "XAUT_USDT"}
+        flagged = [s for s in self._active_symbols if s.upper() in unsuitable]
+        if not flagged:
+            return
+        log.warning(
+            "[SYMBOL_NOTICE] %s in active symbols. The assessment §3.5 flags "
+            "these as poor strategy instruments for this BTC-tuned momentum "
+            "bot (thin perp books, FX-correlated). Consider dropping until a "
+            "session-aware mean-reversion sleeve exists.",
+            ",".join(flagged),
+        )
 
     def _log_boot_manifest(self) -> None:
         """Gate A A6 (memo 1 §7): single ``[BOOT]`` log line with all live-config state."""
         import os as _os
 
         cfg = self.config
+        # Per-symbol effective config snapshot — surfaces any symbol that is
+        # running an override so the operator can see it without env diffing.
         per_symbol_overrides: list[str] = []
         for sym in cfg.symbols:
             scoped = self._config_for_symbol(sym) if hasattr(self, "_config_for_symbol") else cfg
@@ -1201,6 +2656,7 @@ class FuturesRuntime:
             if deltas:
                 per_symbol_overrides.append(f"{sym}[{' '.join(deltas)}]")
 
+        # Sprint flag state — reveal which opt-in overlays are actually live.
         sprint_flags = [
             name
             for name in (
@@ -1248,14 +2704,99 @@ class FuturesRuntime:
             ",".join(sprint_flags) if sprint_flags else "none",
         )
 
+        # Loud warning for the combination that produces silent idleness: gate
+        # so tight that every symbol is rejected (the 4-of-6 symbol problem
+        # flagged in memo 1 §3) or funding gate disabled in live mode.
         if cfg.funding_rate_abs_max <= 0 and not cfg.paper_trade:
             log.warning(
                 "[BOOT] FUTURES_FUNDING_RATE_ABS_MAX=0 in LIVE mode — "
                 "funding-rate gate is disabled; x20-x50 perps may bleed funding in crowded regimes."
             )
 
+        # Gate B B1 (memo 1 §7): loud [LIVE] banner on every boot in live mode
+        # so the first fill after a paper→live flip is unmistakable in the
+        # log. Lists the money-at-risk knobs in one place.
+        if not cfg.paper_trade:
+            max_margin = cfg.max_total_margin_usdt
+            if max_margin <= 0:
+                max_margin = cfg.margin_budget_usdt * cfg.max_concurrent_positions
+            log.warning(
+                "[LIVE] real-money mode active | symbols=%s | leverage=x%d-x%d | "
+                "per_trade_margin=$%.2f | max_total_margin=$%.2f | max_concurrent=%d | "
+                "hard_loss_cap_pct=%.2f%% | funding_gate=%.5f",
+                ",".join(cfg.symbols),
+                cfg.leverage_min,
+                cfg.leverage_max,
+                cfg.margin_budget_usdt,
+                max_margin,
+                cfg.max_concurrent_positions,
+                cfg.hard_loss_cap_pct * 100.0,
+                cfg.funding_rate_abs_max,
+            )
+
+    def _validate_exchange_specs_on_boot(self) -> None:
+        """Gate B B4 (memo 1 §7): boot-time MEXC contract-spec check.
+
+        Fetches ``get_contract_detail`` for each active symbol and validates
+        ``contractSize``, ``minVol``, ``priceUnit``, ``takerFeeRate`` against
+        known expected values in ``exchange_spec.DEFAULT_EXPECTATIONS``.
+
+        Behaviour is controlled by ``FUTURES_EXCHANGE_SPEC_STRICT`` (default
+        true). Strict mode raises SystemExit on any mismatch; warn mode logs
+        but lets the runtime start.
+
+        Opt-out entirely with ``FUTURES_EXCHANGE_SPEC_CHECK=false`` (default
+        true) — useful for unit tests that stub out the client.
+        """
+
+        import os as _os
+
+        check_on = str(_os.environ.get("FUTURES_EXCHANGE_SPEC_CHECK", "true")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not check_on:
+            return
+        strict = str(_os.environ.get("FUTURES_EXCHANGE_SPEC_STRICT", "true")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            from futuresbot.exchange_spec import (
+                DEFAULT_EXPECTATIONS,
+                validate_specs,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("Exchange-spec validator unavailable: %s", exc)
+            return
+
+        symbols = list(self.config.symbols)
+        all_ok, reasons = validate_specs(
+            symbols=symbols,
+            fetcher=self.client.get_contract_detail,
+            expectations=DEFAULT_EXPECTATIONS,
+        )
+        if all_ok:
+            log.info("[EXCHANGE_SPEC_OK] validated %d symbols: %s", len(symbols), ",".join(symbols))
+            return
+        for reason in reasons:
+            log.error("[EXCHANGE_SPEC_FAIL] %s", reason)
+        if strict:
+            raise SystemExit(
+                "Gate B B4: exchange-spec mismatch blocked startup. "
+                f"Reasons: {reasons}. Set FUTURES_EXCHANGE_SPEC_STRICT=false to downgrade to warn."
+            )
+        log.warning(
+            "[EXCHANGE_SPEC_WARN] %d mismatches accepted (strict mode off)",
+            len(reasons),
+        )
+
     def run(self) -> None:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        _configure_logging()
         log.info(
             "Starting futures runtime mode=%s symbols=%s hourly_check_seconds=%s heartbeat_seconds=%s paper_trade=%s",
             self._mode_label(),
@@ -1264,8 +2805,27 @@ class FuturesRuntime:
             self.config.heartbeat_seconds,
             self.config.paper_trade,
         )
-        # Gate A A6 (memo 1 §7): single structured [BOOT] manifest line.
+        # Gate A A6 (memo 1 §7): single structured [BOOT] manifest line so the
+        # operator can read the full live-config state (filter thresholds,
+        # funding-gate state, leverage band, Sprint flags) on redeploy without
+        # diffing Railway env against code defaults.
         self._log_boot_manifest()
+        # Gate B B4 (memo 1 §7): validate MEXC contract-spec for every active
+        # symbol before the first cycle — refuses to start in strict mode if
+        # contractSize/minVol/takerFeeRate don't match expected values.
+        self._validate_exchange_specs_on_boot()
+        # P1 §6 #9 — boot-time per-symbol [CONTRACT_SPEC] log, listing the
+        # MEXC contractSize / minVol / priceUnit / maxLeverage / takerFeeRate
+        # so an operator can debug a 400 reject without reading the validator
+        # source. Kicks off after exchange-spec validation so we only log what
+        # passed strict mode (symbols that failed are absent from active).
+        self._validate_symbols()
+        self._emit_contract_specs()
+        # P2 §6 #11 / §6 #12 — surface deprecation + unsuitable-symbol notices
+        # exactly once at boot, after symbol validation has settled the active
+        # list (so we don't warn about symbols the validator already dropped).
+        self._warn_deprecated_monitor_flags()
+        self._warn_unsuitable_symbols()
         self._send_startup_message()
         self._record_activity("Runtime started")
         while True:
@@ -1288,6 +2848,9 @@ class FuturesRuntime:
                             pos_price = current_price
                     except Exception:
                         pos_price = current_price
+                    # Sprint 1 §2.5 — pre-liquidation force-close. No-op when flag off.
+                    if self._liq_buffer_force_close(position, pos_price):
+                        continue
                     self._hourly_exit(position, pos_price)
                 # Attempt new entries for any remaining slots (highest-score signal wins
                 # each cycle; bucket / concurrency / session / funding gates enforced inside).
@@ -1296,8 +2859,16 @@ class FuturesRuntime:
                 self._write_status(signal=signal, price=current_price)
                 if signal is not None:
                     self._enter_trade(signal)
+                # P1 §6 #5 (assessment) + cross-bot synergy with mexc-bot-v2:
+                # publish the funding-rate observations gathered this cycle to
+                # Redis. The spot bot consumes them via mexcbot/funding_carry.
+                # Default ON; opt out with USE_FUNDING_OBSERVATIONS_PUBLISH=0.
+                self._publish_funding_observations()
                 self._log_cycle_summary(price=current_price, signal=signal)
                 self._send_heartbeat(price=current_price, signal=signal)
+                # P2 §6 #11 — carry/basis monitor calls intentionally removed.
+                # Funding-carry intelligence is now published to Redis for the
+                # spot bot via ``_publish_funding_observations`` (P1 §6 #5).
             except Exception as exc:
                 log.exception("Futures runtime loop failed: %s", exc)
                 self._record_activity(f"Runtime error: {type(exc).__name__}")
@@ -1311,8 +2882,44 @@ class FuturesRuntime:
             time.sleep(self.config.hourly_check_seconds)
 
 
+def _configure_logging() -> None:
+    """P1 §6 #7 — split healthy/error streams so Railway stops painting every
+    INFO line with severity=error.
+
+    INFO/DEBUG → stdout (Railway treats stdout as severity=info)
+    WARNING+   → stderr (Railway treats stderr as severity=error)
+
+    Idempotent: subsequent calls are a no-op when our handlers are already
+    installed on the root logger.
+    """
+
+    import sys as _sys
+
+    root = logging.getLogger()
+    # Detect prior install via a tagged attribute on the handler.
+    for h in root.handlers:
+        if getattr(h, "_futuresbot_split_handler", False):
+            return
+    # Tear down any default handlers (basicConfig from prior boot, libraries).
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    stdout_handler = logging.StreamHandler(_sys.stdout)
+    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+    stdout_handler.setFormatter(fmt)
+    stdout_handler._futuresbot_split_handler = True  # type: ignore[attr-defined]
+    stderr_handler = logging.StreamHandler(_sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(fmt)
+    stderr_handler._futuresbot_split_handler = True  # type: ignore[attr-defined]
+    root.addHandler(stdout_handler)
+    root.addHandler(stderr_handler)
+    root.setLevel(logging.INFO)
+
+
 def run_runtime() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    _configure_logging()
     try:
         config = FuturesConfig.from_env()
         client = MexcFuturesClient(config)

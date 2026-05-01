@@ -17,6 +17,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class StrategyConfig(Protocol):
     symbol: str
     min_confidence_score: float
@@ -48,6 +55,30 @@ def _safe_float(value: float | int | None) -> float:
     return float(value)
 
 
+def _round_price_precision(price: float) -> float:
+    """Round prices to a scale-appropriate precision.
+
+    Fixes sub-cent-coin pricing (PEPE, SHIB, etc.): rounding to 2 decimals
+    flattens them to 0.00 and silently corrupts every downstream calc that
+    reads ``signal.entry_price`` / ``tp_price`` / ``sl_price``.
+    """
+
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return 0.0
+    ax = abs(px)
+    if ax <= 0:
+        return 0.0
+    if ax < 0.001:
+        return round(px, 10)
+    if ax < 0.1:
+        return round(px, 6)
+    if ax < 100:
+        return round(px, 4)
+    return round(px, 2)
+
+
 def _confidence(score: float, threshold: float) -> float:
     return max(0.35, min(0.99, 0.35 + max(0.0, score - threshold) / 40.0))
 
@@ -60,6 +91,68 @@ def _leverage_for_signal(certainty: float, sl_distance_pct: float, config: Strat
     if risk_cap < config.leverage_min:
         return None
     return max(config.leverage_min, min(config.leverage_max, int(round(target)), risk_cap))
+
+
+def _passes_cost_budget_gate(
+    *,
+    entry_price: float,
+    tp_price: float,
+    sl_price: float,
+    leverage: int,
+    symbol: str | None = None,
+) -> bool:
+    """Sprint 1 §2.2 — cost-adjusted reward/risk gate.
+
+    Off by default. When ``USE_COST_BUDGET_RR=1`` is set, require that
+    ``tp_distance / (sl_distance + expected_cost)`` clears ``MIN_NET_RR``
+    (default 1.8). Expected cost uses a conservative funding + slippage
+    estimate scaled by leverage.
+
+    Never raises — any import or arithmetic failure falls open (legacy gate
+    behaviour) so live trading is not interrupted by a Sprint 1 plumbing bug.
+    """
+
+    if os.environ.get("USE_COST_BUDGET_RR", "0").strip() not in {"1", "true", "yes", "y", "on"}:
+        return True
+    try:
+        from futuresbot.cost_budget import compute_cost_bps, passes_cost_adjusted_rr
+
+        if entry_price <= 0:
+            return True
+        tp_distance_pct = abs(tp_price - entry_price) / entry_price
+        sl_distance_pct = abs(entry_price - sl_price) / entry_price
+        hold_hours = _env_float("COST_BUDGET_HOLD_HOURS", 4.0)
+        funding_rate = _env_float("COST_BUDGET_FUNDING_RATE_8H", 0.0001)
+        # P1 (third assessment) §5 #1+#2 — prefer the per-symbol taker fee
+        # resolved at boot from the venue contract-detail endpoint
+        # (``COST_BUDGET_TAKER_FEE_RATE_<NORMALIZED_SYMBOL>``) over the
+        # global env default. Falls back to the global default when the
+        # runtime hasn't populated a per-symbol entry (e.g. tests or first
+        # boot before ``_emit_contract_specs`` runs).
+        taker_fee = _env_float("COST_BUDGET_TAKER_FEE_RATE", 0.0004)
+        if symbol:
+            normalized = "".join(ch if ch.isalnum() else "_" for ch in symbol.upper())
+            override = os.environ.get(f"COST_BUDGET_TAKER_FEE_RATE_{normalized}")
+            if override is not None:
+                try:
+                    taker_fee = float(override)
+                except (TypeError, ValueError):
+                    pass
+        cost = compute_cost_bps(
+            leverage=leverage,
+            hold_hours=hold_hours,
+            funding_rate_8h=funding_rate,
+            taker_fee_rate=taker_fee,
+        )
+        min_rr = _env_float("MIN_NET_RR", 1.8)
+        return passes_cost_adjusted_rr(
+            tp_distance_pct=tp_distance_pct,
+            sl_distance_pct=sl_distance_pct,
+            cost_bps=cost.total_bps,
+            min_rr=min_rr,
+        )
+    except Exception:
+        return True
 
 
 def _build_signal(
@@ -78,14 +171,22 @@ def _build_signal(
     leverage = _leverage_for_signal(certainty, sl_distance_pct, config)
     if leverage is None:
         return None
+    if not _passes_cost_budget_gate(
+        entry_price=entry_price,
+        tp_price=tp_price,
+        sl_price=sl_price,
+        leverage=leverage,
+        symbol=getattr(config, "symbol", None),
+    ):
+        return None
     return FuturesSignal(
         symbol=config.symbol,
         side=side,
         score=round(score, 2),
         certainty=round(certainty, 4),
-        entry_price=round(entry_price, 2),
-        tp_price=round(tp_price, 2),
-        sl_price=round(sl_price, 2),
+        entry_price=_round_price_precision(entry_price),
+        tp_price=_round_price_precision(tp_price),
+        sl_price=_round_price_precision(sl_price),
         leverage=leverage,
         entry_signal=entry_signal,
         metadata={
@@ -106,6 +207,9 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         return None
 
     close_15 = frame_15m["close"].astype(float)
+    open_15 = frame_15m["open"].astype(float)
+    high_15 = frame_15m["high"].astype(float)
+    low_15 = frame_15m["low"].astype(float)
     volume_15 = frame_15m["volume"].astype(float)
     close_1h = frame_1h["close"].astype(float)
     high_1h = frame_1h["high"].astype(float)
@@ -202,6 +306,60 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
     rsi_1h_short_cont = _env_float("FUTURES_RSI_1H_SHORT_CONT_MAX", 50.0)
     rsi_15_short_cont = _env_float("FUTURES_RSI_15_SHORT_CONT_MAX", 52.0)
 
+    impulse_enabled = _env_bool("FUTURES_IMPULSE_CONTINUATION_ENABLED", True)
+    impulse_lookback_bars = max(3, int(_env_float("FUTURES_IMPULSE_LOOKBACK_BARS", 8.0)))
+    impulse_min_move_pct = _env_float("FUTURES_IMPULSE_MIN_MOVE_PCT", 0.006)
+    impulse_min_move_atr = _env_float("FUTURES_IMPULSE_MIN_MOVE_ATR", 1.10)
+    impulse_volume_floor = _env_float("FUTURES_IMPULSE_VOLUME_FLOOR", 0.75)
+    impulse_adx_min = _env_float("FUTURES_IMPULSE_ADX_MIN", 12.0)
+    impulse_trend_6h_min = _env_float("FUTURES_IMPULSE_TREND_6H_MIN", 0.0005)
+    impulse_rsi_1h_long_min = _env_float("FUTURES_IMPULSE_RSI_1H_LONG_MIN", 48.0)
+    impulse_rsi_15_long_min = _env_float("FUTURES_IMPULSE_RSI_15_LONG_MIN", 50.0)
+    impulse_rsi_1h_short_max = _env_float("FUTURES_IMPULSE_RSI_1H_SHORT_MAX", 52.0)
+    impulse_rsi_15_short_max = _env_float("FUTURES_IMPULSE_RSI_15_SHORT_MAX", 50.0)
+    impulse_close_buffer_atr = _env_float("FUTURES_IMPULSE_CLOSE_BUFFER_ATR", 0.35)
+    impulse_max_ema_extension_atr = _env_float("FUTURES_IMPULSE_MAX_EMA_EXTENSION_ATR", 2.75)
+    impulse_reference = current_price
+    if len(close_15) > impulse_lookback_bars:
+        impulse_reference = float(close_15.iloc[-(impulse_lookback_bars + 1)])
+    impulse_move_pct = (current_price / impulse_reference) - 1.0 if impulse_reference > 0 else 0.0
+    impulse_move_atr = abs(current_price - impulse_reference) / current_atr_15 if current_atr_15 > 0 else 0.0
+    impulse_recent_high = float(high_15.iloc[-impulse_lookback_bars:].max())
+    impulse_recent_low = float(low_15.iloc[-impulse_lookback_bars:].min())
+    impulse_recent_close_high = float(close_15.iloc[-impulse_lookback_bars:].max())
+    impulse_recent_close_low = float(close_15.iloc[-impulse_lookback_bars:].min())
+    impulse_close_near_high = current_price >= impulse_recent_close_high - current_atr_15 * impulse_close_buffer_atr
+    impulse_close_near_low = current_price <= impulse_recent_close_low + current_atr_15 * impulse_close_buffer_atr
+    impulse_ema_extension = abs(current_price - current_ema20) / current_atr_1h if current_atr_1h > 0 else 999.0
+    impulse_volume_ok = volume_ratio >= impulse_volume_floor or impulse_move_atr >= impulse_min_move_atr * 1.35
+    impulse_body = abs(float(close_15.iloc[-1]) - float(open_15.iloc[-1])) / current_atr_15 if current_atr_15 > 0 else 0.0
+    impulse_long_ok = (
+        impulse_enabled
+        and impulse_move_pct >= impulse_min_move_pct
+        and impulse_move_atr >= impulse_min_move_atr
+        and impulse_volume_ok
+        and current_adx >= impulse_adx_min
+        and current_rsi_1h >= impulse_rsi_1h_long_min
+        and current_rsi_15 >= impulse_rsi_15_long_min
+        and (trend_6h >= impulse_trend_6h_min or ema_slope > 0)
+        and current_price > current_ema20
+        and impulse_close_near_high
+        and impulse_ema_extension <= impulse_max_ema_extension_atr
+    )
+    impulse_short_ok = (
+        impulse_enabled
+        and impulse_move_pct <= -impulse_min_move_pct
+        and impulse_move_atr >= impulse_min_move_atr
+        and impulse_volume_ok
+        and current_adx >= impulse_adx_min
+        and current_rsi_1h <= impulse_rsi_1h_short_max
+        and current_rsi_15 <= impulse_rsi_15_short_max
+        and (trend_6h <= -impulse_trend_6h_min or ema_slope < 0)
+        and current_price < current_ema20
+        and impulse_close_near_low
+        and impulse_ema_extension <= impulse_max_ema_extension_atr
+    )
+
     long_ok = (
         consolidation_ok
         and current_adx >= config.adx_floor
@@ -259,6 +417,13 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         long_score += min(10.0, max(0.0, ema_gap * 850.0))
         long_score += min(6.0, max(0.0, (volume_ratio - volume_floor_cfg) * 10.0))
         long_score -= 6.0  # continuation discount vs. fresh breakout
+    elif impulse_long_ok:
+        long_score += min(14.0, max(0.0, impulse_move_pct * 900.0))
+        long_score += min(10.0, max(0.0, impulse_move_atr * 2.5))
+        long_score += min(8.0, max(0.0, (volume_ratio - impulse_volume_floor) * 8.0))
+        long_score += min(6.0, max(0.0, (current_adx - impulse_adx_min) * 0.8))
+        long_score += 4.0 if trend_6h > 0 else 0.0
+        long_score += 3.0 if current_ema20 > current_ema50 or ema_slope > 0 else 0.0
 
     short_score = 40.0
     if short_ok:
@@ -276,17 +441,39 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         short_score += min(10.0, max(0.0, abs(ema_gap) * 850.0))
         short_score += min(6.0, max(0.0, (volume_ratio - volume_floor_cfg) * 10.0))
         short_score -= 6.0
+    elif impulse_short_ok:
+        short_score += min(14.0, max(0.0, abs(impulse_move_pct) * 900.0))
+        short_score += min(10.0, max(0.0, impulse_move_atr * 2.5))
+        short_score += min(8.0, max(0.0, (volume_ratio - impulse_volume_floor) * 8.0))
+        short_score += min(6.0, max(0.0, (current_adx - impulse_adx_min) * 0.8))
+        short_score += 4.0 if trend_6h < 0 else 0.0
+        short_score += 3.0 if current_ema20 < current_ema50 or ema_slope < 0 else 0.0
 
     if long_score < config.min_confidence_score and short_score < config.min_confidence_score:
         return None
 
     if long_score >= short_score:
-        tp_move = max(config.tp_atr_mult * current_atr_1h, config.tp_range_mult * consolidation_range, config.tp_floor_pct * current_price)
-        sl_price = min(
-            consolidation_low - config.sl_buffer_atr_mult * current_atr_1h,
-            current_ema50 - config.sl_trend_atr_mult * current_atr_1h,
-            current_price - current_atr_1h * 0.85,
-        )
+        impulse_path = impulse_long_ok and not (long_ok or continuation_long_ok)
+        if impulse_path:
+            tp_move = max(
+                _env_float("FUTURES_IMPULSE_TP_ATR_MULT", 5.0) * current_atr_15,
+                _env_float("FUTURES_IMPULSE_TP_FLOOR_PCT", 0.012) * current_price,
+            )
+            max_stop_pct = _env_float("FUTURES_IMPULSE_MAX_STOP_PCT", 0.012)
+            sl_price = max(
+                impulse_recent_low - current_atr_15 * _env_float("FUTURES_IMPULSE_SWING_SL_BUFFER_ATR", 0.25),
+                current_price - current_atr_15 * _env_float("FUTURES_IMPULSE_SL_ATR_MULT", 3.0),
+                current_price * (1.0 - max_stop_pct),
+            )
+            if sl_price >= current_price:
+                sl_price = current_price - current_atr_15 * _env_float("FUTURES_IMPULSE_SL_ATR_MULT", 3.0)
+        else:
+            tp_move = max(config.tp_atr_mult * current_atr_1h, config.tp_range_mult * consolidation_range, config.tp_floor_pct * current_price)
+            sl_price = min(
+                consolidation_low - config.sl_buffer_atr_mult * current_atr_1h,
+                current_ema50 - config.sl_trend_atr_mult * current_atr_1h,
+                current_price - current_atr_1h * 0.85,
+            )
         reward = tp_move
         risk = current_price - sl_price
         if risk <= 0 or reward / risk < config.min_reward_risk:
@@ -298,9 +485,10 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
             tp_price=current_price + tp_move,
             sl_price=sl_price,
             entry_signal=(
-                "COIL_BREAKOUT_LONG" if breakout_long
-                else "PRESSURE_BREAK_LONG" if pressure_long
-                else "TREND_CONTINUATION_LONG"
+                "COIL_BREAKOUT_LONG" if long_ok and breakout_long
+                else "PRESSURE_BREAK_LONG" if long_ok and pressure_long
+                else "TREND_CONTINUATION_LONG" if continuation_long_ok
+                else "IMPULSE_EVENT_CONTINUATION_LONG"
             ),
             config=config,
             metadata={
@@ -309,15 +497,33 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
                 "adx_1h": round(current_adx, 4),
                 "volume_ratio": round(volume_ratio, 4),
                 "consolidation_range_pct": round(consolidation_range_pct, 6),
+                "impulse_move_pct": round(impulse_move_pct, 6),
+                "impulse_move_atr": round(impulse_move_atr, 4),
+                "impulse_body_atr": round(impulse_body, 4),
             },
         )
 
-    tp_move = max(config.tp_atr_mult * current_atr_1h, config.tp_range_mult * consolidation_range, config.tp_floor_pct * current_price)
-    sl_price = max(
-        consolidation_high + config.sl_buffer_atr_mult * current_atr_1h,
-        current_ema50 + config.sl_trend_atr_mult * current_atr_1h,
-        current_price + current_atr_1h * 0.85,
-    )
+    impulse_path = impulse_short_ok and not (short_ok or continuation_short_ok)
+    if impulse_path:
+        tp_move = max(
+            _env_float("FUTURES_IMPULSE_TP_ATR_MULT", 5.0) * current_atr_15,
+            _env_float("FUTURES_IMPULSE_TP_FLOOR_PCT", 0.012) * current_price,
+        )
+        max_stop_pct = _env_float("FUTURES_IMPULSE_MAX_STOP_PCT", 0.012)
+        sl_price = min(
+            impulse_recent_high + current_atr_15 * _env_float("FUTURES_IMPULSE_SWING_SL_BUFFER_ATR", 0.25),
+            current_price + current_atr_15 * _env_float("FUTURES_IMPULSE_SL_ATR_MULT", 3.0),
+            current_price * (1.0 + max_stop_pct),
+        )
+        if sl_price <= current_price:
+            sl_price = current_price + current_atr_15 * _env_float("FUTURES_IMPULSE_SL_ATR_MULT", 3.0)
+    else:
+        tp_move = max(config.tp_atr_mult * current_atr_1h, config.tp_range_mult * consolidation_range, config.tp_floor_pct * current_price)
+        sl_price = max(
+            consolidation_high + config.sl_buffer_atr_mult * current_atr_1h,
+            current_ema50 + config.sl_trend_atr_mult * current_atr_1h,
+            current_price + current_atr_1h * 0.85,
+        )
     reward = tp_move
     risk = sl_price - current_price
     if risk <= 0 or reward / risk < config.min_reward_risk:
@@ -329,9 +535,10 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         tp_price=current_price - tp_move,
         sl_price=sl_price,
         entry_signal=(
-            "COIL_BREAKDOWN_SHORT" if breakout_short
-            else "PRESSURE_BREAK_SHORT" if pressure_short
-            else "TREND_CONTINUATION_SHORT"
+            "COIL_BREAKDOWN_SHORT" if short_ok and breakout_short
+            else "PRESSURE_BREAK_SHORT" if short_ok and pressure_short
+            else "TREND_CONTINUATION_SHORT" if continuation_short_ok
+            else "IMPULSE_EVENT_CONTINUATION_SHORT"
         ),
         config=config,
         metadata={
@@ -340,17 +547,21 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
             "adx_1h": round(current_adx, 4),
             "volume_ratio": round(volume_ratio, 4),
             "consolidation_range_pct": round(consolidation_range_pct, 6),
+            "impulse_move_pct": round(impulse_move_pct, 6),
+            "impulse_move_atr": round(impulse_move_atr, 4),
+            "impulse_body_atr": round(impulse_body, 4),
         },
     )
 
+
 def diagnose_setup_rejection(frame_15m: pd.DataFrame, config: StrategyConfig) -> str:
-    """Gate A A5 (memo 1 Â§7): return the *first* gate that rejected a bar.
+    """Gate A A5 (memo 1 §7): return the *first* gate that rejected a bar.
 
     Pure function, no I/O. Used by the runtime to emit a ``[GATE_BLOCK]`` log
     line explaining why ``score_btc_futures_setup`` returned ``None``, so the
     operator can tell the difference between "market was quiet" and "filters
     are mathematically unreachable for this symbol" (the Futures-bot memo 1
-    Â§3 finding on PEPE / TAO running BTC-tuned gates).
+    §3 finding on PEPE / TAO running BTC-tuned gates).
 
     The diagnosis is best-effort and conservative: any compute failure returns
     ``"diagnostic_error"`` rather than raising.
@@ -438,7 +649,7 @@ def diagnose_setup_rejection(frame_15m: pd.DataFrame, config: StrategyConfig) ->
             if current_rsi_15 > 52.0:
                 return f"rsi_15={current_rsi_15:.1f}>52.0 (short-stack)"
 
-        # Breakout / pressure zone â€” if we got here, stack and trend are fine
+        # Breakout / pressure zone — if we got here, stack and trend are fine
         # but the trigger bar is not in a breakout region.
         breakout_buffer = current_atr_15 * config.breakout_buffer_atr
         if long_stack:

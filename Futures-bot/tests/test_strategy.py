@@ -61,3 +61,45 @@ def test_strategy_produces_short_signal_on_downtrend_breakdown():
     assert signal is not None
     assert signal.side == "SHORT"
     assert 20 <= signal.leverage <= 50
+
+
+def test_strategy_produces_impulse_event_continuation_long(monkeypatch):
+    monkeypatch.setenv("FUTURES_IMPULSE_CONTINUATION_ENABLED", "1")
+    monkeypatch.setenv("FUTURES_IMPULSE_ADX_MIN", "0")
+    monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_ATR", "0.50")
+    monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_PCT", "0.006")
+    monkeypatch.setenv("FUTURES_IMPULSE_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [100000 + math.sin(idx / 6.0) * 35 + math.cos(idx / 13.0) * 25 for idx in range(520)]
+    anchor = base[-10]
+    for offset in range(9):
+        base[-9 + offset] = anchor * (1.0 + 0.0011 * (offset + 1))
+    frame = _frame_from_prices(base)
+
+    signal = score_btc_futures_setup(frame, replace(_config(), trend_24h_floor=0.05, trend_6h_floor=0.02))
+
+    assert signal is not None
+    assert signal.side == "LONG"
+    assert signal.entry_signal == "IMPULSE_EVENT_CONTINUATION_LONG"
+    assert signal.metadata["impulse_move_pct"] > 0
+
+
+def test_strategy_produces_impulse_event_continuation_short(monkeypatch):
+    monkeypatch.setenv("FUTURES_IMPULSE_CONTINUATION_ENABLED", "1")
+    monkeypatch.setenv("FUTURES_IMPULSE_ADX_MIN", "0")
+    monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_ATR", "0.50")
+    monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_PCT", "0.006")
+    monkeypatch.setenv("FUTURES_IMPULSE_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [100000 + math.sin(idx / 6.0) * 35 + math.cos(idx / 13.0) * 25 for idx in range(520)]
+    anchor = base[-10]
+    for offset in range(9):
+        base[-9 + offset] = anchor * (1.0 - 0.0011 * (offset + 1))
+    frame = _frame_from_prices(base)
+
+    signal = score_btc_futures_setup(frame, replace(_config(), trend_24h_floor=0.05, trend_6h_floor=0.02))
+
+    assert signal is not None
+    assert signal.side == "SHORT"
+    assert signal.entry_signal == "IMPULSE_EVENT_CONTINUATION_SHORT"
+    assert signal.metadata["impulse_move_pct"] < 0

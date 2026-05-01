@@ -156,7 +156,7 @@ def test_funding_rate_abs_max_default(monkeypatch):
         if name.startswith("FUTURES_") or name.startswith("USE_") or name in {"MEXC_API_KEY", "MEXC_API_SECRET"}:
             monkeypatch.delenv(name, raising=False)
     cfg = FuturesConfig.from_env()
-    assert cfg.funding_rate_abs_max == pytest.approx(0.0008)
+    assert cfg.funding_rate_abs_max == pytest.approx(0.0002)
 
 
 def test_calibration_min_total_trades_default(monkeypatch):
@@ -165,6 +165,19 @@ def test_calibration_min_total_trades_default(monkeypatch):
             monkeypatch.delenv(name, raising=False)
     cfg = FuturesConfig.from_env()
     assert cfg.calibration_min_total_trades == 15
+
+
+def test_symbol_leverage_max_override_clamps_min(monkeypatch):
+    for name in list(os.environ):
+        if name.startswith("FUTURES_") or name.startswith("USE_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FUTURES_SYMBOLS", "BTC_USDT,TAO_USDT")
+    monkeypatch.setenv("FUTURES_TAOUSDT_LEVERAGE_MAX", "8")
+
+    cfg = FuturesConfig.from_env().for_symbol("TAO_USDT")
+
+    assert cfg.leverage_max == 8
+    assert cfg.leverage_min == 8
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +286,11 @@ def _runtime_stub() -> FuturesRuntime:
     cfg.min_reward_risk = 1.15
     cfg.funding_rate_abs_max = 0.0008
     cfg.calibration_min_total_trades = 15
+    # Fields read by the [LIVE] banner section of _log_boot_manifest in the
+    # synced runtime — set explicit numerics so MagicMock comparisons work.
+    cfg.max_total_margin_usdt = 0.0
+    cfg.max_concurrent_positions = 1
+    cfg.margin_budget_usdt = 75.0
     r.config = cfg
     # Bypass per-symbol override lookup (return base config unchanged)
     r._config_for_symbol = lambda sym: cfg  # type: ignore[method-assign]

@@ -205,13 +205,35 @@ class FuturesConfig:
     funding_rate_abs_max: float = 0.0
     open_type: int = 1
     position_mode: int = 2
+    # P1 (third assessment) §5 #3 — separate Redis key for a long-window
+    # backtest "seed" calibration, consulted as a fallback when the live
+    # calibration (``calibration_redis_key``) fails the freshness or
+    # sample-size gate. Empty string disables the fallback.
+    calibration_seed_redis_key: str = ""
+    # P1 §6 #5 — cross-bot synergy: Redis key the futures bot publishes
+    # funding-rate observations under, consumed by the spot bot's funding
+    # carry sleeve (mexc-bot-v2/mexcbot/funding_carry.py).
+    funding_observations_redis_key: str = "mexc_funding_observations"
+    crypto_event_overlay_enabled: bool = True
+    crypto_event_redis_key: str = "mexc:crypto_event_intelligence"
+    crypto_event_refresh_seconds: int = 300
+    crypto_event_stale_seconds: int = 1800
+    crypto_event_min_abs_bias: float = 0.35
+    crypto_event_threshold_relief: float = 4.0
+    crypto_event_score_boost: float = 5.0
+    crypto_event_adverse_score_penalty: float = 4.0
 
     @classmethod
     def from_env(cls) -> "FuturesConfig":
         hourly_check_seconds = env_int("FUTURES_HOURLY_CHECK_SECONDS", 300)
         primary_symbol = env_str("FUTURES_SYMBOL", "BTC_USDT").upper()
         symbols = parse_symbol_list(env_str("FUTURES_SYMBOLS", ""), primary_symbol)
-        return cls(
+        # P0 fix (assessment §3.2): fail fast on misnamed per-symbol env vars
+        # (e.g. FUTURES_PEPE_USDT_LEVERAGE_MAX is silently ignored because
+        # _symbol_env_prefix strips underscores -> FUTURES_PEPEUSDT). This
+        # prevents silent leverage-cap / funding-gate bypasses in production.
+        _enforce_symbol_env_key_hygiene(symbols)
+        instance = cls(
             api_key=env_str("MEXC_API_KEY", ""),
             api_secret=env_str("MEXC_API_SECRET", ""),
             telegram_token=env_str("FUTURES_TELEGRAM_TOKEN", env_str("TELEGRAM_TOKEN", "")),
@@ -230,8 +252,22 @@ class FuturesConfig:
             calibration_refresh_seconds=env_int("FUTURES_CALIBRATION_REFRESH_SECONDS", 900),
             calibration_max_age_hours=env_float("FUTURES_CALIBRATION_MAX_AGE_HOURS", 72.0),
             calibration_min_total_trades=env_int("FUTURES_CALIBRATION_MIN_TOTAL_TRADES", 15),
+            calibration_seed_redis_key=env_str(
+                "FUTURES_CALIBRATION_SEED_REDIS_KEY", "mexc_futures_calibration_seed"
+            ),
             review_file=resolve_repo_path(env_str("FUTURES_DAILY_REVIEW_FILE", "backtest_output/daily_review.json")),
             review_redis_key=env_str("FUTURES_DAILY_REVIEW_REDIS_KEY", "mexc_futures_daily_review"),
+            funding_observations_redis_key=env_str(
+                "FUTURES_FUNDING_OBSERVATIONS_REDIS_KEY", "mexc_funding_observations"
+            ),
+            crypto_event_overlay_enabled=env_bool("FUTURES_CRYPTO_EVENT_OVERLAY_ENABLED", True),
+            crypto_event_redis_key=env_str("FUTURES_CRYPTO_EVENT_REDIS_KEY", "mexc:crypto_event_intelligence"),
+            crypto_event_refresh_seconds=env_int("FUTURES_CRYPTO_EVENT_REFRESH_SECONDS", 300),
+            crypto_event_stale_seconds=env_int("FUTURES_CRYPTO_EVENT_STALE_SECONDS", 1800),
+            crypto_event_min_abs_bias=env_float("FUTURES_CRYPTO_EVENT_MIN_ABS_BIAS", 0.35),
+            crypto_event_threshold_relief=env_float("FUTURES_CRYPTO_EVENT_THRESHOLD_RELIEF", 4.0),
+            crypto_event_score_boost=env_float("FUTURES_CRYPTO_EVENT_SCORE_BOOST", 5.0),
+            crypto_event_adverse_score_penalty=env_float("FUTURES_CRYPTO_EVENT_ADVERSE_SCORE_PENALTY", 4.0),
             redis_url=env_str("REDIS_URL", ""),
             anthropic_api_key=env_str("ANTHROPIC_API_KEY", ""),
             runtime_state_file=resolve_repo_path(env_str("FUTURES_RUNTIME_STATE_FILE", "futures_runtime_state.json")),
@@ -262,10 +298,34 @@ class FuturesConfig:
             correlation_buckets=parse_correlation_buckets(env_str("FUTURES_CORRELATION_BUCKETS", "")),
             max_per_bucket=max(1, env_int("FUTURES_MAX_PER_BUCKET", 1)),
             session_hours_utc=env_str("FUTURES_SESSION_HOURS_UTC", ""),
-            funding_rate_abs_max=env_float("FUTURES_FUNDING_RATE_ABS_MAX", 0.0008),
+            # P1 fix (assessment §4.2 / §6 #6): tighten the global funding-rate cap
+            # default. The previous 0.0008/8h (≈87%/yr APR) is permissive to the
+            # point of being decorative on a momentum strategy whose holds straddle
+            # one funding interval. 0.0002/8h (≈22%/yr) keeps the gate meaningful.
+            # Per-symbol overrides remain authoritative (e.g. PEPE memecoin can be
+            # widened back to 0.00025 via FUTURES_PEPEUSDT_FUNDING_RATE_ABS_MAX).
+            funding_rate_abs_max=env_float("FUTURES_FUNDING_RATE_ABS_MAX", 0.0002),
             open_type=env_int("FUTURES_OPEN_TYPE", 1),
             position_mode=env_int("FUTURES_POSITION_MODE", 2),
         )
+        # Sprint 1 — §2.4 strict recv_window. Opt-in via USE_STRICT_RECV_WINDOW=1
+        # clamps recv_window_seconds to the institutional-standard 5s.
+        if env_bool("USE_STRICT_RECV_WINDOW", False):
+            strict_cap = env_int("STRICT_RECV_WINDOW_SECONDS", 5)
+            if strict_cap > 0:
+                instance = dataclasses.replace(
+                    instance, recv_window_seconds=min(instance.recv_window_seconds, strict_cap)
+                )
+        # Sprint 1 — §2.6 tight hard-loss cap. Opt-in via USE_HARD_LOSS_CAP_TIGHT=1
+        # clamps hard_loss_cap_pct to HARD_LOSS_CAP_TIGHT_PCT (default 0.40) so a
+        # single trade cannot lose more than that fraction of posted margin.
+        if env_bool("USE_HARD_LOSS_CAP_TIGHT", False):
+            tight_cap = env_float("HARD_LOSS_CAP_TIGHT_PCT", 0.40)
+            if tight_cap > 0:
+                instance = dataclasses.replace(
+                    instance, hard_loss_cap_pct=min(instance.hard_loss_cap_pct, tight_cap)
+                )
+        return instance
 
     def for_symbol(self, symbol: str) -> "FuturesConfig":
         """Return a copy of this config scoped to ``symbol`` with per-symbol env overrides.
@@ -278,11 +338,13 @@ class FuturesConfig:
         sym = symbol.upper()
         if sym == self.symbol and not _has_symbol_overrides(sym):
             return self
+        leverage_max = env_int_for_symbol(sym, "LEVERAGE_MAX", self.leverage_max)
+        leverage_min = min(env_int_for_symbol(sym, "LEVERAGE_MIN", self.leverage_min), leverage_max)
         return dataclasses.replace(
             self,
             symbol=sym,
-            leverage_min=env_int_for_symbol(sym, "LEVERAGE_MIN", self.leverage_min),
-            leverage_max=env_int_for_symbol(sym, "LEVERAGE_MAX", self.leverage_max),
+            leverage_min=leverage_min,
+            leverage_max=leverage_max,
             min_confidence_score=env_float_for_symbol(sym, "SCORE_THRESHOLD", self.min_confidence_score),
             hard_loss_cap_pct=env_float_for_symbol(sym, "HARD_LOSS_CAP_PCT", self.hard_loss_cap_pct),
             adx_floor=env_float_for_symbol(sym, "ADX_FLOOR", self.adx_floor),
@@ -340,6 +402,53 @@ def _has_symbol_overrides(symbol: str) -> bool:
         if os.getenv(f"{prefix}_{suffix}"):
             return True
     return False
+
+
+def detect_misnamed_symbol_env_keys(symbols: tuple[str, ...]) -> list[tuple[str, str]]:
+    """P0 fix (assessment §3.2): detect per-symbol env vars that use the natural
+    underscore form (e.g. ``FUTURES_PEPE_USDT_LEVERAGE_MAX``) instead of the
+    canonical alphanumeric form expected by ``_symbol_env_prefix``
+    (``FUTURES_PEPEUSDT_LEVERAGE_MAX``). Such vars are silently ignored at
+    runtime, which can nullify a per-symbol leverage cap or funding gate
+    without warning.
+
+    Returns a list of ``(misnamed_key, suggested_canonical_key)`` pairs.
+    Empty list means clean.
+    """
+
+    findings: list[tuple[str, str]] = []
+    for symbol in symbols:
+        sym_upper = symbol.upper()
+        canonical_prefix = _symbol_env_prefix(sym_upper)  # e.g. FUTURES_PEPEUSDT
+        natural_prefix = f"FUTURES_{sym_upper}"           # e.g. FUTURES_PEPE_USDT
+        if natural_prefix == canonical_prefix:
+            continue  # symbol has no underscores (e.g. BTCUSDT) -> no ambiguity
+        for suffix in _SYMBOL_OVERRIDE_SUFFIXES:
+            misnamed = f"{natural_prefix}_{suffix}"
+            canonical = f"{canonical_prefix}_{suffix}"
+            if os.getenv(misnamed) is not None and os.getenv(canonical) is None:
+                findings.append((misnamed, canonical))
+    return findings
+
+
+class MisnamedSymbolEnvKeyError(ValueError):
+    """Raised at boot when per-symbol env vars use a non-canonical form."""
+
+
+def _enforce_symbol_env_key_hygiene(symbols: tuple[str, ...]) -> None:
+    if env_bool("FUTURES_DISABLE_ENV_KEY_VALIDATION", False):
+        return
+    findings = detect_misnamed_symbol_env_keys(symbols)
+    if not findings:
+        return
+    lines = [f"  - {bad}  ->  {good}" for bad, good in findings]
+    raise MisnamedSymbolEnvKeyError(
+        "Per-symbol env vars use non-canonical form (underscores in symbol are "
+        "stripped by _symbol_env_prefix, so the keys below are silently ignored). "
+        "Rename them to the canonical form, or set "
+        "FUTURES_DISABLE_ENV_KEY_VALIDATION=1 to bypass (not recommended):\n"
+        + "\n".join(lines)
+    )
 
 
 @dataclass(slots=True)

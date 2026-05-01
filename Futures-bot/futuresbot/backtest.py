@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,16 @@ from futuresbot.models import FuturesPosition, FuturesSignal
 from futuresbot.strategy import score_btc_futures_setup
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(slots=True)
 class BacktestState:
 	balance: float
@@ -24,12 +35,11 @@ class BacktestState:
 
 
 def _profit_factor(pnl: pd.Series) -> float:
-	"""Gate A A2 (memo 1 §7): return ``inf`` (not 999) when there are no losses.
+	"""Gate A A2 (memo 1 §7): emit ``inf`` when there are no losing trades
+	rather than the misleading ``999.0`` sentinel. Upstream consumers must
+	treat inf as a sentinel and combine it with the trade count before
+	making any decision."""
 
-	Lets downstream consumers distinguish "no-loss sample" (first-class empty
-	signal) from "bounded positive edge" (a real number) instead of treating a
-	4-trade sample's PF 999 as production-grade.
-	"""
 	wins = pnl[pnl > 0]
 	losses = pnl[pnl < 0]
 	if losses.empty:
@@ -139,17 +149,44 @@ class FuturesBacktestEngine:
 		self.contract_size = float(self.contract.get("contractSize", 0.0001) or 0.0001)
 		self.min_vol = int(float(self.contract.get("minVol", 1) or 1))
 
-	def _contracts_for_entry(self, entry_price: float, leverage: int, balance: float) -> tuple[int, float]:
+	def _contracts_for_entry(self, entry_price: float, leverage: int, balance: float, sl_price: float | None = None) -> tuple[int, float, int]:
 		margin = min(self.config.margin_budget_usdt, balance)
 		if entry_price <= 0 or leverage <= 0 or margin <= 0:
-			return 0, 0.0
+			return 0, 0.0, leverage
+		# §2.1 — NAV-risk sizing. When USE_NAV_RISK_SIZING=1 the contract count
+		# is fixed by ``risk_pct * NAV / stop_distance`` so each trade's stop-out
+		# loses exactly ``NAV_RISK_PCT`` of NAV regardless of symbol price scale.
+		# This closes the sub-cent-coin blowup hole where the legacy
+		# (margin * leverage / entry_price) path sized PEPE to catastrophic
+		# notionals because its stop-distance is tiny in absolute terms.
+		if sl_price is not None and sl_price > 0 and os.environ.get("USE_NAV_RISK_SIZING", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+			try:
+				from futuresbot.nav_risk_sizing import compute_nav_risk_sizing
+
+				risk_pct = _env_float("NAV_RISK_PCT", 0.01)
+				nav_lev_min = int(_env_float("NAV_LEVERAGE_MIN", 5))
+				nav_lev_max = int(_env_float("NAV_LEVERAGE_MAX", 10))
+				nav = compute_nav_risk_sizing(
+					nav_usdt=balance,
+					entry_price=entry_price,
+					sl_price=sl_price,
+					contract_size=self.contract_size,
+					risk_pct=risk_pct,
+					leverage_min=nav_lev_min,
+					leverage_max=nav_lev_max,
+					available_margin_usdt=margin,
+				)
+				if nav is not None and nav.qty_contracts >= self.min_vol:
+					return nav.qty_contracts, round(float(nav.margin_usdt), 8), int(nav.applied_leverage)
+			except Exception:
+				pass
 		base_qty = margin * leverage / entry_price
 		contracts = int(base_qty / self.contract_size)
 		contracts = max(0, contracts)
 		if contracts < self.min_vol:
-			return 0, 0.0
+			return 0, 0.0, leverage
 		used_margin = contracts * self.contract_size * entry_price / leverage
-		return contracts, used_margin
+		return contracts, used_margin, leverage
 
 	def _mark_to_market(self, position: FuturesPosition | None, price: float) -> float:
 		if position is None or price <= 0:
@@ -158,7 +195,9 @@ class FuturesBacktestEngine:
 		return position.base_qty * (price - position.entry_price) * direction
 
 	def _open_position(self, signal: FuturesSignal, entry_time: pd.Timestamp, entry_price: float, balance: float) -> FuturesPosition | None:
-		contracts, used_margin = self._contracts_for_entry(entry_price, signal.leverage, balance)
+		contracts, used_margin, applied_leverage = self._contracts_for_entry(
+			entry_price, signal.leverage, balance, sl_price=float(signal.sl_price),
+		)
 		if contracts <= 0:
 			return None
 		return FuturesPosition(
@@ -167,7 +206,7 @@ class FuturesBacktestEngine:
 			entry_price=float(entry_price),
 			contracts=contracts,
 			contract_size=self.contract_size,
-			leverage=int(signal.leverage),
+			leverage=int(applied_leverage),
 			margin_usdt=round(used_margin, 8),
 			tp_price=float(signal.tp_price),
 			sl_price=float(signal.sl_price),
@@ -180,22 +219,89 @@ class FuturesBacktestEngine:
 			metadata=dict(signal.metadata),
 		)
 
-	def _close_position(self, position: FuturesPosition, exit_time: pd.Timestamp, exit_price: float, reason: str) -> dict[str, Any]:
+	def _close_position(
+		self,
+		position: FuturesPosition,
+		exit_time: pd.Timestamp,
+		exit_price: float,
+		reason: str,
+		*,
+		liquidated: bool = False,
+		liq_price: float | None = None,
+	) -> dict[str, Any]:
 		direction = 1.0 if position.side == "LONG" else -1.0
 		entry_notional = position.base_qty * position.entry_price
-		exit_notional = position.base_qty * exit_price
-		gross_pnl = position.base_qty * (exit_price - position.entry_price) * direction
-		fees = (entry_notional + exit_notional) * self.config.taker_fee_rate
-		pnl = gross_pnl - fees
+		# Sprint 2 §3.1 — realistic close (slippage + funding + liquidation) when
+		# USE_REALISTIC_BACKTEST=1. Falls back to the legacy fee-only model when off
+		# so backward comparisons remain apples-to-apples.
+		if os.environ.get("USE_REALISTIC_BACKTEST", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+			try:
+				from futuresbot.realistic_costs import simulate_position_close
+
+				funding_rate = _env_float("REALISTIC_FUNDING_RATE_8H", 0.0001)
+				slip_per_lev = _env_float("REALISTIC_SLIPPAGE_BPS_PER_LEV", 0.5)
+				exit_mult = _env_float("REALISTIC_EXIT_SLIP_MULT", 1.5)
+				liq_slip = _env_float("REALISTIC_LIQ_SLIPPAGE", 0.005)
+				result = simulate_position_close(
+					side=position.side,
+					entry_price=position.entry_price,
+					exit_price=exit_price,
+					base_qty=position.base_qty,
+					leverage=position.leverage,
+					open_at=position.opened_at,
+					close_at=exit_time.to_pydatetime(),
+					liquidated=liquidated,
+					liq_price=liq_price,
+					taker_fee_rate=self.config.taker_fee_rate,
+					slip_bps_per_lev=slip_per_lev,
+					exit_slip_mult=exit_mult,
+					funding_rate_8h=funding_rate,
+					liq_extra_slippage=liq_slip,
+				)
+				pnl = result.net_pnl
+				effective_exit = result.effective_exit_price
+				fees = result.fees_usdt
+				funding_usdt = result.funding_usdt
+				slippage_usdt = result.slippage_usdt
+			except Exception:
+				exit_notional = position.base_qty * exit_price
+				gross_pnl = position.base_qty * (exit_price - position.entry_price) * direction
+				fees = (entry_notional + exit_notional) * self.config.taker_fee_rate
+				pnl = gross_pnl - fees
+				effective_exit = exit_price
+				funding_usdt = 0.0
+				slippage_usdt = 0.0
+		else:
+			exit_notional = position.base_qty * exit_price
+			gross_pnl = position.base_qty * (exit_price - position.entry_price) * direction
+			fees = (entry_notional + exit_notional) * self.config.taker_fee_rate
+			pnl = gross_pnl - fees
+			effective_exit = exit_price
+			funding_usdt = 0.0
+			slippage_usdt = 0.0
 		pnl_pct = (pnl / position.margin_usdt * 100.0) if position.margin_usdt > 0 else 0.0
+		# Precision-aware price rendering: small-price coins (PEPE, etc.) would
+		# otherwise round to 0.00 in the journal and make exports unreadable.
+		def _round_price(px: float) -> float:
+			ax = abs(float(px))
+			if ax <= 0:
+				return 0.0
+			if ax < 0.001:
+				return round(float(px), 10)
+			if ax < 0.1:
+				return round(float(px), 6)
+			if ax < 100:
+				return round(float(px), 4)
+			return round(float(px), 2)
 		return {
 			"symbol": position.symbol,
 			"strategy": "BTC_FUTURES",
 			"side": position.side,
 			"entry_time": position.opened_at.isoformat(),
 			"exit_time": exit_time.to_pydatetime().isoformat(),
-			"entry_price": round(position.entry_price, 2),
-			"exit_price": round(exit_price, 2),
+			"entry_price": _round_price(position.entry_price),
+			"exit_price": _round_price(effective_exit),
+			"quoted_exit_price": _round_price(exit_price),
 			"contracts": position.contracts,
 			"base_qty": round(position.base_qty, 8),
 			"leverage": position.leverage,
@@ -204,15 +310,42 @@ class FuturesBacktestEngine:
 			"score": position.score,
 			"certainty": position.certainty,
 			"exit_reason": reason,
-			"tp_price": round(position.tp_price, 2),
-			"sl_price": round(position.sl_price, 2),
+			"tp_price": _round_price(position.tp_price),
+			"sl_price": _round_price(position.sl_price),
 			"pnl_usdt": round(pnl, 8),
 			"pnl_pct": round(pnl_pct, 4),
+			"fees_usdt": round(float(fees), 8),
+			"funding_usdt": round(float(funding_usdt), 8),
+			"slippage_usdt": round(float(slippage_usdt), 8),
+			"liquidated": bool(liquidated),
 		}
 
 	def _bar_exit(self, position: FuturesPosition, bar: pd.Series) -> tuple[float, str] | None:
 		high = float(bar["high"])
 		low = float(bar["low"])
+		# Sprint 2 §3.1 — liquidation check fires before TP/SL when flag on.
+		if os.environ.get("USE_REALISTIC_BACKTEST", "0").strip().lower() in {"1", "true", "yes", "y", "on"}:
+			try:
+				from futuresbot.realistic_costs import check_liquidation_breach, compute_liq_price
+
+				mm_rate = _env_float("REALISTIC_MAINTENANCE_MARGIN_RATE", 0.005)
+				liq = compute_liq_price(
+					entry_price=position.entry_price,
+					leverage=position.leverage,
+					side=position.side,
+					maintenance_margin_rate=mm_rate,
+				)
+				if liq is not None and check_liquidation_breach(
+					liq_price=liq.price,
+					side=position.side,
+					bar_high=high,
+					bar_low=low,
+				):
+					# Sentinel signals a liquidation fill to run(); the fill price
+					# (slippage-adjusted) is computed inside _close_position.
+					return liq.price, "LIQUIDATED"
+			except Exception:
+				pass
 		if position.side == "LONG":
 			if low <= position.sl_price:
 				return position.sl_price, "STOP_LOSS"
@@ -265,7 +398,15 @@ class FuturesBacktestEngine:
 				bar_exit = self._bar_exit(state.open_position, bar)
 				if bar_exit is not None:
 					exit_price, reason = bar_exit
-					trade = self._close_position(state.open_position, timestamp + step, exit_price, reason)
+					liquidated = reason == "LIQUIDATED"
+					trade = self._close_position(
+						state.open_position,
+						timestamp + step,
+						exit_price,
+						reason,
+						liquidated=liquidated,
+						liq_price=exit_price if liquidated else None,
+					)
 					state.balance += float(trade["pnl_usdt"])
 					trades.append(trade)
 					state.open_position = None

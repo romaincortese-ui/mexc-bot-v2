@@ -210,6 +210,10 @@ class MexcFuturesClient:
         payload = self.private_get(f"/api/v1/private/order/get/{order_id}")
         return payload.get("data", {}) if isinstance(payload, dict) else {}
 
+    def cancel_order(self, order_id: str) -> Any:
+        """Cancel a working futures order by id (Sprint 3 §3.5 maker ladder)."""
+        return self.private_post("/api/v1/private/order/cancel", [int(order_id)])
+
     def place_position_tpsl(self, *, position_id: str, vol: int, take_profit_price: float, stop_loss_price: float) -> Any:
         payload = {
             "positionId": int(position_id),
