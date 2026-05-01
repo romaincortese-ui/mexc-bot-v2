@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from mexcbot.event_overlay import (
     UnlockEvent,
+    evaluate_event_state_opportunity_boost,
     evaluate_event_state_overlay,
     evaluate_exchange_inflow_gate,
     evaluate_stablecoin_flow_gate,
@@ -130,3 +131,54 @@ def test_event_state_overlay_fails_open_when_stale():
 
     assert d.sizing_multiplier == 1.0
     assert d.reasons == ()
+
+
+def test_risk_on_event_state_creates_threshold_relief_and_sizing_boost():
+    state = {
+        "generated_at": BASE.isoformat(),
+        "ttl_seconds": 1800,
+        "stablecoin_supply_change_24h_frac": 0.018,
+        "events": [
+            {"scope": "market", "direction": "risk_on", "severity": 0.60, "title": "ETF approved"}
+        ],
+    }
+
+    boost = evaluate_event_state_opportunity_boost(symbol="BTCUSDT", now=BASE, state=state, max_threshold_relief=4.0)
+    overlay = evaluate_event_state_overlay(symbol="BTCUSDT", now=BASE, state=state)
+
+    assert boost.threshold_relief == 4.0
+    assert boost.sizing_multiplier > 1.0
+    assert overlay.sizing_multiplier > 1.0
+    assert "stable_supply_expanding:0.0180>=0.01" in boost.reasons
+
+
+def test_risk_on_threshold_relief_is_suppressed_by_market_risk():
+    state = {
+        "generated_at": BASE.isoformat(),
+        "ttl_seconds": 1800,
+        "market_risk_score": 0.70,
+        "events": [
+            {"scope": "market", "direction": "risk_on", "severity": 0.80, "title": "ETF approved"}
+        ],
+    }
+
+    boost = evaluate_event_state_opportunity_boost(symbol="BTCUSDT", now=BASE, state=state)
+
+    assert boost.threshold_relief == 0.0
+    assert boost.reasons == ()
+
+
+def test_risk_on_threshold_relief_is_suppressed_by_exchange_inflow():
+    state = {
+        "generated_at": BASE.isoformat(),
+        "ttl_seconds": 1800,
+        "btc_exchange_inflow_1h": 8_000,
+        "events": [
+            {"scope": "market", "direction": "risk_on", "severity": 0.80, "title": "ETF approved"}
+        ],
+    }
+
+    boost = evaluate_event_state_opportunity_boost(symbol="BTCUSDT", now=BASE, state=state)
+
+    assert boost.threshold_relief == 0.0
+    assert boost.reasons == ()

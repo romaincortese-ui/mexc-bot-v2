@@ -27,7 +27,7 @@ from mexcbot.config import LiveConfig, env_bool, env_float, env_int
 from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
 from mexcbot.exchange import MexcClient
 from mexcbot.exits import evaluate_trade_action
-from mexcbot.event_overlay import evaluate_event_state_overlay
+from mexcbot.event_overlay import evaluate_event_state_opportunity_boost, evaluate_event_state_overlay
 from mexcbot.indicators import calc_ema
 from mexcbot.marketdata import fetch_fear_and_greed
 from mexcbot.models import Opportunity, Trade
@@ -89,6 +89,10 @@ CRYPTO_EVENT_REDIS_KEY = os.environ.get("CRYPTO_EVENT_REDIS_KEY", "mexc:crypto_e
 CRYPTO_EVENT_STATE_FILE = os.environ.get("CRYPTO_EVENT_STATE_FILE", "").strip()
 CRYPTO_EVENT_REFRESH_SECONDS = env_float("CRYPTO_EVENT_REFRESH_SECONDS", 300.0)
 CRYPTO_EVENT_STALE_SECONDS = env_int("CRYPTO_EVENT_STALE_SECONDS", 1800)
+CRYPTO_EVENT_THRESHOLD_RELIEF = env_float("CRYPTO_EVENT_THRESHOLD_RELIEF", 3.0)
+CRYPTO_EVENT_MIN_RISK_ON_SCORE = env_float("CRYPTO_EVENT_MIN_RISK_ON_SCORE", 0.45)
+CRYPTO_EVENT_RISK_ON_MULTIPLIER = env_float("CRYPTO_EVENT_RISK_ON_MULTIPLIER", 1.15)
+CRYPTO_EVENT_MAX_SIZING_MULTIPLIER = env_float("CRYPTO_EVENT_MAX_SIZING_MULTIPLIER", 1.25)
 # SL applied when we reconcile an untracked position (manually-opened, orphaned,
 # or surviving a bot restart without recoverable state). Must not be looser than
 # what the strategy would have picked, or we silently widen real risk on restart.
@@ -2745,6 +2749,7 @@ class LiveBotRuntime:
 
     def _threshold_overrides(self, strategies: list[str]) -> dict[str, float]:
         overrides: dict[str, float] = {}
+        event_relief = self._crypto_event_threshold_relief()
         for strategy in strategies:
             resolved = strategy.upper()
             if resolved not in ADAPTIVE_THRESHOLD_STRATEGIES:
@@ -2754,7 +2759,7 @@ class LiveBotRuntime:
             fng_mult = 1.0
             if self._fear_greed_index is not None and self._fear_greed_index <= self.config.fear_greed_extreme_fear_threshold:
                 fng_mult = self.config.fear_greed_extreme_fear_mult
-            overrides[resolved] = round(max(0.0, (base_threshold + offset) * self._market_regime_mult * fng_mult), 4)
+            overrides[resolved] = round(max(0.0, (base_threshold + offset) * self._market_regime_mult * fng_mult - event_relief), 4)
         return overrides
 
     def _strategy_budget_multiplier(self, strategy: str) -> float:
@@ -2988,6 +2993,8 @@ class LiveBotRuntime:
                 now=datetime.now(timezone.utc),
                 state=self._crypto_event_state,
                 stale_after_seconds=CRYPTO_EVENT_STALE_SECONDS,
+                risk_on_multiplier=CRYPTO_EVENT_RISK_ON_MULTIPLIER,
+                max_sizing_multiplier=CRYPTO_EVENT_MAX_SIZING_MULTIPLIER,
             )
         except Exception as exc:
             log.debug("Crypto event overlay evaluation failed for %s: %s", opportunity.symbol, exc)
@@ -3001,7 +3008,25 @@ class LiveBotRuntime:
             opportunity.metadata.pop("event_overlay_mult", None)
             opportunity.metadata.pop("event_overlay_reasons", None)
             opportunity.metadata.pop("event_overlay_state_age_seconds", None)
-        return max(0.0, min(1.0, float(decision.sizing_multiplier)))
+        return max(0.0, min(CRYPTO_EVENT_MAX_SIZING_MULTIPLIER, float(decision.sizing_multiplier)))
+
+    def _crypto_event_threshold_relief(self) -> float:
+        if not USE_CRYPTO_EVENT_OVERLAY or CRYPTO_EVENT_THRESHOLD_RELIEF <= 0:
+            return 0.0
+        self._refresh_crypto_event_state()
+        try:
+            decision = evaluate_event_state_opportunity_boost(
+                now=datetime.now(timezone.utc),
+                state=self._crypto_event_state,
+                stale_after_seconds=CRYPTO_EVENT_STALE_SECONDS,
+                min_risk_on_score=CRYPTO_EVENT_MIN_RISK_ON_SCORE,
+                max_threshold_relief=CRYPTO_EVENT_THRESHOLD_RELIEF,
+                risk_on_multiplier=CRYPTO_EVENT_RISK_ON_MULTIPLIER,
+            )
+        except Exception as exc:
+            log.debug("Crypto event threshold relief evaluation failed: %s", exc)
+            return 0.0
+        return max(0.0, float(decision.threshold_relief))
 
     def _existing_exposures_for_corr(self, total_equity: float) -> dict:
         if total_equity <= 0:

@@ -167,6 +167,9 @@ def evaluate_exchange_inflow_gate(
 DEFAULT_EVENT_STATE_STALE_SECONDS: int = 1_800
 DEFAULT_HEADLINE_RISK_MULTIPLIER: float = 0.70
 DEFAULT_SEVERE_HEADLINE_RISK_MULTIPLIER: float = 0.50
+DEFAULT_RISK_ON_MULTIPLIER: float = 1.15
+DEFAULT_MAX_EVENT_SIZING_MULTIPLIER: float = 1.25
+DEFAULT_RISK_ON_THRESHOLD: float = 0.45
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +178,16 @@ class EventOverlayDecision:
     sizing_multiplier: float
     reasons: tuple[str, ...]
     state_age_seconds: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EventOpportunityBoostDecision:
+    symbol: str
+    threshold_relief: float
+    sizing_multiplier: float
+    reasons: tuple[str, ...]
+    state_age_seconds: float | None = None
+    risk_on_score: float = 0.0
 
 
 def parse_event_timestamp(value: Any) -> datetime | None:
@@ -243,6 +256,8 @@ def evaluate_event_state_overlay(
     stale_after_seconds: int = DEFAULT_EVENT_STATE_STALE_SECONDS,
     headline_risk_multiplier: float = DEFAULT_HEADLINE_RISK_MULTIPLIER,
     severe_headline_risk_multiplier: float = DEFAULT_SEVERE_HEADLINE_RISK_MULTIPLIER,
+    risk_on_multiplier: float = DEFAULT_RISK_ON_MULTIPLIER,
+    max_sizing_multiplier: float = DEFAULT_MAX_EVENT_SIZING_MULTIPLIER,
 ) -> EventOverlayDecision:
     sym = (symbol or "").strip().upper()
     fresh, age = is_event_state_fresh(state, now=now, stale_after_seconds=stale_after_seconds)
@@ -251,6 +266,11 @@ def evaluate_event_state_overlay(
 
     multiplier = 1.0
     reasons: list[str] = []
+
+    risk_on_score, risk_on_reasons = _risk_on_score_for_symbol(state, sym)
+    if risk_on_score > 0:
+        multiplier *= 1.0 + (float(risk_on_multiplier) - 1.0) * risk_on_score
+        reasons.extend(risk_on_reasons)
 
     unlocks = parse_unlock_events(state.get("unlock_events") or state.get("unlocks"))
     unlock_decision = evaluate_unlock_gate(symbol=sym, now=now, events=unlocks)
@@ -292,9 +312,41 @@ def evaluate_event_state_overlay(
 
     return EventOverlayDecision(
         symbol=sym,
-        sizing_multiplier=max(0.0, min(1.0, float(multiplier))),
+        sizing_multiplier=max(0.0, min(float(max_sizing_multiplier), float(multiplier))),
         reasons=tuple(reasons),
         state_age_seconds=age,
+    )
+
+
+def evaluate_event_state_opportunity_boost(
+    *,
+    symbol: str = "",
+    now: datetime,
+    state: dict[str, Any] | None,
+    stale_after_seconds: int = DEFAULT_EVENT_STATE_STALE_SECONDS,
+    min_risk_on_score: float = DEFAULT_RISK_ON_THRESHOLD,
+    max_threshold_relief: float = 3.0,
+    risk_on_multiplier: float = DEFAULT_RISK_ON_MULTIPLIER,
+) -> EventOpportunityBoostDecision:
+    sym = (symbol or "").strip().upper()
+    fresh, age = is_event_state_fresh(state, now=now, stale_after_seconds=stale_after_seconds)
+    if not fresh or not isinstance(state, dict):
+        return EventOpportunityBoostDecision(symbol=sym, threshold_relief=0.0, sizing_multiplier=1.0, reasons=(), state_age_seconds=age)
+    if _market_risk_score_for_symbol(state, sym) >= 0.55 or _has_adverse_market_flow(state):
+        return EventOpportunityBoostDecision(symbol=sym, threshold_relief=0.0, sizing_multiplier=1.0, reasons=(), state_age_seconds=age)
+
+    risk_on_score, reasons = _risk_on_score_for_symbol(state, sym)
+    if risk_on_score < float(min_risk_on_score):
+        return EventOpportunityBoostDecision(symbol=sym, threshold_relief=0.0, sizing_multiplier=1.0, reasons=(), state_age_seconds=age)
+    relief = max(0.0, float(max_threshold_relief)) * min(1.0, risk_on_score)
+    multiplier = 1.0 + (float(risk_on_multiplier) - 1.0) * min(1.0, risk_on_score)
+    return EventOpportunityBoostDecision(
+        symbol=sym,
+        threshold_relief=relief,
+        sizing_multiplier=multiplier,
+        reasons=tuple(reasons),
+        state_age_seconds=age,
+        risk_on_score=risk_on_score,
     )
 
 
@@ -313,6 +365,52 @@ def _market_risk_score_for_symbol(state: dict[str, Any], symbol: str) -> float:
             continue
         score = max(score, _safe_float(raw.get("severity") or raw.get("score"), 0.0))
     return max(0.0, min(1.0, score))
+
+
+def _risk_on_score_for_symbol(state: dict[str, Any], symbol: str) -> tuple[float, tuple[str, ...]]:
+    score = 0.0
+    reasons: list[str] = []
+    for key in ("stablecoin_supply_change_24h_frac", "stable_supply_change_24h_frac"):
+        if key not in state:
+            continue
+        change = _safe_float(state.get(key), 0.0)
+        if change >= DEFAULT_STABLE_FLOW_THRESHOLD_24H:
+            stable_score = max(0.0, min(1.0, change / DEFAULT_STABLE_FLOW_THRESHOLD_24H))
+            score = max(score, stable_score)
+            reasons.append(f"stable_supply_expanding:{change:.4f}>={DEFAULT_STABLE_FLOW_THRESHOLD_24H}")
+        break
+
+    for raw in state.get("events") or state.get("headlines") or ():
+        if not isinstance(raw, dict):
+            continue
+        direction = str(raw.get("direction") or raw.get("bias") or "").strip().lower()
+        if direction not in {"risk_on", "bullish", "positive"}:
+            continue
+        event_score = _safe_float(raw.get("severity") or raw.get("score"), 0.0)
+        if event_score <= 0:
+            continue
+        scope = str(raw.get("scope") or "").strip().lower()
+        symbols = {str(item).strip().upper() for item in raw.get("symbols") or () if str(item).strip()}
+        market_wide = scope in {"", "market", "global", "crypto", "market_wide"}
+        symbol_specific = bool(symbol) and symbol in symbols
+        if not market_wide and not symbol_specific:
+            continue
+        score = max(score, max(0.0, min(1.0, event_score)))
+        if symbol_specific:
+            reasons.append(f"crypto_event_risk_on_symbol:{event_score:.2f}")
+        else:
+            reasons.append(f"crypto_event_risk_on:{event_score:.2f}")
+    return max(0.0, min(1.0, score)), tuple(reasons)
+
+
+def _has_adverse_market_flow(state: dict[str, Any]) -> bool:
+    for key in ("stablecoin_supply_change_24h_frac", "stable_supply_change_24h_frac"):
+        if key in state and _safe_float(state.get(key), 0.0) <= -DEFAULT_STABLE_FLOW_THRESHOLD_24H:
+            return True
+    for key in ("btc_exchange_inflow_1h", "exchange_btc_inflow_1h"):
+        if key in state and _safe_float(state.get(key), 0.0) >= DEFAULT_INFLOW_THRESHOLD_BTC_1H:
+            return True
+    return False
 
 
 def _safe_float(value: Any, default: float) -> float:
