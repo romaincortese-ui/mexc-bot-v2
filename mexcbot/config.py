@@ -103,6 +103,24 @@ class LiveConfig:
     symbol_perf_gate_min_profit_factor: float
     symbol_perf_gate_lookback_trades: int
     symbol_perf_gate_pause_hours: int
+    signal_perf_gate_enabled: bool
+    signal_perf_gate_min_trades: int
+    signal_perf_gate_max_losses: int
+    signal_perf_gate_min_profit_factor: float
+    signal_perf_gate_lookback_trades: int
+    signal_perf_gate_pause_hours: int
+    min_expected_net_profit_usdt: float
+    market_context_enabled: bool
+    market_context_bull_budget_mult: float
+    market_context_sideways_budget_mult: float
+    market_context_bear_budget_mult: float
+    market_context_crash_budget_mult: float
+    market_context_bear_block_strategies: list[str]
+    market_context_crash_block_strategies: list[str]
+    liquidity_missed_tracking_enabled: bool
+    liquidity_missed_horizon_minutes: int
+    liquidity_missed_min_report_move_pct: float
+    liquidity_missed_max_pending: int
     moonshot_btc_ema_gate: float
     moonshot_btc_gate_reopen: float
     adaptive_window: int
@@ -146,7 +164,7 @@ class LiveConfig:
     grid_btc_1h_floor: float
     grid_btc_24h_floor: float
     state_file: str
-    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER"])
+    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"])
     base_url: str = "https://api.mexc.com"
 
     @classmethod
@@ -206,6 +224,24 @@ class LiveConfig:
             symbol_perf_gate_min_profit_factor=env_float("SYMBOL_PERF_GATE_MIN_PF", 1.0),
             symbol_perf_gate_lookback_trades=env_int("SYMBOL_PERF_GATE_LOOKBACK_TRADES", 20),
             symbol_perf_gate_pause_hours=env_int("SYMBOL_PERF_GATE_PAUSE_HOURS", 24),
+            signal_perf_gate_enabled=env_bool("SIGNAL_PERF_GATE_ENABLED", True),
+            signal_perf_gate_min_trades=env_int("SIGNAL_PERF_GATE_MIN_TRADES", 4),
+            signal_perf_gate_max_losses=env_int("SIGNAL_PERF_GATE_MAX_LOSSES", 3),
+            signal_perf_gate_min_profit_factor=env_float("SIGNAL_PERF_GATE_MIN_PF", 0.95),
+            signal_perf_gate_lookback_trades=env_int("SIGNAL_PERF_GATE_LOOKBACK_TRADES", 30),
+            signal_perf_gate_pause_hours=env_int("SIGNAL_PERF_GATE_PAUSE_HOURS", 24),
+            min_expected_net_profit_usdt=env_float("MIN_EXPECTED_NET_PROFIT_USDT", env_float("MEXCBOT_MIN_EXPECTED_NET_PROFIT_USDT", 0.10)),
+            market_context_enabled=env_bool("MARKET_CONTEXT_ENABLED", True),
+            market_context_bull_budget_mult=env_float("MARKET_CONTEXT_BULL_BUDGET_MULT", 1.10),
+            market_context_sideways_budget_mult=env_float("MARKET_CONTEXT_SIDEWAYS_BUDGET_MULT", 1.00),
+            market_context_bear_budget_mult=env_float("MARKET_CONTEXT_BEAR_BUDGET_MULT", 0.75),
+            market_context_crash_budget_mult=env_float("MARKET_CONTEXT_CRASH_BUDGET_MULT", 0.35),
+            market_context_bear_block_strategies=env_csv("MARKET_CONTEXT_BEAR_BLOCK_STRATEGIES", ""),
+            market_context_crash_block_strategies=env_csv("MARKET_CONTEXT_CRASH_BLOCK_STRATEGIES", "MOONSHOT,REVERSAL,GRID"),
+            liquidity_missed_tracking_enabled=env_bool("LIQUIDITY_MISSED_TRACKING_ENABLED", True),
+            liquidity_missed_horizon_minutes=env_int("LIQUIDITY_MISSED_HORIZON_MINUTES", 60),
+            liquidity_missed_min_report_move_pct=env_float("LIQUIDITY_MISSED_MIN_REPORT_MOVE_PCT", 0.01),
+            liquidity_missed_max_pending=env_int("LIQUIDITY_MISSED_MAX_PENDING", 100),
             moonshot_btc_ema_gate=env_float("MOONSHOT_BTC_EMA_GATE", -0.02),
             moonshot_btc_gate_reopen=env_float("MOONSHOT_BTC_GATE_REOPEN", -0.01),
             adaptive_window=env_int("ADAPTIVE_WINDOW", 16),
@@ -249,6 +285,6 @@ class LiveConfig:
             grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
             grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
             state_file=env_str("MEXCBOT_STATE_FILE", default_state_file()),
-            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER"),
+            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND"),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
         )

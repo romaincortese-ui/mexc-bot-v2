@@ -257,6 +257,24 @@ def _config(**overrides) -> LiveConfig:
         symbol_perf_gate_min_profit_factor=1.0,
         symbol_perf_gate_lookback_trades=20,
         symbol_perf_gate_pause_hours=24,
+        signal_perf_gate_enabled=True,
+        signal_perf_gate_min_trades=4,
+        signal_perf_gate_max_losses=3,
+        signal_perf_gate_min_profit_factor=0.95,
+        signal_perf_gate_lookback_trades=30,
+        signal_perf_gate_pause_hours=24,
+        min_expected_net_profit_usdt=0.10,
+        market_context_enabled=True,
+        market_context_bull_budget_mult=1.10,
+        market_context_sideways_budget_mult=1.00,
+        market_context_bear_budget_mult=0.75,
+        market_context_crash_budget_mult=0.35,
+        market_context_bear_block_strategies=[],
+        market_context_crash_block_strategies=["MOONSHOT", "REVERSAL", "GRID"],
+        liquidity_missed_tracking_enabled=True,
+        liquidity_missed_horizon_minutes=60,
+        liquidity_missed_min_report_move_pct=0.01,
+        liquidity_missed_max_pending=100,
         moonshot_btc_ema_gate=-0.02,
         moonshot_btc_gate_reopen=-0.01,
         adaptive_window=20,
@@ -613,6 +631,110 @@ def test_signal_lane_gate_blocks_configured_lane(caplog):
     assert opportunity.metadata["pretrade_block_reason"] == "blocked_signal_lane"
     assert opportunity.metadata["symbol_gate_detail"] == "REVERSAL:DIVERGENCE_HAMMER"
     assert "[SIGNAL_GATE] Blocked CHIPUSDT REVERSAL:DIVERGENCE_HAMMER" in caplog.text
+
+
+def test_signal_performance_gate_blocks_weak_lane(caplog):
+    runtime = LiveBotRuntime(
+        _config(
+            signal_perf_gate_max_losses=3,
+            signal_perf_gate_min_trades=4,
+            signal_perf_gate_min_profit_factor=0.95,
+            blocked_signal_lanes=[],
+        ),
+        StubClient(),
+    )
+    runtime.trade_history = [
+        {"symbol": "AUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.3, "is_partial": False},
+        {"symbol": "BUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.2, "is_partial": False},
+        {"symbol": "CUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.1, "is_partial": False},
+    ]
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        allowed = runtime._passes_sprint_pretrade_gates(opportunity)
+
+    assert allowed is False
+    assert opportunity.metadata["pretrade_block_reason"] == "signal_performance_gate"
+    assert "SCALPER:CROSSOVER" in opportunity.metadata["symbol_gate_detail"]
+    assert runtime.signal_performance_paused_until["SCALPER:CROSSOVER"] > time.time()
+    assert "[SIGNAL_PERF_GATE] Blocked DOGEUSDT SCALPER:CROSSOVER" in caplog.text
+
+
+def test_signal_performance_gate_allows_profitable_lane_with_small_losses():
+    runtime = LiveBotRuntime(
+        _config(
+            signal_perf_gate_max_losses=3,
+            signal_perf_gate_min_trades=4,
+            signal_perf_gate_min_profit_factor=0.95,
+            blocked_signal_lanes=[],
+        ),
+        StubClient(),
+    )
+    runtime.trade_history = [
+        {"symbol": "AUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.01, "is_partial": False},
+        {"symbol": "BUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.01, "is_partial": False},
+        {"symbol": "CUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.01, "is_partial": False},
+        {"symbol": "DUSDT", "strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": 1.0, "is_partial": False},
+    ]
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    assert runtime._passes_sprint_pretrade_gates(opportunity) is True
+    assert runtime.signal_performance_paused_until == {}
+
+
+def test_expected_profit_gate_blocks_tiny_net_tp():
+    runtime = LiveBotRuntime(_config(min_expected_net_profit_usdt=0.10), StubClient())
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    rejected = runtime._expected_profit_rejects(opportunity, allocation_usdt=5.0)
+
+    assert rejected is True
+    assert opportunity.metadata["pretrade_block_reason"] == "min_expected_net_profit"
+    assert opportunity.metadata["expected_tp_net_usdt"] < 0.10
+
+
+def test_market_context_blocks_crash_strategies():
+    runtime = LiveBotRuntime(
+        _config(
+            strategies=["SCALPER", "MOONSHOT", "GRID"],
+            market_context_enabled=True,
+            market_context_crash_block_strategies=["MOONSHOT", "GRID"],
+        ),
+        StubClient(),
+    )
+    runtime._market_regime_mult = 1.40
+
+    eligible = runtime._eligible_strategies()
+
+    assert eligible == ["SCALPER"]
+
+
+def test_liquidity_block_records_and_reports_missed_opportunity():
+    client = StubClient()
+    runtime = LiveBotRuntime(
+        _config(
+            dead_coin_vol_scalper=2_000_000.0,
+            liquidity_missed_tracking_enabled=True,
+            liquidity_missed_horizon_minutes=1,
+            liquidity_missed_min_report_move_pct=0.01,
+        ),
+        client,
+    )
+    runtime.telegram = StubTelegram()
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    passed = runtime._passes_liquidity_guard(opportunity)
+
+    assert passed is False
+    assert len(runtime.liquidity_missed_pending) == 1
+    runtime.liquidity_missed_pending[0]["due_at"] = time.time() - 1
+    client.price_by_symbol["DOGEUSDT"] = 10.3
+
+    runtime._review_liquidity_missed_opportunities()
+
+    assert runtime.liquidity_missed_pending == []
+    assert "DOGEUSDT +3.00%" in runtime.liquidity_missed_reports[0]
+    assert "Liquidity missed-opportunity report" in runtime.telegram.sent_messages[-1][0]
 
 
 def test_symbol_performance_gate_blocks_pf_below_floor_after_sample():

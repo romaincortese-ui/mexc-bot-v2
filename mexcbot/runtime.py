@@ -245,8 +245,11 @@ class LiveBotRuntime:
         self.recently_closed: dict[str, float] = {}
         self.symbol_cooldowns: dict[str, float] = {}
         self.symbol_performance_paused_until: dict[str, float] = {}
+        self.signal_performance_paused_until: dict[str, float] = {}
         self.liquidity_blacklist: dict[str, float] = {}
         self.liquidity_fail_count: dict[str, int] = {}
+        self.liquidity_missed_pending: list[dict[str, object]] = []
+        self.liquidity_missed_reports: deque[str] = deque(maxlen=10)
         self.trade_calibration: dict = {}
         self._calibration_manifest: dict[str, object] = {}
         self.daily_review: dict = {}
@@ -262,6 +265,8 @@ class LiveBotRuntime:
         self._market_regime_mult = 1.0
         self._fear_greed_index: int | None = None
         self._last_grid_block_reason: str | None = None
+        self._last_market_context_label: str | None = None
+        self._last_market_context_block_reason: str | None = None
         self._adaptive_offsets: dict[str, float] = {}
         self._last_rebalance_count = 0
         self._dynamic_scalper_budget: float | None = None
@@ -407,8 +412,11 @@ class LiveBotRuntime:
             "recently_closed": dict(self.recently_closed),
             "symbol_cooldowns": dict(self.symbol_cooldowns),
             "symbol_performance_paused_until": dict(self.symbol_performance_paused_until),
+            "signal_performance_paused_until": dict(self.signal_performance_paused_until),
             "liquidity_blacklist": dict(self.liquidity_blacklist),
             "liquidity_fail_count": dict(self.liquidity_fail_count),
+            "liquidity_missed_pending": list(self.liquidity_missed_pending),
+            "liquidity_missed_reports": list(self.liquidity_missed_reports),
             "win_rate_pause_until": self._win_rate_pause_until,
             "consecutive_losses": self._consecutive_losses,
             "streak_paused_at": self._streak_paused_at,
@@ -468,8 +476,14 @@ class LiveBotRuntime:
                 str(symbol): float(expires_at)
                 for symbol, expires_at in dict(payload.get("symbol_performance_paused_until", {})).items()
             }
+            self.signal_performance_paused_until = {
+                str(lane): float(expires_at)
+                for lane, expires_at in dict(payload.get("signal_performance_paused_until", {})).items()
+            }
             self.liquidity_blacklist = {str(symbol): float(expires_at) for symbol, expires_at in dict(payload.get("liquidity_blacklist", {})).items()}
             self.liquidity_fail_count = {str(symbol): int(count) for symbol, count in dict(payload.get("liquidity_fail_count", {})).items()}
+            self.liquidity_missed_pending = [dict(item) for item in list(payload.get("liquidity_missed_pending", [])) if isinstance(item, dict)]
+            self.liquidity_missed_reports = deque([str(item) for item in list(payload.get("liquidity_missed_reports", []))], maxlen=10)
             self._win_rate_pause_until = float(payload.get("win_rate_pause_until", 0.0) or 0.0)
             self._consecutive_losses = int(payload.get("consecutive_losses", 0) or 0)
             self._streak_paused_at = float(payload.get("streak_paused_at", 0.0) or 0.0)
@@ -499,8 +513,11 @@ class LiveBotRuntime:
             self.recently_closed = {}
             self.symbol_cooldowns = {}
             self.symbol_performance_paused_until = {}
+            self.signal_performance_paused_until = {}
             self.liquidity_blacklist = {}
             self.liquidity_fail_count = {}
+            self.liquidity_missed_pending = []
+            self.liquidity_missed_reports.clear()
             self._win_rate_pause_until = 0.0
             self._consecutive_losses = 0
             self._streak_paused_at = 0.0
@@ -554,7 +571,7 @@ class LiveBotRuntime:
         }.get(strategy.upper(), "•")
 
     def _market_regime_label(self) -> str:
-        mult = self._market_regime_mult
+        mult = float(getattr(self, "_market_regime_mult", 1.0) or 1.0)
         if mult > 1.30:
             return "CRASH"
         if mult > 1.10:
@@ -564,6 +581,48 @@ class LiveBotRuntime:
         if mult > 0.80:
             return "BULL"
         return "STRONG BULL"
+
+    def _market_context_label(self) -> str:
+        label = self._market_regime_label()
+        if not getattr(self.config, "market_context_enabled", False):
+            return label
+        fear_greed_index = getattr(self, "_fear_greed_index", None)
+        if fear_greed_index is not None and fear_greed_index <= getattr(self.config, "fear_greed_bear_threshold", 15):
+            if label in {"BEAR", "CRASH"}:
+                return "CRASH"
+            if label == "SIDEWAYS":
+                return "BEAR"
+        return label
+
+    def _market_context(self) -> dict[str, object]:
+        label = self._market_context_label()
+        budget_mult = 1.0
+        blocked: set[str] = set()
+        if getattr(self.config, "market_context_enabled", False):
+            if label == "CRASH":
+                budget_mult = getattr(self.config, "market_context_crash_budget_mult", 1.0)
+                blocked = {strategy.upper() for strategy in getattr(self.config, "market_context_crash_block_strategies", [])}
+            elif label == "BEAR":
+                budget_mult = getattr(self.config, "market_context_bear_budget_mult", 1.0)
+                blocked = {strategy.upper() for strategy in getattr(self.config, "market_context_bear_block_strategies", [])}
+            elif label == "SIDEWAYS":
+                budget_mult = getattr(self.config, "market_context_sideways_budget_mult", 1.0)
+            else:
+                budget_mult = getattr(self.config, "market_context_bull_budget_mult", 1.0)
+        return {
+            "label": label,
+            "threshold_mult": round(float(getattr(self, "_market_regime_mult", 1.0) or 1.0), 4),
+            "budget_mult": max(0.0, float(budget_mult)),
+            "blocked_strategies": sorted(blocked),
+        }
+
+    def _market_context_budget_multiplier(self, opportunity: Opportunity) -> float:
+        context = self._market_context()
+        label = str(context["label"])
+        mult = float(context["budget_mult"])
+        opportunity.metadata["market_context"] = label
+        opportunity.metadata["market_context_budget_mult"] = round(mult, 4)
+        return mult
 
     def _fng_label(self) -> str:
         fng = self._fear_greed_index
@@ -746,7 +805,7 @@ class LiveBotRuntime:
         return lines
 
     def _commands_hint(self) -> str:
-        return "/status /pnl /fees /allocation /symbols /metrics /config /logs /review /approve /pause /resume /close /reconcile /resetstreak /restart /ask"
+        return "/status /pnl /fees /allocation /symbols /signals /missed /metrics /config /logs /review /approve /pause /resume /close /reconcile /resetstreak /restart /ask"
 
     def _review_suggestions(self) -> list[dict[str, object]]:
         merged: list[dict[str, object]] = []
@@ -1086,6 +1145,69 @@ class LiveBotRuntime:
             "profit_factor": profit_factor,
         }
 
+    def _signal_performance_stats(self, lane: str) -> dict[str, object]:
+        resolved = _normalise_signal_lane(lane)
+        lookback = max(self.config.signal_perf_gate_min_trades, self.config.signal_perf_gate_lookback_trades)
+        trades = [
+            trade for trade in self.trade_history
+            if _signal_lane_key(trade.get("strategy"), trade.get("entry_signal")) == resolved and not trade.get("is_partial")
+        ][-lookback:]
+        wins = [trade for trade in trades if self._trade_net_pnl_usdt(trade) > 0]
+        losses = [trade for trade in trades if self._trade_net_pnl_usdt(trade) <= 0]
+        gross_profit = sum(max(0.0, self._trade_net_pnl_usdt(trade)) for trade in trades)
+        gross_loss = abs(sum(min(0.0, self._trade_net_pnl_usdt(trade)) for trade in trades))
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
+        return {
+            "lane": resolved,
+            "trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "net_pnl": sum(self._trade_net_pnl_usdt(trade) for trade in trades),
+            "profit_factor": profit_factor,
+        }
+
+    def _signal_gate_block_reason(self, stats: dict[str, object]) -> str | None:
+        losses = int(stats.get("losses", 0) or 0)
+        trades = int(stats.get("trades", 0) or 0)
+        profit_factor = float(stats.get("profit_factor", 0.0) or 0.0)
+        poor_profit_factor = profit_factor < self.config.signal_perf_gate_min_profit_factor
+        if self.config.signal_perf_gate_max_losses > 0 and losses >= self.config.signal_perf_gate_max_losses and poor_profit_factor:
+            return f"{losses} losses >= limit {self.config.signal_perf_gate_max_losses}"
+        if trades >= self.config.signal_perf_gate_min_trades and poor_profit_factor:
+            return f"PF {profit_factor:.2f} < {self.config.signal_perf_gate_min_profit_factor:.2f} over {trades} trades"
+        return None
+
+    def _signal_performance_rejects(self, opportunity: Opportunity) -> bool:
+        if not self.config.signal_perf_gate_enabled:
+            return False
+        lane = _signal_lane_key(opportunity.strategy, opportunity.entry_signal)
+        now_ts = time.time()
+        paused_until = float(self.signal_performance_paused_until.get(lane, 0.0) or 0.0)
+        if paused_until > now_ts:
+            mins_left = max(1, math.ceil((paused_until - now_ts) / 60.0))
+            opportunity.metadata["pretrade_block_reason"] = "signal_performance_gate"
+            opportunity.metadata["symbol_gate_detail"] = f"{lane} active pause {mins_left}m"
+            return True
+        stats = self._signal_performance_stats(lane)
+        reason = self._signal_gate_block_reason(stats)
+        if reason is None:
+            return False
+        pause_seconds = max(1, self.config.signal_perf_gate_pause_hours) * 3600
+        self.signal_performance_paused_until[lane] = now_ts + pause_seconds
+        opportunity.metadata["pretrade_block_reason"] = "signal_performance_gate"
+        opportunity.metadata["symbol_gate_detail"] = f"{lane}: {reason}"
+        opportunity.metadata["symbol_gate_trades"] = int(stats["trades"])
+        opportunity.metadata["symbol_gate_pf"] = round(float(stats["profit_factor"]), 4) if math.isfinite(float(stats["profit_factor"])) else "inf"
+        log.info("[SIGNAL_PERF_GATE] Blocked %s %s: %s", opportunity.symbol, lane, reason)
+        self._record_activity(f"Signal perf gate block {lane}: {reason}")
+        self._save_state()
+        return True
+
     def _symbol_gate_block_reason(self, stats: dict[str, object]) -> str | None:
         losses = int(stats.get("losses", 0) or 0)
         trades = int(stats.get("trades", 0) or 0)
@@ -1169,6 +1291,59 @@ class LiveBotRuntime:
                 )
         else:
             lines.append("No closed symbol history yet.")
+        return "\n".join(lines)[:4000]
+
+    def _build_signal_gate_message(self) -> str:
+        now_ts = time.time()
+        self._purge_cooldowns()
+        lines = [
+            "🚦 <b>Signal Performance Gate</b>",
+            "━━━━━━━━━━━━━━━",
+            (
+                f"Rules: {self.config.signal_perf_gate_max_losses} losses or PF "
+                f"&lt; {self.config.signal_perf_gate_min_profit_factor:.2f} after "
+                f"{self.config.signal_perf_gate_min_trades} trades"
+            ),
+            f"Pause: <b>{self.config.signal_perf_gate_pause_hours}h</b> | Lookback: <b>{self.config.signal_perf_gate_lookback_trades}</b> trades",
+        ]
+        active = {
+            lane: expires_at
+            for lane, expires_at in self.signal_performance_paused_until.items()
+            if expires_at > now_ts
+        }
+        if active:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Blocked now:")
+            for lane, expires_at in sorted(active.items(), key=lambda item: item[1]):
+                mins_left = max(1, math.ceil((expires_at - now_ts) / 60.0))
+                stats = self._signal_performance_stats(lane)
+                pf = float(stats["profit_factor"])
+                pf_text = "∞" if math.isinf(pf) else f"{pf:.2f}"
+                lines.append(
+                    f"  ⛔ {lane}: {mins_left}m left | {int(stats['trades'])}t "
+                    f"{int(stats['wins'])}W/{int(stats['losses'])}L | PF {pf_text} | ${float(stats['net_pnl']):+.2f}"
+                )
+        lanes = sorted({
+            _signal_lane_key(trade.get("strategy"), trade.get("entry_signal"))
+            for trade in self.trade_history
+            if trade.get("entry_signal") and not trade.get("is_partial")
+        })
+        stats_rows = [self._signal_performance_stats(lane) for lane in lanes]
+        stats_rows = [row for row in stats_rows if int(row["trades"]) > 0]
+        stats_rows.sort(key=lambda row: (float(row["net_pnl"]), -int(row["losses"])))
+        if stats_rows:
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("Weakest recent lanes:")
+            for row in stats_rows[:5]:
+                pf = float(row["profit_factor"])
+                pf_text = "∞" if math.isinf(pf) else f"{pf:.2f}"
+                marker = "⛔" if str(row["lane"]) in active else "•"
+                lines.append(
+                    f"  {marker} {row['lane']}: {int(row['trades'])}t {int(row['wins'])}W/{int(row['losses'])}L "
+                    f"PF {pf_text} | ${float(row['net_pnl']):+.2f}"
+                )
+        else:
+            lines.append("No closed signal history yet.")
         return "\n".join(lines)[:4000]
 
     def _format_hold_time(self, closed_trade: dict[str, object]) -> str | None:
@@ -1325,6 +1500,17 @@ class LiveBotRuntime:
                 "min_profit_factor": self.config.symbol_perf_gate_min_profit_factor,
                 "pause_hours": self.config.symbol_perf_gate_pause_hours,
             },
+            "signal_performance_gate": {
+                "enabled": self.config.signal_perf_gate_enabled,
+                "min_trades": self.config.signal_perf_gate_min_trades,
+                "max_losses": self.config.signal_perf_gate_max_losses,
+                "min_profit_factor": self.config.signal_perf_gate_min_profit_factor,
+                "pause_hours": self.config.signal_perf_gate_pause_hours,
+            },
+            "profit_gate": {
+                "min_expected_net_profit_usdt": self.config.min_expected_net_profit_usdt,
+            },
+            "market_context": self._market_context(),
             "reconcile_on_boot": bool(RECONCILE_ON_BOOT),
             "calibration": dict(self._calibration_manifest),
         }
@@ -1807,7 +1993,7 @@ class LiveBotRuntime:
         lines = [
             f"📋 <b>Status</b> [{self._mode_label()}]",
             "━━━━━━━━━━━━━━━",
-            f"Market: <b>{self._market_regime_label()}</b> (×{self._market_regime_mult:.2f}) | F&G {self._fng_label()}",
+            f"Market: <b>{self._market_context_label()}</b> (×{self._market_regime_mult:.2f}) | F&G {self._fng_label()}",
             self._btc_trend_line(),
             f"Moonshot: {self._moonshot_status_label()} | Gate {'✅ open' if self._moonshot_gate_open else '⛔ closed'} | Paused: {'yes' if self._paused else 'no'}",
             f"Free: <b>${snapshot['free_usdt']:.2f}</b> | Total: <b>${snapshot['total_equity']:.2f}</b> | Session: <b>${snapshot['session_pnl']:+.2f}</b>",
@@ -2014,7 +2200,7 @@ class LiveBotRuntime:
         dead_active = sum(1 for expires_at in self.liquidity_blacklist.values() if expires_at > time.time())
         body = (
             f"⚙️ <b>Config</b>\n"
-            f"Market {self._market_regime_label()} (×{self._market_regime_mult:.2f}) | Moon {'✅' if self._moonshot_gate_open else '⛔'}\n"
+            f"Market {self._market_context_label()} (×{self._market_regime_mult:.2f}, budget ×{float(self._market_context()['budget_mult']):.2f}) | Moon {'✅' if self._moonshot_gate_open else '⛔'}\n"
             f"Strategies: {', '.join(self.config.strategies)}\n"
             f"Thresholds: S {self._strategy_base_threshold('SCALPER'):.1f} | M {self._strategy_base_threshold('MOONSHOT'):.1f} | T {self._strategy_base_threshold('TRINITY'):.1f} | R {self._strategy_base_threshold('REVERSAL'):.1f}\n"
             f"Pools S/M/T/G {self.config.scalper_allocation_pct * 100:.0f}/{self.config.moonshot_allocation_pct * 100:.0f}/{self.config.trinity_allocation_pct * 100:.0f}/{self.config.grid_allocation_pct * 100:.0f}\n"
@@ -2024,6 +2210,9 @@ class LiveBotRuntime:
             f"Moon gate: {self.config.moonshot_btc_ema_gate:+.3f} reopen {self.config.moonshot_btc_gate_reopen:+.3f}\n"
             f"Adaptive: window {self.config.adaptive_window} | tighten {self.config.adaptive_tighten_step:.1f} | relax {self.config.adaptive_relax_step:.1f}\n"
             f"Symbol gate: {'on' if self.config.symbol_perf_gate_enabled else 'off'} | {self.config.symbol_perf_gate_max_losses} losses or PF&lt;{self.config.symbol_perf_gate_min_profit_factor:.2f} after {self.config.symbol_perf_gate_min_trades}t | pause {self.config.symbol_perf_gate_pause_hours}h\n"
+            f"Signal gate: {'on' if self.config.signal_perf_gate_enabled else 'off'} | {self.config.signal_perf_gate_max_losses} losses or PF&lt;{self.config.signal_perf_gate_min_profit_factor:.2f} after {self.config.signal_perf_gate_min_trades}t\n"
+            f"Profit gate: min expected net TP ${self.config.min_expected_net_profit_usdt:.2f}\n"
+            f"Liquidity missed: {'on' if self.config.liquidity_missed_tracking_enabled else 'off'} | horizon {self.config.liquidity_missed_horizon_minutes}m\n"
             f"{self._calibration_manifest_line()}\n"
             f"☠️ Blacklisted {dead_active} | {'⏸️ PAUSED' if self._paused else '▶️ RUNNING'}"
         )
@@ -2615,6 +2804,10 @@ class LiveBotRuntime:
                 self._notify(self._build_allocation_dashboard_message())
             elif text in {"/symbols", "/symbolgate"}:
                 self._notify(self._build_symbol_gate_message())
+            elif text in {"/signals", "/signalgate"}:
+                self._notify(self._build_signal_gate_message())
+            elif text in {"/missed", "/liquidity"}:
+                self._notify(self._build_liquidity_missed_message())
             elif text == "/metrics":
                 self._notify(self._build_metrics_message())
             elif text in {"/logs", "/log"}:
@@ -2641,6 +2834,8 @@ class LiveBotRuntime:
                     f"/fees — Daily gross/fee/net report\n"
                     f"/allocation — Strategy pool capacity\n"
                     f"/symbols — Symbol performance gate\n"
+                    f"/signals — Signal performance gate\n"
+                    f"/missed — Liquidity missed report\n"
                     f"/metrics — Win rate, PF, signals\n"
                     f"/config — Strategy thresholds & pools\n"
                     f"/logs — Recent activity\n"
@@ -2811,6 +3006,11 @@ class LiveBotRuntime:
             for symbol, expires_at in self.symbol_performance_paused_until.items()
             if expires_at > now_ts
         }
+        self.signal_performance_paused_until = {
+            lane: expires_at
+            for lane, expires_at in self.signal_performance_paused_until.items()
+            if expires_at > now_ts
+        }
         expired_blacklist = [symbol for symbol, expires_at in self.liquidity_blacklist.items() if expires_at <= now_ts]
         for symbol in expired_blacklist:
             self.liquidity_blacklist.pop(symbol, None)
@@ -2867,6 +3067,20 @@ class LiveBotRuntime:
                     self._last_grid_block_reason = block_grid_reason
             else:
                 self._last_grid_block_reason = None
+        context = self._market_context()
+        blocked_by_context = {str(strategy).upper() for strategy in context.get("blocked_strategies", [])}
+        if blocked_by_context:
+            before = list(eligible)
+            eligible = [strategy for strategy in eligible if strategy.upper() not in blocked_by_context]
+            blocked_now = sorted({strategy.upper() for strategy in before} - {strategy.upper() for strategy in eligible})
+            if blocked_now:
+                reason = f"{context['label']} blocks {','.join(blocked_now)}"
+                if self._last_market_context_block_reason != reason:
+                    log.info("[MARKET_CONTEXT] %s", reason)
+                    self._record_activity(reason)
+                    self._last_market_context_block_reason = reason
+            else:
+                self._last_market_context_block_reason = None
         return eligible
 
     def _update_moonshot_gate(self) -> None:
@@ -3121,6 +3335,7 @@ class LiveBotRuntime:
         mult *= self._drawdown_kill_multiplier()
         mult *= self._fee_tier_multiplier()
         mult *= self._weekend_flatten_multiplier()
+        mult *= self._market_context_budget_multiplier(opportunity)
         mult *= self._crypto_event_overlay_multiplier(opportunity)
         return max(0.0, mult)
 
@@ -3309,6 +3524,8 @@ class LiveBotRuntime:
         opportunity.metadata.pop("symbol_gate_detail", None)
         if self._signal_lane_rejects(opportunity):
             return False
+        if self._signal_performance_rejects(opportunity):
+            return False
         if self._symbol_performance_rejects(opportunity):
             return False
         if self._moonshot_per_symbol_rejects(opportunity):
@@ -3427,17 +3644,63 @@ class LiveBotRuntime:
         opportunity.metadata["risk_budget_usdt"] = round(allocation, 4)
         return allocation
 
+    def _expected_profit_fields(self, opportunity: Opportunity, allocation_usdt: float) -> dict[str, float]:
+        tp_pct = float(opportunity.tp_pct if opportunity.tp_pct is not None else self.config.take_profit_pct)
+        sl_pct = float(opportunity.sl_pct if opportunity.sl_pct is not None else self.config.stop_loss_pct)
+        gross_entry = max(0.0, float(allocation_usdt or 0.0))
+        entry_fee = gross_entry * MEXC_SPOT_TAKER_FEE_RATE
+        tp_gross = gross_entry * tp_pct
+        sl_gross = -gross_entry * sl_pct
+        tp_exit_fee = max(0.0, (gross_entry + tp_gross) * MEXC_SPOT_TAKER_FEE_RATE)
+        sl_exit_fee = max(0.0, (gross_entry + sl_gross) * MEXC_SPOT_TAKER_FEE_RATE)
+        return {
+            "tp_pct": tp_pct,
+            "sl_pct": sl_pct,
+            "estimated_entry_fee_usdt": entry_fee,
+            "estimated_tp_exit_fee_usdt": tp_exit_fee,
+            "estimated_sl_exit_fee_usdt": sl_exit_fee,
+            "expected_tp_gross_usdt": tp_gross,
+            "expected_sl_gross_usdt": sl_gross,
+            "expected_tp_net_usdt": tp_gross - entry_fee - tp_exit_fee,
+            "expected_sl_net_usdt": sl_gross - entry_fee - sl_exit_fee,
+        }
+
+    def _expected_profit_rejects(self, opportunity: Opportunity, allocation_usdt: float) -> bool:
+        floor = float(getattr(self.config, "min_expected_net_profit_usdt", 0.0) or 0.0)
+        fields = self._expected_profit_fields(opportunity, allocation_usdt)
+        opportunity.metadata.update({key: round(value, 8) for key, value in fields.items()})
+        if floor <= 0:
+            return False
+        expected_net = float(fields["expected_tp_net_usdt"])
+        if expected_net >= floor:
+            return False
+        opportunity.metadata["pretrade_block_reason"] = "min_expected_net_profit"
+        opportunity.metadata["symbol_gate_detail"] = f"tp_net ${expected_net:.4f} < ${floor:.4f}"
+        log.info(
+            "[PROFIT_GATE] Blocked %s %s: expected_tp_net=%.4f floor=%.4f allocation=%.4f",
+            opportunity.symbol,
+            _signal_lane_key(opportunity.strategy, opportunity.entry_signal),
+            expected_net,
+            floor,
+            allocation_usdt,
+        )
+        self._record_activity(f"Profit gate block {opportunity.symbol} ${expected_net:.2f}")
+        return True
+
     def _update_market_regime(self) -> None:
         previous = self._market_regime_mult
         frame = self._get_btc_1h_frame()
         if frame is None:
             return
         self._market_regime_mult = compute_market_regime_multiplier(frame, self.config)
-        if abs(previous - self._market_regime_mult) >= 0.2:
-            self._record_activity(f"Market regime {self._market_regime_label()} x{self._market_regime_mult:.2f}")
+        context = self._market_context()
+        context_label = str(context["label"])
+        if abs(previous - self._market_regime_mult) >= 0.2 or context_label != self._last_market_context_label:
+            self._last_market_context_label = context_label
+            self._record_activity(f"Market context {context_label} x{self._market_regime_mult:.2f} budget x{float(context['budget_mult']):.2f}")
             self._notify(
-                f"🌍 <b>Market regime update</b>\n"
-                f"{self._market_regime_label()} | Multiplier <b>×{self._market_regime_mult:.2f}</b>"
+                f"🌍 <b>Market context update</b>\n"
+                f"{context_label} | Threshold <b>×{self._market_regime_mult:.2f}</b> | Budget <b>×{float(context['budget_mult']):.2f}</b>"
             )
 
     def _check_dead_coin(self, symbol: str, *, vol_24h: float, spread: float | None, strategy: str) -> bool:
@@ -3459,6 +3722,110 @@ class LiveBotRuntime:
         self.liquidity_fail_count.pop(symbol, None)
         return True
 
+    def _record_liquidity_blocked_opportunity(
+        self,
+        opportunity: Opportunity,
+        *,
+        vol_24h: float,
+        spread: float | None,
+    ) -> None:
+        if not self.config.liquidity_missed_tracking_enabled:
+            return
+        if self.config.liquidity_missed_horizon_minutes <= 0:
+            return
+        blocked_price = float(opportunity.price or 0.0)
+        if blocked_price <= 0:
+            try:
+                blocked_price = float(self.client.get_price(opportunity.symbol) or 0.0)
+            except Exception:
+                blocked_price = 0.0
+        if blocked_price <= 0:
+            return
+        now_ts = time.time()
+        due_at = now_ts + self.config.liquidity_missed_horizon_minutes * 60
+        lane = _signal_lane_key(opportunity.strategy, opportunity.entry_signal)
+        self.liquidity_missed_pending = [
+            item for item in self.liquidity_missed_pending
+            if str(item.get("symbol") or "") != opportunity.symbol or str(item.get("lane") or "") != lane
+        ]
+        self.liquidity_missed_pending.append(
+            {
+                "symbol": opportunity.symbol,
+                "strategy": opportunity.strategy,
+                "entry_signal": opportunity.entry_signal,
+                "lane": lane,
+                "score": round(float(opportunity.score), 4),
+                "blocked_at": now_ts,
+                "due_at": due_at,
+                "blocked_price": blocked_price,
+                "vol_24h": round(float(vol_24h or 0.0), 4),
+                "spread": round(float(spread), 6) if spread is not None else None,
+            }
+        )
+        max_pending = max(1, int(self.config.liquidity_missed_max_pending or 1))
+        self.liquidity_missed_pending = self.liquidity_missed_pending[-max_pending:]
+        self._save_state()
+
+    def _review_liquidity_missed_opportunities(self) -> None:
+        if not self.config.liquidity_missed_tracking_enabled or not self.liquidity_missed_pending:
+            return
+        now_ts = time.time()
+        still_pending: list[dict[str, object]] = []
+        report_lines: list[str] = []
+        min_report_move = float(self.config.liquidity_missed_min_report_move_pct or 0.0)
+        for item in list(self.liquidity_missed_pending):
+            due_at = float(item.get("due_at", 0.0) or 0.0)
+            if due_at > now_ts:
+                still_pending.append(item)
+                continue
+            symbol = str(item.get("symbol") or "")
+            blocked_price = float(item.get("blocked_price", 0.0) or 0.0)
+            if not symbol or blocked_price <= 0:
+                continue
+            try:
+                current_price = float(self.client.get_price(symbol) or 0.0)
+            except Exception:
+                still_pending.append(item)
+                continue
+            if current_price <= 0:
+                still_pending.append(item)
+                continue
+            move_pct = current_price / blocked_price - 1.0
+            report = {
+                "symbol": symbol,
+                "lane": str(item.get("lane") or ""),
+                "blocked_price": round(blocked_price, 12),
+                "current_price": round(current_price, 12),
+                "move_pct": round(move_pct, 6),
+                "score": item.get("score", 0.0),
+                "vol_24h": item.get("vol_24h", 0.0),
+                "spread": item.get("spread"),
+            }
+            log.info("[LIQUIDITY_MISSED] %s", _audit_json(report))
+            if abs(move_pct) >= min_report_move:
+                line = f"{symbol} {move_pct:+.2%} after liquidity block ({report['lane']})"
+                self.liquidity_missed_reports.appendleft(line)
+                report_lines.append(line)
+        self.liquidity_missed_pending = still_pending[-max(1, int(self.config.liquidity_missed_max_pending or 1)):]
+        if report_lines:
+            self._record_activity(f"Liquidity missed report {len(report_lines)}")
+            self._notify("📉 <b>Liquidity missed-opportunity report</b>\n" + "\n".join(report_lines[:8]))
+        self._save_state()
+
+    def _build_liquidity_missed_message(self) -> str:
+        self._review_liquidity_missed_opportunities()
+        lines = [
+            "📉 <b>Liquidity Missed Opportunities</b>",
+            "━━━━━━━━━━━━━━━",
+            f"Pending: <b>{len(self.liquidity_missed_pending)}</b> | Horizon: <b>{self.config.liquidity_missed_horizon_minutes}m</b>",
+        ]
+        if self.liquidity_missed_reports:
+            lines.append("Recent reports:")
+            lines.extend(f"  • {line}" for line in list(self.liquidity_missed_reports)[:8])
+        else:
+            lines.append("No completed liquidity-block observations yet.")
+        return "\n".join(lines)[:4000]
+
     def _passes_liquidity_guard(
         self,
         opportunity: Opportunity,
@@ -3477,7 +3844,10 @@ class LiveBotRuntime:
             except Exception:
                 vol_24h = 0.0
         spread = self.client.get_orderbook_spread(symbol)
-        return self._check_dead_coin(symbol, vol_24h=vol_24h, spread=spread, strategy=opportunity.strategy)
+        passed = self._check_dead_coin(symbol, vol_24h=vol_24h, spread=spread, strategy=opportunity.strategy)
+        if not passed:
+            self._record_liquidity_blocked_opportunity(opportunity, vol_24h=vol_24h, spread=spread)
+        return passed
 
     def _update_adaptive_thresholds(self) -> None:
         min_trades_for_adjust = max(10, self.config.adaptive_window // 2)
@@ -3761,9 +4131,10 @@ class LiveBotRuntime:
         return trade
 
     def _fill_open_slots(self) -> None:
+        self._update_fear_greed()
         self._update_market_regime()
         self._update_moonshot_gate()
-        self._update_fear_greed()
+        self._review_liquidity_missed_opportunities()
         eligible_strategies = self._eligible_strategies()
         if not eligible_strategies:
             return
@@ -3817,6 +4188,16 @@ class LiveBotRuntime:
                     total_equity=_audit_float(total_equity or available_balance, 4),
                     pool_cap_usdt=_audit_float(opportunity.metadata.get("strategy_pool_cap_usdt"), 4),
                     strategy_budget_pct=_audit_float(opportunity.metadata.get("strategy_budget_pct"), 6),
+                )
+                cycle_excluded.add(opportunity.symbol)
+                continue
+            if self._expected_profit_rejects(opportunity, allocation_usdt):
+                self._log_entry_block(
+                    opportunity,
+                    "min_expected_net_profit",
+                    allocation_usdt=_audit_float(allocation_usdt, 4),
+                    expected_tp_net_usdt=_audit_float(opportunity.metadata.get("expected_tp_net_usdt"), 8),
+                    min_expected_net_profit_usdt=_audit_float(self.config.min_expected_net_profit_usdt, 8),
                 )
                 cycle_excluded.add(opportunity.symbol)
                 continue

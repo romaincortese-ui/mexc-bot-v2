@@ -144,6 +144,149 @@ def test_backtest_engine_blocks_configured_signal_lane():
     assert trades == []
 
 
+def test_backtest_engine_blocks_tiny_expected_net_profit():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=70, freq="5min")
+    frame = pd.DataFrame(
+        {
+            "open": [100.0] * 70,
+            "high": [103.0] * 70,
+            "low": [99.5] * 70,
+            "close": [100.0] * 70,
+            "volume": [1000.0] * 70,
+        },
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["BTCUSDT"],
+        initial_balance=20.0,
+        min_expected_net_profit_usdt=0.10,
+    )
+
+    def stub_scorer(symbol: str, window: pd.DataFrame, threshold: float):
+        if len(window) < 60:
+            return None
+        return Opportunity(
+            symbol=symbol,
+            score=40.0,
+            price=float(window["close"].iloc[-1]),
+            rsi=42.0,
+            rsi_score=5.0,
+            ma_score=20.0,
+            vol_score=20.0,
+            vol_ratio=1.5,
+            entry_signal="CROSSOVER",
+            strategy="SCALPER",
+        )
+
+    engine = BacktestEngine(config, StubProvider(frame), scorer=stub_scorer)
+    _, trades = engine.run()
+
+    assert trades == []
+
+
+def test_backtest_signal_performance_filter_blocks_weak_lane():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=2, freq="5min")
+    frame = pd.DataFrame(
+        {"open": [100.0] * 2, "high": [101.0] * 2, "low": [99.0] * 2, "close": [100.0] * 2, "volume": [1000.0] * 2},
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["BTCUSDT"],
+        signal_perf_gate_max_losses=2,
+        signal_perf_gate_min_trades=3,
+    )
+    engine = BacktestEngine(config, StubProvider(frame))
+    candidate = Opportunity(
+        symbol="BTCUSDT",
+        score=40.0,
+        price=100.0,
+        rsi=42.0,
+        rsi_score=5.0,
+        ma_score=20.0,
+        vol_score=20.0,
+        vol_ratio=1.5,
+        entry_signal="CROSSOVER",
+        strategy="SCALPER",
+    )
+    closed = [
+        {"strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.2},
+        {"strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.1},
+    ]
+    paused: dict[str, int] = {}
+
+    filtered = engine._apply_signal_performance_filter([(candidate, "BTCUSDT")], closed, paused, 10)
+
+    assert filtered == []
+    assert paused["SCALPER:CROSSOVER"] > 10
+
+
+def test_backtest_signal_performance_filter_allows_profitable_lane_with_small_losses():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=2, freq="5min")
+    frame = pd.DataFrame(
+        {"open": [100.0] * 2, "high": [101.0] * 2, "low": [99.0] * 2, "close": [100.0] * 2, "volume": [1000.0] * 2},
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["BTCUSDT"],
+        signal_perf_gate_max_losses=3,
+        signal_perf_gate_min_trades=4,
+        signal_perf_gate_min_profit_factor=0.95,
+    )
+    engine = BacktestEngine(config, StubProvider(frame))
+    candidate = Opportunity(
+        symbol="BTCUSDT",
+        score=40.0,
+        price=100.0,
+        rsi=42.0,
+        rsi_score=5.0,
+        ma_score=20.0,
+        vol_score=20.0,
+        vol_ratio=1.5,
+        entry_signal="CROSSOVER",
+        strategy="SCALPER",
+    )
+    closed = [
+        {"strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.01},
+        {"strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.01},
+        {"strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": -0.01},
+        {"strategy": "SCALPER", "entry_signal": "CROSSOVER", "net_pnl_usdt": 1.0},
+    ]
+    paused: dict[str, int] = {}
+
+    filtered = engine._apply_signal_performance_filter([(candidate, "BTCUSDT")], closed, paused, 10)
+
+    assert filtered == [(candidate, "BTCUSDT")]
+    assert paused == {}
+
+
+def test_backtest_market_context_filter_blocks_crash_strategies():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=2, freq="5min")
+    frame = pd.DataFrame(
+        {"open": [100.0] * 2, "high": [101.0] * 2, "low": [99.0] * 2, "close": [100.0] * 2, "volume": [1000.0] * 2},
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["BTCUSDT"],
+        market_context_crash_block_strategies=["MOONSHOT"],
+    )
+    engine = BacktestEngine(config, StubProvider(frame))
+    engine._market_regime_mult = 1.40
+    moonshot = Opportunity("DOGEUSDT", 40.0, 1.0, 40.0, 5.0, 20.0, 20.0, 1.5, "TRENDING_SOCIAL", strategy="MOONSHOT")
+    scalper = Opportunity("BTCUSDT", 40.0, 100.0, 40.0, 5.0, 20.0, 20.0, 1.5, "CROSSOVER", strategy="SCALPER")
+
+    filtered = engine._apply_market_context_filter([(moonshot, "DOGEUSDT"), (scalper, "BTCUSDT")])
+
+    assert filtered == [(scalper, "BTCUSDT")]
+
+
 def test_backtest_engine_flattens_opportunity_buzz_metadata_into_trade_rows():
     index = pd.date_range("2024-01-01T00:00:00Z", periods=70, freq="5min")
     frame = pd.DataFrame(
@@ -558,6 +701,7 @@ def test_backtest_engine_rotates_scalper_when_stronger_signal_appears():
         symbols=["BTCUSDT", "ETHUSDT"],
         max_open_positions=1,
         reentry_cooldown_bars=100,
+        blocked_signal_lanes=[],
     )
 
     def rotating_scorer(symbol: str, window: pd.DataFrame, threshold: float):
@@ -620,6 +764,7 @@ def test_backtest_engine_filters_correlated_scalper_follow_up_entries():
         symbols=["BTCUSDT", "CORRUSDT", "ALTUSDT"],
         max_open_positions=2,
         reentry_cooldown_bars=100,
+        blocked_signal_lanes=[],
     )
 
     def stub_scorer(symbol: str, window: pd.DataFrame, threshold: float):

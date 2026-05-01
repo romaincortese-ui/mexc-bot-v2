@@ -444,6 +444,34 @@ class BacktestEngine:
             return effective / self.config.moonshot_budget_pct if self.config.moonshot_budget_pct > 0 else 1.0
         return 1.0
 
+    def _market_context_label(self) -> str:
+        label = self._market_regime_label()
+        if not self.config.market_context_enabled:
+            return label
+        if self._synthetic_fng <= self.config.fear_greed_bear_threshold:
+            if label in {"BEAR", "CRASH"}:
+                return "CRASH"
+            if label == "SIDEWAYS":
+                return "BEAR"
+        return label
+
+    def _market_context(self) -> dict[str, object]:
+        label = self._market_context_label()
+        budget_mult = 1.0
+        blocked: set[str] = set()
+        if self.config.market_context_enabled:
+            if label == "CRASH":
+                budget_mult = self.config.market_context_crash_budget_mult
+                blocked = {strategy.upper() for strategy in self.config.market_context_crash_block_strategies}
+            elif label == "BEAR":
+                budget_mult = self.config.market_context_bear_budget_mult
+                blocked = {strategy.upper() for strategy in self.config.market_context_bear_block_strategies}
+            elif label == "SIDEWAYS":
+                budget_mult = self.config.market_context_sideways_budget_mult
+            else:
+                budget_mult = self.config.market_context_bull_budget_mult
+        return {"label": label, "budget_mult": max(0.0, float(budget_mult)), "blocked_strategies": sorted(blocked)}
+
     def _strategy_pool_key(self, strategy: str) -> str:
         resolved = strategy.upper()
         if resolved in {"MOONSHOT", "REVERSAL", "PRE_BREAKOUT"}:
@@ -509,7 +537,10 @@ class BacktestEngine:
         opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
         opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
         opportunity.metadata["strategy_available_cap_usdt"] = round(available_pool_cap, 4)
-        allocation = min(cash_balance, available_pool_cap, per_trade_cap)
+        context = self._market_context()
+        opportunity.metadata["market_context"] = str(context["label"])
+        opportunity.metadata["market_context_budget_mult"] = round(float(context["budget_mult"]), 4)
+        allocation = min(cash_balance, available_pool_cap, per_trade_cap) * float(context["budget_mult"])
         if allocation <= 0:
             return 0.0
         return allocation
@@ -608,6 +639,32 @@ class BacktestEngine:
         if mult > 0.80:
             return "BULL"
         return "STRONG BULL"
+
+    def _expected_net_tp_usdt(self, opportunity: Opportunity, allocation_usdt: float) -> float:
+        if allocation_usdt <= 0:
+            return 0.0
+        execution = self._simulate_buy_execution(
+            price=float(opportunity.price),
+            allocation=float(allocation_usdt),
+            execution_style=self._execution_style_for_entry(opportunity.strategy),
+        )
+        qty = float(execution["qty"])
+        entry_price = float(execution["fill_price"])
+        if qty <= 0 or entry_price <= 0:
+            return 0.0
+        tp_pct = opportunity.tp_pct if opportunity.tp_pct is not None else self.config.take_profit_pct
+        tp_price = entry_price * (1 + float(tp_pct))
+        tp_gross = (tp_price - entry_price) * qty
+        tp_exit_fee = tp_price * qty * self._fee_rate(self._execution_style_for_exit(opportunity.strategy, "TAKE_PROFIT"))
+        return tp_gross - float(execution["fee_usdt"]) - tp_exit_fee
+
+    def _passes_expected_profit_gate(self, opportunity: Opportunity, allocation_usdt: float) -> bool:
+        floor = float(self.config.min_expected_net_profit_usdt or 0.0)
+        expected_net = self._expected_net_tp_usdt(opportunity, allocation_usdt)
+        opportunity.metadata["expected_tp_net_usdt"] = round(expected_net, 8)
+        if floor <= 0:
+            return True
+        return expected_net >= floor
 
     def _fng_label(self) -> str:
         fng = self._synthetic_fng
@@ -861,6 +918,68 @@ class BacktestEngine:
             if _signal_lane_key(candidate.strategy, candidate.entry_signal) not in blocked
         ]
 
+    def _apply_market_context_filter(self, candidates: list[tuple[Opportunity, str]]) -> list[tuple[Opportunity, str]]:
+        context = self._market_context()
+        blocked = {str(strategy).upper() for strategy in context.get("blocked_strategies", [])}
+        if not blocked:
+            return candidates
+        return [(candidate, data_key) for candidate, data_key in candidates if candidate.strategy.upper() not in blocked]
+
+    def _signal_perf_stats(self, closed_trades: list[dict], lane: str) -> dict[str, object]:
+        lookback = max(self.config.signal_perf_gate_min_trades, self.config.signal_perf_gate_lookback_trades)
+        resolved = _normalise_signal_lane(lane)
+        trades = [
+            trade for trade in closed_trades
+            if _signal_lane_key(trade.get("strategy"), trade.get("entry_signal")) == resolved and not trade.get("is_partial")
+        ][-lookback:]
+        pnl_values = [float(trade.get("net_pnl_usdt", trade.get("pnl_usdt", 0.0)) or 0.0) for trade in trades]
+        gross_profit = sum(value for value in pnl_values if value > 0)
+        gross_loss = abs(sum(value for value in pnl_values if value <= 0))
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
+        return {
+            "lane": resolved,
+            "trades": len(trades),
+            "losses": sum(1 for value in pnl_values if value <= 0),
+            "profit_factor": profit_factor,
+        }
+
+    def _signal_perf_block_reason(self, stats: dict[str, object]) -> str | None:
+        trades = int(stats.get("trades", 0) or 0)
+        losses = int(stats.get("losses", 0) or 0)
+        profit_factor = float(stats.get("profit_factor", 0.0) or 0.0)
+        poor_profit_factor = profit_factor < self.config.signal_perf_gate_min_profit_factor
+        if self.config.signal_perf_gate_max_losses > 0 and losses >= self.config.signal_perf_gate_max_losses and poor_profit_factor:
+            return f"{losses} losses >= {self.config.signal_perf_gate_max_losses}"
+        if trades >= self.config.signal_perf_gate_min_trades and poor_profit_factor:
+            return f"PF {profit_factor:.2f} < {self.config.signal_perf_gate_min_profit_factor:.2f}"
+        return None
+
+    def _apply_signal_performance_filter(
+        self,
+        candidates: list[tuple[Opportunity, str]],
+        closed_trades: list[dict],
+        paused_until_index: dict[str, int],
+        time_index: int,
+    ) -> list[tuple[Opportunity, str]]:
+        if not self.config.signal_perf_gate_enabled:
+            return candidates
+        filtered: list[tuple[Opportunity, str]] = []
+        for candidate, data_key in candidates:
+            lane = _signal_lane_key(candidate.strategy, candidate.entry_signal)
+            if paused_until_index.get(lane, 0) > time_index:
+                continue
+            stats = self._signal_perf_stats(closed_trades, lane)
+            if self._signal_perf_block_reason(stats) is not None:
+                paused_until_index[lane] = time_index + max(1, self.config.signal_perf_gate_pause_bars)
+                continue
+            filtered.append((candidate, data_key))
+        return filtered
+
     def run(self) -> tuple[list[dict], list[dict]]:
         strategy_mode = self.scorer is None
         datasets = self._strategy_datasets() if strategy_mode else []
@@ -883,6 +1002,7 @@ class BacktestEngine:
         closed_trades: list[dict] = []
         open_trades: list[dict] = []
         cooldown_until_index: dict[str, int] = {}
+        signal_pause_until_index: dict[str, int] = {}
         pending_dust_credits: list[dict] = []
 
         for time_index, timestamp in enumerate(timestamps):
@@ -899,6 +1019,11 @@ class BacktestEngine:
             cooldown_until_index = {
                 symbol: expiry_index
                 for symbol, expiry_index in cooldown_until_index.items()
+                if expiry_index > time_index
+            }
+            signal_pause_until_index = {
+                lane: expiry_index
+                for lane, expiry_index in signal_pause_until_index.items()
                 if expiry_index > time_index
             }
             for open_trade in list(open_trades):
@@ -1011,6 +1136,13 @@ class BacktestEngine:
                 scored_candidates = [(candidate, candidate.symbol) for candidate in self._score_candidates(data, timestamp, excluded_symbols)]
 
             scored_candidates = self._apply_signal_lane_filter(scored_candidates)
+            scored_candidates = self._apply_market_context_filter(scored_candidates)
+            scored_candidates = self._apply_signal_performance_filter(
+                scored_candidates,
+                closed_trades,
+                signal_pause_until_index,
+                time_index,
+            )
             scored_candidates = self._apply_scalper_correlation_filter(scored_candidates, data, timestamp, open_trades)
 
             best_scalper_score = 0.0
@@ -1073,6 +1205,8 @@ class BacktestEngine:
                 )
                 if allocation <= 0:
                     break
+                if not self._passes_expected_profit_gate(best, allocation):
+                    continue
                 tp_pct = best.tp_pct if best.tp_pct is not None else self.config.take_profit_pct
                 sl_pct = best.sl_pct if best.sl_pct is not None else self.config.stop_loss_pct
                 entry_execution = self._simulate_buy_execution(

@@ -138,7 +138,21 @@ class BacktestConfig:
     fear_greed_extreme_fear_threshold: int = 20
     fear_greed_extreme_fear_mult: float = 1.40
     fear_greed_bear_block_moonshot: bool = True
-    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER"])
+    signal_perf_gate_enabled: bool = True
+    signal_perf_gate_min_trades: int = 4
+    signal_perf_gate_max_losses: int = 3
+    signal_perf_gate_min_profit_factor: float = 0.95
+    signal_perf_gate_lookback_trades: int = 30
+    signal_perf_gate_pause_bars: int = 288
+    min_expected_net_profit_usdt: float = 0.10
+    market_context_enabled: bool = True
+    market_context_bull_budget_mult: float = 1.10
+    market_context_sideways_budget_mult: float = 1.00
+    market_context_bear_budget_mult: float = 0.75
+    market_context_crash_budget_mult: float = 0.35
+    market_context_bear_block_strategies: list[str] = field(default_factory=list)
+    market_context_crash_block_strategies: list[str] = field(default_factory=lambda: ["MOONSHOT", "REVERSAL", "GRID"])
+    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"])
 
     def symbols_for_strategy(self, strategy: str) -> list[str]:
         resolved = strategy.upper()
@@ -242,5 +256,19 @@ class BacktestConfig:
             fear_greed_extreme_fear_threshold=env_int("FG_EXTREME_FEAR_THRESHOLD", 20),
             fear_greed_extreme_fear_mult=env_float("FG_EXTREME_FEAR_MULT", 1.40),
             fear_greed_bear_block_moonshot=env_bool("FG_BEAR_BLOCK_MOONSHOT", True),
-            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER"),
+            signal_perf_gate_enabled=env_bool("SIGNAL_PERF_GATE_ENABLED", True),
+            signal_perf_gate_min_trades=env_int("SIGNAL_PERF_GATE_MIN_TRADES", 4),
+            signal_perf_gate_max_losses=env_int("SIGNAL_PERF_GATE_MAX_LOSSES", 3),
+            signal_perf_gate_min_profit_factor=env_float("SIGNAL_PERF_GATE_MIN_PF", 0.95),
+            signal_perf_gate_lookback_trades=env_int("SIGNAL_PERF_GATE_LOOKBACK_TRADES", 30),
+            signal_perf_gate_pause_bars=env_int("BACKTEST_SIGNAL_PERF_GATE_PAUSE_BARS", env_int("SIGNAL_PERF_GATE_PAUSE_BARS", 288)),
+            min_expected_net_profit_usdt=env_float("BACKTEST_MIN_EXPECTED_NET_PROFIT_USDT", env_float("MIN_EXPECTED_NET_PROFIT_USDT", env_float("MEXCBOT_MIN_EXPECTED_NET_PROFIT_USDT", 0.10))),
+            market_context_enabled=env_bool("MARKET_CONTEXT_ENABLED", True),
+            market_context_bull_budget_mult=env_float("MARKET_CONTEXT_BULL_BUDGET_MULT", 1.10),
+            market_context_sideways_budget_mult=env_float("MARKET_CONTEXT_SIDEWAYS_BUDGET_MULT", 1.00),
+            market_context_bear_budget_mult=env_float("MARKET_CONTEXT_BEAR_BUDGET_MULT", 0.75),
+            market_context_crash_budget_mult=env_float("MARKET_CONTEXT_CRASH_BUDGET_MULT", 0.35),
+            market_context_bear_block_strategies=env_csv("MARKET_CONTEXT_BEAR_BLOCK_STRATEGIES", ""),
+            market_context_crash_block_strategies=env_csv("MARKET_CONTEXT_CRASH_BLOCK_STRATEGIES", "MOONSHOT,REVERSAL,GRID"),
+            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND"),
         )
