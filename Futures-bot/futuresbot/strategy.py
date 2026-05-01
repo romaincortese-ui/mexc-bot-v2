@@ -84,13 +84,25 @@ def _confidence(score: float, threshold: float) -> float:
 
 
 def _leverage_for_signal(certainty: float, sl_distance_pct: float, config: StrategyConfig) -> int | None:
+    return _leverage_for_signal_with_bounds(certainty, sl_distance_pct, config, config.leverage_min, config.leverage_max)
+
+
+def _leverage_for_signal_with_bounds(
+    certainty: float,
+    sl_distance_pct: float,
+    config: StrategyConfig,
+    leverage_min: int,
+    leverage_max: int,
+) -> int | None:
     if sl_distance_pct <= 0:
         return None
-    target = config.leverage_min + certainty * (config.leverage_max - config.leverage_min)
+    leverage_min = max(1, min(int(leverage_min), int(leverage_max)))
+    leverage_max = max(leverage_min, int(leverage_max))
+    target = leverage_min + certainty * (leverage_max - leverage_min)
     risk_cap = int(math.floor(config.hard_loss_cap_pct / sl_distance_pct))
-    if risk_cap < config.leverage_min:
+    if risk_cap < leverage_min:
         return None
-    return max(config.leverage_min, min(config.leverage_max, int(round(target)), risk_cap))
+    return max(leverage_min, min(leverage_max, int(round(target)), risk_cap))
 
 
 def _passes_cost_budget_gate(
@@ -165,10 +177,18 @@ def _build_signal(
     entry_signal: str,
     config: StrategyConfig,
     metadata: dict[str, float | str],
+    leverage_min_override: int | None = None,
+    leverage_max_override: int | None = None,
 ) -> FuturesSignal | None:
     sl_distance_pct = abs(entry_price - sl_price) / entry_price if entry_price > 0 else 0.0
     certainty = _confidence(score, config.min_confidence_score)
-    leverage = _leverage_for_signal(certainty, sl_distance_pct, config)
+    leverage = _leverage_for_signal_with_bounds(
+        certainty,
+        sl_distance_pct,
+        config,
+        leverage_min_override if leverage_min_override is not None else config.leverage_min,
+        leverage_max_override if leverage_max_override is not None else config.leverage_max,
+    )
     if leverage is None:
         return None
     if not _passes_cost_budget_gate(
@@ -310,13 +330,15 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
     impulse_lookback_bars = max(3, int(_env_float("FUTURES_IMPULSE_LOOKBACK_BARS", 8.0)))
     impulse_min_move_pct = _env_float("FUTURES_IMPULSE_MIN_MOVE_PCT", 0.006)
     impulse_min_move_atr = _env_float("FUTURES_IMPULSE_MIN_MOVE_ATR", 1.10)
-    impulse_volume_floor = _env_float("FUTURES_IMPULSE_VOLUME_FLOOR", 0.75)
+    impulse_volume_floor = _env_float("FUTURES_IMPULSE_VOLUME_FLOOR", 1.15)
     impulse_adx_min = _env_float("FUTURES_IMPULSE_ADX_MIN", 12.0)
     impulse_trend_6h_min = _env_float("FUTURES_IMPULSE_TREND_6H_MIN", 0.0005)
     impulse_rsi_1h_long_min = _env_float("FUTURES_IMPULSE_RSI_1H_LONG_MIN", 48.0)
     impulse_rsi_15_long_min = _env_float("FUTURES_IMPULSE_RSI_15_LONG_MIN", 50.0)
+    impulse_rsi_15_long_max = _env_float("FUTURES_IMPULSE_RSI_15_LONG_MAX", 82.0)
     impulse_rsi_1h_short_max = _env_float("FUTURES_IMPULSE_RSI_1H_SHORT_MAX", 52.0)
     impulse_rsi_15_short_max = _env_float("FUTURES_IMPULSE_RSI_15_SHORT_MAX", 50.0)
+    impulse_rsi_15_short_min = _env_float("FUTURES_IMPULSE_RSI_15_SHORT_MIN", 18.0)
     impulse_close_buffer_atr = _env_float("FUTURES_IMPULSE_CLOSE_BUFFER_ATR", 0.35)
     impulse_max_ema_extension_atr = _env_float("FUTURES_IMPULSE_MAX_EMA_EXTENSION_ATR", 2.75)
     impulse_reference = current_price
@@ -331,7 +353,7 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
     impulse_close_near_high = current_price >= impulse_recent_close_high - current_atr_15 * impulse_close_buffer_atr
     impulse_close_near_low = current_price <= impulse_recent_close_low + current_atr_15 * impulse_close_buffer_atr
     impulse_ema_extension = abs(current_price - current_ema20) / current_atr_1h if current_atr_1h > 0 else 999.0
-    impulse_volume_ok = volume_ratio >= impulse_volume_floor or impulse_move_atr >= impulse_min_move_atr * 1.35
+    impulse_volume_ok = volume_ratio >= impulse_volume_floor
     impulse_body = abs(float(close_15.iloc[-1]) - float(open_15.iloc[-1])) / current_atr_15 if current_atr_15 > 0 else 0.0
     impulse_long_ok = (
         impulse_enabled
@@ -341,6 +363,7 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         and current_adx >= impulse_adx_min
         and current_rsi_1h >= impulse_rsi_1h_long_min
         and current_rsi_15 >= impulse_rsi_15_long_min
+        and current_rsi_15 <= impulse_rsi_15_long_max
         and (trend_6h >= impulse_trend_6h_min or ema_slope > 0)
         and current_price > current_ema20
         and impulse_close_near_high
@@ -354,6 +377,7 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
         and current_adx >= impulse_adx_min
         and current_rsi_1h <= impulse_rsi_1h_short_max
         and current_rsi_15 <= impulse_rsi_15_short_max
+        and current_rsi_15 >= impulse_rsi_15_short_min
         and (trend_6h <= -impulse_trend_6h_min or ema_slope < 0)
         and current_price < current_ema20
         and impulse_close_near_low
@@ -455,6 +479,8 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
     if long_score >= short_score:
         impulse_path = impulse_long_ok and not (long_ok or continuation_long_ok)
         if impulse_path:
+            impulse_leverage_max = max(1, int(_env_float("FUTURES_IMPULSE_LEVERAGE_MAX", min(float(config.leverage_max), 8.0))))
+            impulse_leverage_min = min(config.leverage_min, impulse_leverage_max)
             tp_move = max(
                 _env_float("FUTURES_IMPULSE_TP_ATR_MULT", 5.0) * current_atr_15,
                 _env_float("FUTURES_IMPULSE_TP_FLOOR_PCT", 0.012) * current_price,
@@ -491,6 +517,8 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
                 else "IMPULSE_EVENT_CONTINUATION_LONG"
             ),
             config=config,
+            leverage_min_override=impulse_leverage_min if impulse_path else None,
+            leverage_max_override=impulse_leverage_max if impulse_path else None,
             metadata={
                 "trend_24h": round(trend_24h, 6),
                 "trend_6h": round(trend_6h, 6),
@@ -505,6 +533,8 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
 
     impulse_path = impulse_short_ok and not (short_ok or continuation_short_ok)
     if impulse_path:
+        impulse_leverage_max = max(1, int(_env_float("FUTURES_IMPULSE_LEVERAGE_MAX", min(float(config.leverage_max), 8.0))))
+        impulse_leverage_min = min(config.leverage_min, impulse_leverage_max)
         tp_move = max(
             _env_float("FUTURES_IMPULSE_TP_ATR_MULT", 5.0) * current_atr_15,
             _env_float("FUTURES_IMPULSE_TP_FLOOR_PCT", 0.012) * current_price,
@@ -541,6 +571,8 @@ def score_btc_futures_setup(frame_15m: pd.DataFrame, config: StrategyConfig) -> 
             else "IMPULSE_EVENT_CONTINUATION_SHORT"
         ),
         config=config,
+        leverage_min_override=impulse_leverage_min if impulse_path else None,
+        leverage_max_override=impulse_leverage_max if impulse_path else None,
         metadata={
             "trend_24h": round(trend_24h, 6),
             "trend_6h": round(trend_6h, 6),

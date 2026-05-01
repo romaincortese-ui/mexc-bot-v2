@@ -69,6 +69,7 @@ def test_strategy_produces_impulse_event_continuation_long(monkeypatch):
     monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_ATR", "0.50")
     monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_PCT", "0.006")
     monkeypatch.setenv("FUTURES_IMPULSE_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("FUTURES_IMPULSE_RSI_15_LONG_MAX", "100")
     monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
     base = [100000 + math.sin(idx / 6.0) * 35 + math.cos(idx / 13.0) * 25 for idx in range(520)]
     anchor = base[-10]
@@ -90,6 +91,7 @@ def test_strategy_produces_impulse_event_continuation_short(monkeypatch):
     monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_ATR", "0.50")
     monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_PCT", "0.006")
     monkeypatch.setenv("FUTURES_IMPULSE_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("FUTURES_IMPULSE_RSI_15_SHORT_MIN", "0")
     monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
     base = [100000 + math.sin(idx / 6.0) * 35 + math.cos(idx / 13.0) * 25 for idx in range(520)]
     anchor = base[-10]
