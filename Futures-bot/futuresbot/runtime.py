@@ -1005,6 +1005,38 @@ class FuturesRuntime:
             log.info("Loaded futures calibration from %s", source or self.config.calibration_file)
             self._record_activity("Calibration loaded")
         else:
+            file_data: dict[str, Any] | None = None
+            file_source: str | None = None
+            file_reason: str | None = None
+            file_valid = False
+            if self.config.calibration_file and (source or "").startswith("Redis key"):
+                file_data, file_source = load_trade_calibration(
+                    redis_url="",
+                    redis_key="",
+                    file_path=self.config.calibration_file,
+                )
+                if file_data is not None:
+                    file_valid, file_reason = validate_trade_calibration_payload(
+                        file_data,
+                        max_age_hours=self.config.calibration_max_age_hours,
+                        min_total_trades=self.config.calibration_min_total_trades,
+                    )
+                else:
+                    file_reason = "no file payload found"
+            if file_valid and file_data is not None:
+                self.calibration = file_data
+                log.warning(
+                    "[CALIBRATION_FILE_FALLBACK] live Redis calibration rejected (%s); using valid file %s instead.",
+                    primary_reason or "stale or insufficient sample",
+                    file_source or self.config.calibration_file,
+                )
+                self._record_activity("Calibration loaded from file (Redis invalid)")
+                if self._flag("USE_WALK_FORWARD_GATE"):
+                    if not self._walk_forward_gate_passes(self.trade_history):
+                        log.info("Calibration rejected by walk-forward gate")
+                        self._record_activity("Calibration rejected (walk-forward)")
+                        self.calibration = None
+                return
             # P1 (third assessment) §5 #3 — when the live (rolling 60-day)
             # calibration fails the freshness or sample-size gate (a frequent
             # occurrence early in a deployment or after a long outage),
@@ -1035,13 +1067,32 @@ class FuturesRuntime:
                     seed_reason = "no seed payload found"
             else:
                 seed_valid = False
+            if not seed_valid and self.config.calibration_file:
+                file_seed, file_seed_source = load_trade_calibration(
+                    redis_url="",
+                    redis_key="",
+                    file_path=self.config.calibration_file,
+                )
+                if file_seed is not None:
+                    file_seed_valid, file_seed_reason = validate_trade_calibration_payload(
+                        file_seed,
+                        max_age_hours=float("inf"),
+                        min_total_trades=self.config.calibration_min_total_trades,
+                    )
+                    if file_seed_valid:
+                        seed_data = file_seed
+                        seed_source = file_seed_source or self.config.calibration_file
+                        seed_valid = True
+                        seed_reason = None
+                    else:
+                        seed_reason = f"{seed_reason}; file_seed_reason={file_seed_reason}" if seed_reason else file_seed_reason
             if seed_valid and seed_data is not None:
                 self.calibration = seed_data
                 log.warning(
                     "[CALIBRATION_SEED_FALLBACK] live calibration rejected (%s); "
                     "using seed from %s instead.",
                     primary_reason or "stale or insufficient sample",
-                    seed_source or seed_key,
+                    seed_source or seed_key or self.config.calibration_file,
                 )
                 self._record_activity("Calibration loaded from seed (live invalid)")
             else:
@@ -1057,7 +1108,7 @@ class FuturesRuntime:
                         source or self.config.calibration_file,
                         primary_reason or "stale or insufficient sample",
                         seed_key or "(disabled)",
-                        seed_reason or "not consulted",
+                        (seed_reason or "not consulted") + (f"; file_reason={file_reason}" if file_reason else ""),
                     )
         # Sprint 3 §3.4 — walk-forward stability gate. When enabled, reject
         # calibration payloads whose OOS PF drops >40% vs IS or fails the
@@ -1394,18 +1445,27 @@ class FuturesRuntime:
                 adverse_score_penalty_points=float(self.config.crypto_event_adverse_score_penalty),
             )
             scoring_config = scoped
+            long_threshold_offset = 0.0
+            short_threshold_offset = 0.0
             if self.config.crypto_event_overlay_enabled and event_scan_decision.threshold_relief > 0:
-                scoring_config = dataclasses.replace(
-                    scoped,
-                    min_confidence_score=max(1.0, scoped.min_confidence_score - event_scan_decision.threshold_relief),
-                )
+                relief_side = "LONG" if event_scan_decision.bias_score > 0 else "SHORT"
+                if relief_side == "LONG":
+                    long_threshold_offset = -event_scan_decision.threshold_relief
+                else:
+                    short_threshold_offset = -event_scan_decision.threshold_relief
                 log.info(
-                    "Crypto event threshold relief for %s: %.2f points (bias=%.2f)",
+                    "Crypto event threshold relief for %s: %.2f points (bias=%.2f applies_to=%s)",
                     sym,
                     event_scan_decision.threshold_relief,
                     event_scan_decision.bias_score,
+                    relief_side,
                 )
-            raw_signal = score_btc_futures_setup(frame, scoring_config)
+            raw_signal = score_btc_futures_setup(
+                frame,
+                scoring_config,
+                long_threshold_offset=long_threshold_offset,
+                short_threshold_offset=short_threshold_offset,
+            )
             # Sprint 3 §3.2 — mean-reversion fallback. When regime is CHOP (or the
             # primary coil-breakout scorer returned nothing) and
             # USE_MEAN_REVERSION=1, attempt a mean-reversion signal via the pure
@@ -1420,16 +1480,19 @@ class FuturesRuntime:
                 # mathematically unreachable for this symbol" (BTC-tuned gates
                 # blocking every PEPE / TAO bar).
                 try:
-                    from futuresbot.strategy import diagnose_setup_rejection
+                    from futuresbot.strategy import diagnose_impulse_rejection, diagnose_setup_rejection
                     reason = diagnose_setup_rejection(frame, scoped)
+                    impulse_reason = diagnose_impulse_rejection(frame, scoped)
                 except Exception as diag_exc:  # pragma: no cover — defensive
                     reason = f"diagnostic_error={type(diag_exc).__name__}"
+                    impulse_reason = f"impulse_diagnostic_error={type(diag_exc).__name__}"
                 # Track in the per-cycle aggregator (P1 §8). Keep the per-symbol
                 # INFO line as well so individual symbol diagnoses remain visible
                 # at debug-grain; volume reduction comes from the consolidated
                 # CYCLE_SUMMARY line that follows.
                 self._last_cycle_gate_blocks[sym] = reason
                 log.info("[GATE_BLOCK] symbol=%s reason=%s", sym, reason)
+                log.info("[IMPULSE_GATE_BLOCK] symbol=%s reason=%s", sym, impulse_reason)
                 continue
             raw_signal = self._apply_crypto_event_overlay(raw_signal, crypto_event_state, event_now)
             if raw_signal is None:

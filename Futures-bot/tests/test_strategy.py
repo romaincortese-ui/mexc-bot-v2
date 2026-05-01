@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from futuresbot.config import FuturesBacktestConfig
-from futuresbot.strategy import score_btc_futures_setup
+from futuresbot.strategy import diagnose_impulse_rejection, score_btc_futures_setup
 
 
 def _config() -> FuturesBacktestConfig:
@@ -105,3 +105,80 @@ def test_strategy_produces_impulse_event_continuation_short(monkeypatch):
     assert signal.side == "SHORT"
     assert signal.entry_signal == "IMPULSE_EVENT_CONTINUATION_SHORT"
     assert signal.metadata["impulse_move_pct"] < 0
+
+
+def test_strategy_produces_tao_range_expansion_long(monkeypatch):
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_ENABLED", "1")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_SYMBOLS", "TAO_USDT")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_MIN_TREND_24H", "0.012")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_ADX_MIN", "0")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [100 + idx * 0.018 + math.sin(idx / 5.0) * 0.9 for idx in range(520)]
+    anchor = base[-30]
+    for offset in range(29):
+        base[-29 + offset] = anchor + math.sin(offset / 2.0) * 2.0 + offset * 0.20
+    base[-1] = max(base[-29:-1]) + 0.25
+    frame = _frame_from_prices(base)
+
+    signal = score_btc_futures_setup(frame, replace(_config(), symbol="TAO_USDT", min_reward_risk=0.8))
+
+    assert signal is not None
+    assert signal.side == "LONG"
+    assert signal.entry_signal == "RANGE_EXPANSION_CONTINUATION_LONG"
+    assert signal.metadata["range_expansion"] == 1.0
+
+
+def test_strategy_produces_tao_range_expansion_short(monkeypatch):
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_ENABLED", "1")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_SYMBOLS", "TAO_USDT")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_MIN_TREND_24H", "0.012")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("FUTURES_RANGE_EXPANSION_ADX_MIN", "0")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [160 - idx * 0.018 + math.sin(idx / 5.0) * 0.9 for idx in range(520)]
+    anchor = base[-30]
+    for offset in range(29):
+        base[-29 + offset] = anchor - math.sin(offset / 2.0) * 2.0 - offset * 0.20
+    base[-1] = min(base[-29:-1]) - 0.25
+    frame = _frame_from_prices(base)
+
+    signal = score_btc_futures_setup(frame, replace(_config(), symbol="TAO_USDT", min_reward_risk=0.8))
+
+    assert signal is not None
+    assert signal.side == "SHORT"
+    assert signal.entry_signal == "RANGE_EXPANSION_CONTINUATION_SHORT"
+    assert signal.metadata["range_expansion"] == 1.0
+
+
+def test_side_specific_threshold_relief_is_directional(monkeypatch):
+    monkeypatch.setenv("FUTURES_IMPULSE_CONTINUATION_ENABLED", "1")
+    monkeypatch.setenv("FUTURES_IMPULSE_ADX_MIN", "0")
+    monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_ATR", "0.50")
+    monkeypatch.setenv("FUTURES_IMPULSE_MIN_MOVE_PCT", "0.006")
+    monkeypatch.setenv("FUTURES_IMPULSE_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("FUTURES_IMPULSE_RSI_15_SHORT_MIN", "0")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [100000 + math.sin(idx / 6.0) * 35 + math.cos(idx / 13.0) * 25 for idx in range(520)]
+    anchor = base[-10]
+    for offset in range(9):
+        base[-9 + offset] = anchor * (1.0 - 0.0011 * (offset + 1))
+    frame = _frame_from_prices(base)
+    cfg = replace(_config(), min_confidence_score=80.0, trend_24h_floor=0.05, trend_6h_floor=0.02)
+
+    assert score_btc_futures_setup(frame, cfg, long_threshold_offset=-8.0) is None
+    signal = score_btc_futures_setup(frame, cfg, short_threshold_offset=-8.0)
+
+    assert signal is not None
+    assert signal.side == "SHORT"
+
+
+def test_impulse_rejection_diagnostic_contains_actionable_fields():
+    frame = _frame_from_prices([100000 + math.sin(idx / 6.0) * 35 for idx in range(520)])
+
+    reason = diagnose_impulse_rejection(frame, _config())
+
+    assert reason.startswith("impulse_gate_block")
+    assert "move_pct=" in reason
+    assert "volume_ratio=" in reason
+    assert "ema_extension_atr=" in reason

@@ -317,3 +317,69 @@ def test_refresh_calibration_keeps_live_when_valid(tmp_path, monkeypatch):
     assert runtime.calibration is not None
     assert runtime.calibration["total_trades"] == 200
     assert seed_consulted["flag"] is False
+
+
+def test_refresh_calibration_uses_file_when_redis_blob_invalid(tmp_path, monkeypatch, caplog):
+    cfg = _config(tmp_path)
+    calibration_path = tmp_path / "multi_symbol_calibration.json"
+    calibration_path.write_text(json.dumps(_fresh_calibration_payload(total_trades=39)), encoding="utf-8")
+    cfg = replace(
+        cfg,
+        calibration_file=str(calibration_path),
+        calibration_redis_key="mexc_futures_calibration",
+        calibration_seed_redis_key="mexc_futures_calibration_seed",
+        calibration_min_total_trades=15,
+        calibration_max_age_hours=72.0,
+        calibration_refresh_seconds=0,
+        redis_url="redis://example.invalid/0",
+    )
+    runtime = FuturesRuntime(cfg, _SpecClient({}))
+
+    def fake_load(*, redis_url, redis_key, file_path):
+        if redis_key == "mexc_futures_calibration":
+            return _fresh_calibration_payload(total_trades=5), "Redis key mexc_futures_calibration"
+        if file_path == str(calibration_path):
+            return json.loads(calibration_path.read_text(encoding="utf-8")), str(calibration_path)
+        return None, None
+
+    monkeypatch.setattr("futuresbot.runtime.load_trade_calibration", fake_load)
+    with caplog.at_level(logging.WARNING, logger="futuresbot.runtime"):
+        runtime.refresh_calibration(force=True)
+
+    assert runtime.calibration is not None
+    assert runtime.calibration["total_trades"] == 39
+    assert any("CALIBRATION_FILE_FALLBACK" in record.message for record in caplog.records)
+
+
+def test_refresh_calibration_uses_stale_file_as_seed_when_seed_key_empty(tmp_path, monkeypatch, caplog):
+    cfg = _config(tmp_path)
+    calibration_path = tmp_path / "multi_symbol_calibration.json"
+    calibration_path.write_text(json.dumps(_fresh_calibration_payload(total_trades=39, hours_old=500.0)), encoding="utf-8")
+    cfg = replace(
+        cfg,
+        calibration_file=str(calibration_path),
+        calibration_redis_key="mexc_futures_calibration",
+        calibration_seed_redis_key="mexc_futures_calibration_seed",
+        calibration_min_total_trades=15,
+        calibration_max_age_hours=72.0,
+        calibration_refresh_seconds=0,
+        redis_url="redis://example.invalid/0",
+    )
+    runtime = FuturesRuntime(cfg, _SpecClient({}))
+
+    def fake_load(*, redis_url, redis_key, file_path):
+        if redis_key == "mexc_futures_calibration":
+            return _fresh_calibration_payload(total_trades=5), "Redis key mexc_futures_calibration"
+        if redis_key == "mexc_futures_calibration_seed":
+            return None, None
+        if file_path == str(calibration_path):
+            return json.loads(calibration_path.read_text(encoding="utf-8")), str(calibration_path)
+        return None, None
+
+    monkeypatch.setattr("futuresbot.runtime.load_trade_calibration", fake_load)
+    with caplog.at_level(logging.WARNING, logger="futuresbot.runtime"):
+        runtime.refresh_calibration(force=True)
+
+    assert runtime.calibration is not None
+    assert runtime.calibration["total_trades"] == 39
+    assert any("CALIBRATION_SEED_FALLBACK" in record.message for record in caplog.records)
