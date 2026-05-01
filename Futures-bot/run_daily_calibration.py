@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 from typing import Iterator
 
 from futuresbot.calibration import build_trade_calibration, publish_trade_calibration, write_trade_calibration
@@ -12,6 +13,14 @@ from futuresbot.backtest import FuturesBacktestEngine, build_report, build_signa
 from futuresbot.config import FuturesBacktestConfig, FuturesConfig
 from futuresbot.marketdata import FuturesHistoricalDataProvider, MexcFuturesClient
 from futuresbot.review import build_daily_review, enrich_daily_review_with_ai, publish_daily_review, write_daily_review
+
+
+def _calibration_output_file() -> str:
+    raw = os.getenv("FUTURES_CALIBRATION_OUTPUT_FILE", "backtest_output/calibration.json")
+    path = Path(raw)
+    if path.is_absolute():
+        return str(path)
+    return str((Path(__file__).resolve().parent / path).resolve())
 
 
 @contextmanager
@@ -53,7 +62,8 @@ def main() -> None:
         min_strategy_trades=config.calibration_min_total_trades,
         min_symbol_trades=config.calibration_min_total_trades,
     )
-    write_trade_calibration(config.calibration_file, calibration)
+    calibration_file = _calibration_output_file()
+    write_trade_calibration(calibration_file, calibration)
     calibration_published = publish_trade_calibration(config.redis_url, config.calibration_redis_key, calibration)
 
     review_days = float(os.getenv("FUTURES_DAILY_REVIEW_WINDOW_DAYS", "1.0"))
@@ -74,7 +84,7 @@ def main() -> None:
     review = enrich_daily_review_with_ai(review, anthropic_api_key=config.anthropic_api_key)
     write_daily_review(config.review_file, review)
     review_published = publish_daily_review(config.redis_url, config.review_redis_key, review)
-    print(json.dumps({"calibration": {"file": config.calibration_file, "published": calibration_published}}, indent=2))
+    print(json.dumps({"calibration": {"file": calibration_file, "published": calibration_published}}, indent=2))
     print(json.dumps({"daily_review": {"file": config.review_file, "published": review_published}}, indent=2))
     print(json.dumps(report, indent=2))
 

@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
-from futuresbot.config import FuturesConfig
+from futuresbot.config import DEFAULT_FUTURES_SYMBOLS, FuturesBacktestConfig, FuturesConfig
 from futuresbot.runtime import FuturesRuntime
 from futuresbot.strategy import _passes_cost_budget_gate
 
@@ -253,6 +253,37 @@ def test_default_symbol_profiles_apply_and_env_overrides_win(tmp_path, monkeypat
 
     assert overridden.leverage_max == 18
     assert overridden.consolidation_max_range_pct == pytest.approx(0.033)
+
+
+def test_default_universe_expands_to_ten_pairs(monkeypatch):
+    cfg = FuturesConfig.from_env()
+
+    assert cfg.symbols == DEFAULT_FUTURES_SYMBOLS
+    assert len(cfg.symbols) == 10
+    assert cfg.correlation_buckets["BCH_USDT"] == "large_cap_beta"
+    assert cfg.correlation_buckets["SEI_USDT"] == "l1_beta"
+    assert cfg.correlation_buckets["ZEC_USDT"] == "privacy_beta"
+
+
+def test_explicit_primary_symbol_keeps_single_symbol_mode(monkeypatch):
+    monkeypatch.setenv("FUTURES_SYMBOL", "ETH_USDT")
+
+    cfg = FuturesConfig.from_env()
+
+    assert cfg.symbol == "ETH_USDT"
+    assert cfg.symbols == ("ETH_USDT",)
+
+
+def test_backtest_config_uses_scoped_symbol_profile(monkeypatch):
+    monkeypatch.setenv("FUTURES_SYMBOL", "ZEC_USDT")
+    monkeypatch.setenv("FUTURES_SYMBOLS", "ZEC_USDT")
+
+    config = FuturesBacktestConfig.from_env()
+
+    assert config.symbol == "ZEC_USDT"
+    assert config.leverage_max == 20
+    assert config.consolidation_max_range_pct == pytest.approx(0.045)
+    assert config.min_reward_risk == pytest.approx(1.30)
 
 
 # ---------------------------------------------------------------------------

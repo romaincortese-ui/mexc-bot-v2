@@ -1,5 +1,5 @@
-"""Re-run the 9-symbol 60-day backtest with the hand-tuned calibration +
-per-symbol env overrides, then compare to the uncalibrated baseline.
+"""Re-run the 10-symbol futures backtest with the packaged signal-lane
+calibration, then compare to the uncalibrated baseline.
 
 Baseline (from backtest_output/multi/) is read directly from summary.json
 files; calibrated run writes to backtest_output/multi_calibrated/<SYMBOL>/."""
@@ -13,41 +13,16 @@ from dataclasses import replace
 from pathlib import Path
 
 from futuresbot.backtest import FuturesBacktestEngine, build_report, export_artifacts
-from futuresbot.config import FuturesBacktestConfig, FuturesConfig, parse_utc_datetime
+from futuresbot.config import DEFAULT_FUTURES_SYMBOLS, FuturesBacktestConfig, FuturesConfig, parse_utc_datetime
 from futuresbot.marketdata import FuturesHistoricalDataProvider, MexcFuturesClient
 
 
-SYMBOLS = [
-    "BTC_USDT", "ETH_USDT", "SOL_USDT", "PEPE_USDT",
-    "XAUT_USDT", "TAO_USDT", "SILVER_USDT", "XRP_USDT",
-    # TRUMP_USDT dropped: MEXC futures contract exists but returns 0 kline
-    # history on /contract/kline for any window tested (2025-04 through
-    # 2026-04). The contract is listed but has no tradable market data -
-    # gate analysis in _probe_zero_trade_symbols.py confirms NO DATA.
-]
+SYMBOLS = list(DEFAULT_FUTURES_SYMBOLS)
 
-# Per-symbol env overrides applied during the calibrated run.
-# Complement the calibration JSON (which handles blocks / score offsets).
-PER_SYMBOL_ENV: dict[str, dict[str, str]] = {
-    "SILVER_USDT": {
-        "SESSION_HOURS_UTC": "7-21",   # London/NY precious-metals session
-    },
-    "XAUT_USDT": {
-        "SESSION_HOURS_UTC": "7-21",
-    },
-    "XRP_USDT": {
-        # After calibration blocks the two short signals the remaining longs
-        # should be above base threshold; keep defaults.
-    },
-    "PEPE_USDT": {
-        "LEVERAGE_MAX": "25",          # cap meme-coin leverage
-    },
-    # TAO_USDT: 60-day window produced 0 trades but 90-day window gives
-    # 2t / 100% WR / +$231 with default thresholds. The strategy DOES fire on
-    # TAO, it just fires rarely (~2-3 trades/quarter). Gate probe shows cons
-    # rejects 91% of bars but the 9% that pass convert cleanly. Leaving
-    # defaults alone; forcing wider gates did not improve PnL in testing.
-}
+# Symbol-specific parameter profiles now live in futuresbot.config. This tool
+# keeps env overrides empty so baseline and calibrated runs differ only by the
+# calibration payload.
+PER_SYMBOL_ENV: dict[str, dict[str, str]] = {}
 
 
 def run_one(symbol: str, start: str, end: str, out_root: Path, calib_path: Path | None, apply_overrides: bool) -> dict:
@@ -120,6 +95,12 @@ def main() -> None:
     parser.add_argument("--baseline-out", default="backtest_output/multi")
     parser.add_argument("--calibration", default="calibration/multi_symbol_calibration.json")
     parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=SYMBOLS,
+        help="Symbols to backtest; defaults to the production 10-pair futures universe.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["calibrated", "baseline", "both"],
         default="calibrated",
@@ -135,8 +116,8 @@ def main() -> None:
     baseline_rows: list[dict] = []
     if args.mode in ("baseline", "both"):
         baseline_root.mkdir(parents=True, exist_ok=True)
-        print(f"\n{'#' * 100}\n# BASELINE pass (no calibration, no overrides) -> {baseline_root}\n{'#' * 100}", flush=True)
-        for s in SYMBOLS:
+        print(f"\n{'#' * 100}\n# BASELINE pass (default profiles, no calibration) -> {baseline_root}\n{'#' * 100}", flush=True)
+        for s in args.symbols:
             print(f"\n=== Running (baseline) {s} {args.start} -> {args.end} ===", flush=True)
             try:
                 row = run_one(s, args.start, args.end, baseline_root, calib_path=None, apply_overrides=False)
@@ -155,8 +136,8 @@ def main() -> None:
     calib_rows: list[dict] = []
     if args.mode in ("calibrated", "both"):
         calibrated_root.mkdir(parents=True, exist_ok=True)
-        print(f"\n{'#' * 100}\n# CALIBRATED pass (calibration={calib_path.name} + per-symbol overrides) -> {calibrated_root}\n{'#' * 100}", flush=True)
-        for s in SYMBOLS:
+        print(f"\n{'#' * 100}\n# CALIBRATED pass (default profiles + calibration={calib_path.name}) -> {calibrated_root}\n{'#' * 100}", flush=True)
+        for s in args.symbols:
             print(f"\n=== Running (calibrated) {s} {args.start} -> {args.end} ===", flush=True)
             try:
                 row = run_one(s, args.start, args.end, calibrated_root, calib_path=calib_path, apply_overrides=True)

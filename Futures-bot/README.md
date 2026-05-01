@@ -1,6 +1,6 @@
-# BTC Futures Bot
+# MEXC Futures Bot
 
-This is a separate BTC-only MEXC futures project added alongside the spot bot.
+This is a separate MEXC perpetual-futures project added alongside the spot bot.
 
 It is intentionally isolated from the live spot runtime:
 
@@ -11,7 +11,14 @@ It is intentionally isolated from the live spot runtime:
 
 ## Strategy
 
-The strategy only trades BTC perpetual futures and only when the setup is strong enough in one direction.
+The default production universe scans 10 perpetual pairs:
+
+```text
+BTC_USDT, ETH_USDT, SOL_USDT, PEPE_USDT, TAO_USDT,
+BNB_USDT, BCH_USDT, SEI_USDT, LINK_USDT, ZEC_USDT
+```
+
+Each pair uses the shared futures scorer with a dedicated profile for volatility, funding, score threshold, reward/risk, and leverage cap. A packaged signal-lane calibration in `calibration/multi_symbol_calibration.json` blocks symbol/signal combinations that were persistently negative in the latest 60-day replay, so the bot can scan broadly without treating every pair like BTC.
 
 - Uses 15m candles for consolidation and breakout context
 - Uses 1h resampled structure for higher-timeframe trend strength
@@ -21,13 +28,15 @@ The strategy only trades BTC perpetual futures and only when the setup is strong
 - Uses full-size exits only
 - Lets exchange TP/SL manage the hard exit path
 - Adds an hourly early-take-profit check when price is already very close to TP
+- Applies per-symbol profiles and calibration blocks before entry
 
 ## Environment
 
 Important variables:
 
 - `FUTURES_PAPER_TRADE=true`
-- `FUTURES_SYMBOL=BTC_USDT`
+- `FUTURES_SYMBOLS=BTC_USDT,ETH_USDT,SOL_USDT,PEPE_USDT,TAO_USDT,BNB_USDT,BCH_USDT,SEI_USDT,LINK_USDT,ZEC_USDT`
+- `FUTURES_SYMBOL=BTC_USDT` for a one-symbol run or single-symbol backtest
 - `FUTURES_MARGIN_BUDGET_USDT=75`
 - `FUTURES_TELEGRAM_TOKEN=...`
 - `FUTURES_TELEGRAM_CHAT_ID=...`
@@ -41,8 +50,9 @@ Important variables:
 - `FUTURES_TREND_6H_FLOOR=0.003`
 - `FUTURES_VOLUME_RATIO_FLOOR=1.0`
 - `FUTURES_MIN_REWARD_RISK=1.15`
-- `FUTURES_CALIBRATION_MIN_TOTAL_TRADES=4`
-- `FUTURES_CALIBRATION_FILE=Futures-bot/backtest_output/calibration.json`
+- `FUTURES_CALIBRATION_MIN_TOTAL_TRADES=15`
+- `FUTURES_CALIBRATION_FILE=Futures-bot/calibration/multi_symbol_calibration.json`
+- `FUTURES_CALIBRATION_OUTPUT_FILE=Futures-bot/backtest_output/calibration.json`
 - `FUTURES_DAILY_REVIEW_FILE=Futures-bot/backtest_output/daily_review.json`
 
 The project reuses `MEXC_API_KEY`, `MEXC_API_SECRET`, `REDIS_URL`, and `ANTHROPIC_API_KEY` when present.
@@ -98,3 +108,13 @@ This writes:
 - `Futures-bot/backtest_output/daily_review.json`
 
 If Redis is configured, it also publishes the calibration and review payloads for the runtime to consume on the next loop.
+
+## Run Multi-Symbol Replay
+
+```powershell
+Set-Location Futures-bot
+$env:PYTHONPATH=(Get-Location).Path
+..\.venv\Scripts\python.exe tools/run_multi_symbol_backtest.py --start 2026-03-02 --end 2026-05-01 --mode both
+```
+
+Use `USE_REALISTIC_BACKTEST=1`, `REALISTIC_FUNDING_RATE_8H`, `REALISTIC_SLIPPAGE_BPS_PER_LEV`, and `REALISTIC_EXIT_SLIP_MULT` to include conservative funding and slippage assumptions.

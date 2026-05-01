@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-04-20T00:00:00+00:00",
-  "window_start": "2026-02-20T00:00:00+00:00",
-  "window_end": "2026-04-20T00:00:00+00:00",
-  "total_trades": 39,
-  "notes": "Hand-tuned calibration derived from the 9-symbol 60-day backtest. Blocks the chronically-losing signal/symbol combinations on XRP and SILVER and tightens thresholds on marginal pairs. Auto-derived by _build_calibration.py against all 39 trades, then overridden per the analysis in the commit message.",
+  "generated_at": "2026-05-01T20:30:00+00:00",
+  "window_start": "2026-03-02T00:00:00+00:00",
+  "window_end": "2026-05-01T00:00:00+00:00",
+  "total_trades": 433,
+  "notes": "Hand-refreshed 10-symbol calibration from the 2026-03-02 to 2026-05-01 replay. Keeps the expanded universe active while blocking symbol/signal lanes that were persistently negative in the 60-day sample. This is deliberately conservative: it scans more symbols, but does not let BTC-style short/impulse lanes run on pairs where that lane failed.",
   "by_strategy": {
     "BTC_FUTURES": {
-      "trades": 39,
-      "win_rate": 0.487,
-      "total_pnl": 4054.15,
-      "profit_factor": 1.45,
-      "expectancy": 103.95
+      "trades": 433,
+      "win_rate": 0.331,
+      "total_pnl": -23.31,
+      "profit_factor": 0.99,
+      "expectancy": -0.05
     }
   },
   "by_strategy_signal": {},
@@ -21,52 +21,172 @@
       "BTC_FUTURES": {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": null}
     },
     "by_strategy_signal": {},
-    "by_strategy_symbol": {
-      "BTC_FUTURES": {
-        "XRP_USDT": {
-          "threshold_offset": 8.0,
-          "risk_mult": 0.6,
-          "block_reason": null,
-          "_comment": "Raise score bar 8pts and reduce size. Base-rate hostile to shorts (see signal blocks); long loser at score 62.4 also filtered."
-        },
-        "SILVER_USDT": {
-          "threshold_offset": 3.0,
-          "risk_mult": 0.75,
-          "block_reason": null,
-          "_comment": "Raise score bar and reduce size. Silver is whippy at 15m."
-        }
-      }
-    },
+    "by_strategy_symbol": {},
     "by_strategy_symbol_signal": {
       "BTC_FUTURES": {
-        "XRP_USDT": {
-          "COIL_BREAKDOWN_SHORT": {
+        "BTC_USDT": {
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
             "threshold_offset": 0.0,
             "risk_mult": 0.0,
-            "block_reason": "XRP shorts persistently fail: 1W/4L in 60d backtest, -$141.56. Structural bullish bias since 2024 SEC resolution; breakdowns squeeze."
+            "block_reason": "BTC impulse shorts lost 17-trade sample in 60d replay; keep BTC as long-biased breakout/impulse until short lane improves."
           },
-          "TREND_CONTINUATION_SHORT": {
-            "threshold_offset": 0.0,
-            "risk_mult": 0.0,
-            "block_reason": "XRP short side disabled (0W/1L, low-score entry)."
-          }
-        },
-        "SILVER_USDT": {
           "TREND_CONTINUATION_LONG": {
             "threshold_offset": 0.0,
             "risk_mult": 0.0,
-            "block_reason": "Silver trend-continuation long 0W/3L. Silver mean-reverts at 15m TF."
+            "block_reason": "Single BTC trend-continuation long failed; prefer coil/pressure/impulse long lanes."
+          }
+        },
+        "ETH_USDT": {
+          "COIL_BREAKOUT_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "ETH coil breakout long failed in replay; ETH edge was impulse/trend long, not coil breakout."
+          },
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "ETH impulse shorts were persistently negative; keep ETH event continuation long-biased."
           },
           "TREND_CONTINUATION_SHORT": {
-            "threshold_offset": 10.0,
-            "risk_mult": 0.5,
-            "block_reason": null,
-            "_comment": "Near-even on 2 trades; require very high conviction before taking silver shorts."
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "ETH trend shorts were 0W/3L in replay."
+          }
+        },
+        "SOL_USDT": {
+          "COIL_BREAKOUT_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "SOL coil breakout failed; only SOL trend-continuation long showed edge."
+          },
+          "IMPULSE_EVENT_CONTINUATION_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "SOL impulse longs were negative in 23-trade sample."
+          },
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "SOL impulse shorts were negative in 22-trade sample."
           },
           "PRESSURE_BREAK_SHORT": {
             "threshold_offset": 0.0,
             "risk_mult": 0.0,
-            "block_reason": "0W/1L, false break into London open."
+            "block_reason": "SOL pressure short failed; not enough evidence to keep active."
+          },
+          "TREND_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "SOL trend short failed; keep SOL long-trend only."
+          }
+        },
+        "PEPE_USDT": {
+          "IMPULSE_EVENT_CONTINUATION_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "PEPE impulse longs were negative; memecoin continuation needs stronger event confirmation before re-enabling."
+          },
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "PEPE impulse shorts were deeply negative; avoid fading meme squeezes."
+          },
+          "PRESSURE_BREAK_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "PEPE pressure long failed; leave only pressure-break short lane active from replay."
+          }
+        },
+        "TAO_USDT": {
+          "COIL_BREAKOUT_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "TAO edge came from impulse-event longs, not coil breakout."
+          },
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "TAO impulse shorts were negative; AI-beta rallies squeezed shorts."
+          },
+          "RANGE_EXPANSION_CONTINUATION_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "TAO range-expansion longs were 0W/3L; use impulse-event long instead."
+          },
+          "RANGE_EXPANSION_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "TAO range-expansion shorts were 0W/5L."
+          },
+          "TREND_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "TAO trend short failed; keep TAO long-biased."
+          }
+        },
+        "BNB_USDT": {
+          "COIL_BREAKDOWN_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "BNB coil breakdown short failed; BNB short edge was impulse-only."
+          },
+          "IMPULSE_EVENT_CONTINUATION_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "BNB impulse longs were slightly negative; keep BNB coil long / impulse short / trend long only."
+          },
+          "PRESSURE_BREAK_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "BNB pressure short failed."
+          }
+        },
+        "BCH_USDT": {
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "BCH impulse shorts were negative; BCH worked better on breakout and long impulse."
+          },
+          "PRESSURE_BREAK_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "BCH pressure short failed; avoid one-off weak short lane."
+          }
+        },
+        "SEI_USDT": {
+          "COIL_BREAKDOWN_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "SEI coil breakdown short failed; SEI edge is impulse/event and trend short, not coil short."
+          },
+          "TREND_CONTINUATION_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "SEI trend-continuation long failed; keep stronger SEI impulse and short trend lanes."
+          }
+        },
+        "LINK_USDT": {
+          "COIL_BREAKDOWN_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "LINK coil breakdown short failed; LINK worked on oracle/RWA-style long impulse and trend long."
+          },
+          "PRESSURE_BREAK_LONG": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "LINK pressure long failed; wait for clearer impulse or coil breakout."
+          },
+          "TREND_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "LINK trend shorts were 0W/2L."
+          }
+        },
+        "ZEC_USDT": {
+          "IMPULSE_EVENT_CONTINUATION_SHORT": {
+            "threshold_offset": 0.0,
+            "risk_mult": 0.0,
+            "block_reason": "ZEC impulse shorts were negative; current privacy-coin tape rewards upside continuation more than fading."
           }
         }
       }

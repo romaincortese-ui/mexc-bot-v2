@@ -15,6 +15,34 @@ load_dotenv()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+DEFAULT_FUTURES_SYMBOLS: tuple[str, ...] = (
+    "BTC_USDT",
+    "ETH_USDT",
+    "SOL_USDT",
+    "PEPE_USDT",
+    "TAO_USDT",
+    "BNB_USDT",
+    "BCH_USDT",
+    "SEI_USDT",
+    "LINK_USDT",
+    "ZEC_USDT",
+)
+
+
+DEFAULT_CORRELATION_BUCKETS = (
+    "BTC_USDT:btc_core,"
+    "ETH_USDT:large_cap_beta,"
+    "SOL_USDT:large_cap_beta,"
+    "BCH_USDT:large_cap_beta,"
+    "BNB_USDT:exchange_token,"
+    "PEPE_USDT:meme_beta,"
+    "TAO_USDT:ai_beta,"
+    "SEI_USDT:l1_beta,"
+    "LINK_USDT:oracle_beta,"
+    "ZEC_USDT:privacy_beta"
+)
+
+
 DEFAULT_SYMBOL_PARAMETER_PROFILES: dict[str, dict[str, float | int]] = {
     # BTC remains the reference profile; values intentionally match the global defaults.
     "BTC_USDT": {},
@@ -57,6 +85,54 @@ DEFAULT_SYMBOL_PARAMETER_PROFILES: dict[str, dict[str, float | int]] = {
         "leverage_max": 25,
         "min_reward_risk": 1.20,
         "funding_rate_abs_max": 0.00022,
+    },
+    "BCH_USDT": {
+        "min_confidence_score": 56.0,
+        "trend_24h_floor": 0.008,
+        "trend_6h_floor": 0.0025,
+        "consolidation_max_range_pct": 0.020,
+        "consolidation_atr_mult": 1.65,
+        "volume_ratio_floor": 1.00,
+        "adx_floor": 17.0,
+        "leverage_max": 35,
+        "min_reward_risk": 1.18,
+        "funding_rate_abs_max": 0.00020,
+    },
+    "SEI_USDT": {
+        "min_confidence_score": 58.0,
+        "trend_24h_floor": 0.010,
+        "trend_6h_floor": 0.0025,
+        "consolidation_max_range_pct": 0.035,
+        "consolidation_atr_mult": 2.00,
+        "volume_ratio_floor": 1.08,
+        "adx_floor": 16.0,
+        "leverage_max": 30,
+        "min_reward_risk": 1.25,
+        "funding_rate_abs_max": 0.00035,
+    },
+    "LINK_USDT": {
+        "min_confidence_score": 57.0,
+        "trend_24h_floor": 0.009,
+        "trend_6h_floor": 0.0025,
+        "consolidation_max_range_pct": 0.024,
+        "consolidation_atr_mult": 1.80,
+        "volume_ratio_floor": 1.05,
+        "adx_floor": 16.5,
+        "leverage_max": 30,
+        "min_reward_risk": 1.20,
+        "funding_rate_abs_max": 0.00022,
+    },
+    "ZEC_USDT": {
+        "min_confidence_score": 60.0,
+        "trend_24h_floor": 0.014,
+        "trend_6h_floor": 0.003,
+        "consolidation_max_range_pct": 0.045,
+        "consolidation_atr_mult": 2.15,
+        "volume_ratio_floor": 1.10,
+        "adx_floor": 17.0,
+        "leverage_max": 20,
+        "min_reward_risk": 1.30,
+        "funding_rate_abs_max": 0.00025,
     },
 }
 
@@ -272,8 +348,17 @@ class FuturesConfig:
     @classmethod
     def from_env(cls) -> "FuturesConfig":
         hourly_check_seconds = env_int("FUTURES_HOURLY_CHECK_SECONDS", 300)
-        primary_symbol = env_str("FUTURES_SYMBOL", "BTC_USDT").upper()
-        symbols = parse_symbol_list(env_str("FUTURES_SYMBOLS", ""), primary_symbol)
+        explicit_primary_symbol = env_str("FUTURES_SYMBOL", "").upper()
+        raw_symbols = env_str("FUTURES_SYMBOLS", "")
+        if raw_symbols:
+            primary_symbol = explicit_primary_symbol or "BTC_USDT"
+            symbols = parse_symbol_list(raw_symbols, primary_symbol)
+        elif explicit_primary_symbol:
+            primary_symbol = explicit_primary_symbol
+            symbols = (primary_symbol,)
+        else:
+            primary_symbol = DEFAULT_FUTURES_SYMBOLS[0]
+            symbols = DEFAULT_FUTURES_SYMBOLS
         # P0 fix (assessment §3.2): fail fast on misnamed per-symbol env vars
         # (e.g. FUTURES_PEPE_USDT_LEVERAGE_MAX is silently ignored because
         # _symbol_env_prefix strips underscores -> FUTURES_PEPEUSDT). This
@@ -293,7 +378,7 @@ class FuturesConfig:
             min_confidence_score=env_float("FUTURES_SCORE_THRESHOLD", 56.0),
             hourly_check_seconds=hourly_check_seconds,
             heartbeat_seconds=env_int("FUTURES_HEARTBEAT_SECONDS", env_int("HEARTBEAT_SECONDS", 3600)),
-            calibration_file=resolve_repo_path(env_str("FUTURES_CALIBRATION_FILE", "backtest_output/calibration.json")),
+            calibration_file=resolve_repo_path(env_str("FUTURES_CALIBRATION_FILE", "calibration/multi_symbol_calibration.json")),
             calibration_redis_key=env_str("FUTURES_CALIBRATION_REDIS_KEY", "mexc_futures_calibration"),
             calibration_refresh_seconds=env_int("FUTURES_CALIBRATION_REFRESH_SECONDS", 900),
             calibration_max_age_hours=env_float("FUTURES_CALIBRATION_MAX_AGE_HOURS", 72.0),
@@ -341,7 +426,7 @@ class FuturesConfig:
             early_exit_buffer_pct=env_float("FUTURES_EARLY_EXIT_BUFFER_PCT", 0.10),
             max_concurrent_positions=max(1, env_int("FUTURES_MAX_CONCURRENT_POSITIONS", 1)),
             max_total_margin_usdt=env_float("FUTURES_MAX_TOTAL_MARGIN_USDT", 0.0),
-            correlation_buckets=parse_correlation_buckets(env_str("FUTURES_CORRELATION_BUCKETS", "")),
+            correlation_buckets=parse_correlation_buckets(env_str("FUTURES_CORRELATION_BUCKETS", DEFAULT_CORRELATION_BUCKETS)),
             max_per_bucket=max(1, env_int("FUTURES_MAX_PER_BUCKET", 1)),
             session_hours_utc=env_str("FUTURES_SESSION_HOURS_UTC", ""),
             # P1 fix (assessment §4.2 / §6 #6): tighten the global funding-rate cap
@@ -562,12 +647,13 @@ class FuturesBacktestConfig:
     def from_env(cls, now: datetime | None = None) -> "FuturesBacktestConfig":
         start, end = resolve_backtest_window(now=now)
         live = FuturesConfig.from_env()
+        scoped = live.for_symbol(live.symbol)
         return cls(
             start=start,
             end=end,
-            symbol=live.symbol,
+            symbol=scoped.symbol,
             initial_balance=env_float("FUTURES_BACKTEST_INITIAL_BALANCE", 300.0),
-            margin_budget_usdt=env_float("FUTURES_BACKTEST_MARGIN_BUDGET_USDT", live.margin_budget_usdt),
+            margin_budget_usdt=env_float("FUTURES_BACKTEST_MARGIN_BUDGET_USDT", scoped.margin_budget_usdt),
             taker_fee_rate=env_float("FUTURES_BACKTEST_TAKER_FEE_RATE", 0.0004),
             calibration_file=live.calibration_file,
             calibration_redis_key=live.calibration_redis_key,
@@ -576,27 +662,27 @@ class FuturesBacktestConfig:
             review_redis_key=live.review_redis_key,
             output_dir=resolve_repo_path(env_str("FUTURES_BACKTEST_OUTPUT_DIR", "backtest_output")),
             cache_dir=resolve_repo_path(env_str("FUTURES_BACKTEST_CACHE_DIR", "backtest_cache")),
-            min_confidence_score=env_float("FUTURES_BACKTEST_SCORE_THRESHOLD", live.min_confidence_score),
-            leverage_min=live.leverage_min,
-            leverage_max=live.leverage_max,
-            hard_loss_cap_pct=live.hard_loss_cap_pct,
-            adx_floor=live.adx_floor,
-            trend_24h_floor=live.trend_24h_floor,
-            trend_6h_floor=live.trend_6h_floor,
-            breakout_buffer_atr=live.breakout_buffer_atr,
-            consolidation_window_bars=live.consolidation_window_bars,
-            consolidation_max_range_pct=live.consolidation_max_range_pct,
-            consolidation_atr_mult=live.consolidation_atr_mult,
-            volume_ratio_floor=live.volume_ratio_floor,
-            tp_atr_mult=live.tp_atr_mult,
-            tp_range_mult=live.tp_range_mult,
-            tp_floor_pct=live.tp_floor_pct,
-            sl_buffer_atr_mult=live.sl_buffer_atr_mult,
-            sl_trend_atr_mult=live.sl_trend_atr_mult,
-            min_reward_risk=live.min_reward_risk,
-            early_exit_tp_progress=live.early_exit_tp_progress,
-            early_exit_min_profit_pct=live.early_exit_min_profit_pct,
-            early_exit_buffer_pct=live.early_exit_buffer_pct,
+            min_confidence_score=env_float("FUTURES_BACKTEST_SCORE_THRESHOLD", scoped.min_confidence_score),
+            leverage_min=scoped.leverage_min,
+            leverage_max=scoped.leverage_max,
+            hard_loss_cap_pct=scoped.hard_loss_cap_pct,
+            adx_floor=scoped.adx_floor,
+            trend_24h_floor=scoped.trend_24h_floor,
+            trend_6h_floor=scoped.trend_6h_floor,
+            breakout_buffer_atr=scoped.breakout_buffer_atr,
+            consolidation_window_bars=scoped.consolidation_window_bars,
+            consolidation_max_range_pct=scoped.consolidation_max_range_pct,
+            consolidation_atr_mult=scoped.consolidation_atr_mult,
+            volume_ratio_floor=scoped.volume_ratio_floor,
+            tp_atr_mult=scoped.tp_atr_mult,
+            tp_range_mult=scoped.tp_range_mult,
+            tp_floor_pct=scoped.tp_floor_pct,
+            sl_buffer_atr_mult=scoped.sl_buffer_atr_mult,
+            sl_trend_atr_mult=scoped.sl_trend_atr_mult,
+            min_reward_risk=scoped.min_reward_risk,
+            early_exit_tp_progress=scoped.early_exit_tp_progress,
+            early_exit_min_profit_pct=scoped.early_exit_min_profit_pct,
+            early_exit_buffer_pct=scoped.early_exit_buffer_pct,
             redis_url=env_str("REDIS_URL", ""),
             anthropic_api_key=live.anthropic_api_key,
         )
