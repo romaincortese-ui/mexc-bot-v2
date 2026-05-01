@@ -103,6 +103,47 @@ def test_backtest_engine_uses_strategy_specific_tp_sl_when_present():
     assert trades[0]["strategy"] == "GRID"
 
 
+def test_backtest_engine_blocks_configured_signal_lane():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=70, freq="5min")
+    frame = pd.DataFrame(
+        {
+            "open": [100.0] * 70,
+            "high": [103.0] * 70,
+            "low": [99.5] * 70,
+            "close": [100.0] * 70,
+            "volume": [1000.0] * 70,
+        },
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["BTCUSDT"],
+        blocked_signal_lanes=["SCALPER:CROSSOVER"],
+    )
+
+    def stub_scorer(symbol: str, window: pd.DataFrame, threshold: float):
+        if len(window) < 60:
+            return None
+        return Opportunity(
+            symbol=symbol,
+            score=40.0,
+            price=float(window["close"].iloc[-1]),
+            rsi=42.0,
+            rsi_score=5.0,
+            ma_score=20.0,
+            vol_score=20.0,
+            vol_ratio=1.5,
+            entry_signal="CROSSOVER",
+            strategy="SCALPER",
+        )
+
+    engine = BacktestEngine(config, StubProvider(frame), scorer=stub_scorer)
+    _, trades = engine.run()
+
+    assert trades == []
+
+
 def test_backtest_engine_flattens_opportunity_buzz_metadata_into_trade_rows():
     index = pd.date_range("2024-01-01T00:00:00Z", periods=70, freq="5min")
     frame = pd.DataFrame(
@@ -286,6 +327,7 @@ def test_backtest_engine_records_partial_tp_before_final_exit():
         symbols=["BTCUSDT"],
         max_open_positions=1,
         reentry_cooldown_bars=100,
+        trinity_allocation_pct=0.10,
     )
 
     def stub_scorer(symbol: str, window: pd.DataFrame, threshold: float):
@@ -760,6 +802,7 @@ def test_backtest_engine_partial_exit_uses_fee_aware_remaining_cost_basis():
         symbols=["BTCUSDT"],
         max_open_positions=1,
         reentry_cooldown_bars=100,
+        trinity_allocation_pct=0.10,
         maker_fee_rate=0.0005,
         taker_fee_rate=0.001,
         taker_slippage_rate=0.001,

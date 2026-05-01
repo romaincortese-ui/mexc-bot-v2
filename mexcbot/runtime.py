@@ -25,7 +25,7 @@ from mexcbot.calibration import (
 )
 from mexcbot.config import LiveConfig, env_bool, env_float, env_int
 from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
-from mexcbot.exchange import MexcClient
+from mexcbot.exchange import MexcClient, OrderExecution
 from mexcbot.exits import evaluate_trade_action
 from mexcbot.event_overlay import evaluate_event_state_opportunity_boost, evaluate_event_state_overlay
 from mexcbot.indicators import calc_ema
@@ -63,6 +63,8 @@ KELLY_MULT_MARGINAL = env_float("KELLY_MULT_MARGINAL", 0.50)
 KELLY_MULT_SOLID = env_float("KELLY_MULT_SOLID", 0.80)
 KELLY_MULT_STANDARD = env_float("KELLY_MULT_STANDARD", 1.00)
 KELLY_MULT_HIGH_CONF = env_float("KELLY_MULT_HIGH_CONF", 1.50)
+MEXC_SPOT_TAKER_FEE_RATE = env_float("MEXC_SPOT_TAKER_FEE_RATE", env_float("MEXC_TAKER_FEE_RATE", 0.001))
+ENTRY_TRADE_RECONCILE_LIMIT = env_int("MEXC_ENTRY_TRADE_RECONCILE_LIMIT", 20)
 
 # ---------------------------------------------------------------------------
 # Sprint memo integrations — feature flags, all OFF by default.
@@ -100,6 +102,7 @@ CRYPTO_EVENT_MAX_SIZING_MULTIPLIER = env_float("CRYPTO_EVENT_MAX_SIZING_MULTIPLI
 # strategies get RECONCILE_DEFAULT_SL_PCT (0.10 = -10%), tighter than the
 # global HARD_SL_FLOOR_PCT (0.20) and the old STOP_LOSS_PCT default (0.40).
 RECONCILE_DEFAULT_SL_PCT = env_float("RECONCILE_DEFAULT_SL_PCT", 0.10)
+RECONCILE_ON_BOOT = env_int("RECONCILE_ON_BOOT", env_int("MEXCBOT_RECONCILE_ON_BOOT", 1))
 RECONCILE_MIN_INTERVAL_SECONDS = env_float("RECONCILE_MIN_INTERVAL_SECONDS", 300.0)
 RECONCILE_FAILURE_COOLDOWN_SECONDS = env_float("RECONCILE_FAILURE_COOLDOWN_SECONDS", 300.0)
 DEFENSIVE_EXIT_REASONS = {
@@ -194,6 +197,14 @@ def _slippage_bps(fill_price: float, reference_price: float | None) -> float:
     return round((fill_price / reference - 1.0) * 10_000.0, 4)
 
 
+def _signal_lane_key(strategy: object, entry_signal: object) -> str:
+    return f"{str(strategy or '').strip().upper()}:{str(entry_signal or '').strip().upper()}"
+
+
+def _normalise_signal_lane(value: object) -> str:
+    return str(value or "").strip().replace("/", ":").upper()
+
+
 def _trade_state_payload(trade: Trade) -> dict[str, object]:
     return {
         "symbol": trade.symbol,
@@ -279,6 +290,114 @@ class LiveBotRuntime:
         self._state_path = Path(self.config.state_file) if self.config.state_file else None
         self._price_monitor = PriceMonitor()
         self._load_state()
+
+    def _convert_fee_asset_to_usdt(self, asset: str, amount: float, avg_price: float, base_asset: str, quote_asset: str) -> float:
+        if amount <= 0:
+            return 0.0
+        asset = str(asset or "").upper()
+        if asset == quote_asset:
+            return float(amount)
+        if asset == base_asset and avg_price > 0:
+            return float(amount) * avg_price
+        if asset == "USDT":
+            return float(amount)
+        try:
+            return float(amount) * float(self.client.get_price(f"{asset}USDT"))
+        except Exception as exc:
+            log.debug("Could not convert %s fee to USDT: %s", asset, exc)
+            return 0.0
+
+    def _entry_fee_metadata_from_execution(
+        self,
+        symbol: str,
+        execution: OrderExecution,
+        *,
+        source: str,
+        other_fee_usdt: float = 0.0,
+    ) -> dict[str, object]:
+        quote_asset = "USDT" if symbol.endswith("USDT") else ""
+        base_asset = symbol[:-4] if quote_asset else ""
+        avg_price = float(execution.avg_price or 0.0)
+        fee_quote_usdt = float(execution.fee_quote_qty or 0.0)
+        fee_base_usdt = self._convert_fee_asset_to_usdt(base_asset, float(execution.fee_base_qty or 0.0), avg_price, base_asset, quote_asset)
+        fee_other_usdt = float(other_fee_usdt or 0.0)
+        total_fee_usdt = max(0.0, fee_quote_usdt + fee_base_usdt + fee_other_usdt)
+        cash_fee_usdt = max(0.0, fee_quote_usdt + fee_other_usdt)
+        fee_assets: dict[str, float] = {}
+        if quote_asset:
+            fee_assets[quote_asset] = fee_quote_usdt
+        if base_asset:
+            fee_assets[base_asset] = fee_base_usdt
+        return {
+            "entry_fee_source": source,
+            "entry_fee_usdt": total_fee_usdt,
+            "entry_fee_cash_usdt": cash_fee_usdt,
+            "entry_fee_quote_usdt": fee_quote_usdt,
+            "entry_fee_base_usdt": fee_base_usdt,
+            "entry_fee_other_usdt": fee_other_usdt,
+            "entry_gross_usdt": float(execution.gross_quote_qty or 0.0),
+            "entry_fee_assets": fee_assets,
+        }
+
+    def _reconcile_entry_execution(self, symbol: str, execution: OrderExecution) -> tuple[OrderExecution, dict[str, object]]:
+        metadata = self._entry_fee_metadata_from_execution(symbol, execution, source="order_response")
+        if self.config.paper_trade or not execution.order_id:
+            return execution, metadata
+        try:
+            rows = self.client.get_my_trades(symbol, limit=ENTRY_TRADE_RECONCILE_LIMIT)
+        except Exception as exc:
+            log.debug("Entry myTrades reconciliation failed for %s order=%s: %s", symbol, execution.order_id, exc)
+            return execution, metadata
+
+        order_id = str(execution.order_id)
+        matches = [row for row in rows if str(row.get("orderId") or "") == order_id]
+        if not matches:
+            return execution, metadata
+
+        quote_asset = "USDT" if symbol.endswith("USDT") else ""
+        base_asset = symbol[:-4] if quote_asset else ""
+        executed_qty = 0.0
+        gross_quote_qty = 0.0
+        fee_quote_qty = 0.0
+        fee_base_qty = 0.0
+        other_fee_usdt = 0.0
+        fee_assets: dict[str, float] = {}
+        for row in matches:
+            qty = float(row.get("qty") or 0.0)
+            price = float(row.get("price") or 0.0)
+            quote_qty = float(row.get("quoteQty") or (qty * price) or 0.0)
+            executed_qty += qty
+            gross_quote_qty += quote_qty
+            commission = float(row.get("commission") or 0.0)
+            commission_asset = str(row.get("commissionAsset") or "").upper()
+            if commission <= 0 or not commission_asset:
+                continue
+            fee_assets[commission_asset] = fee_assets.get(commission_asset, 0.0) + commission
+            if commission_asset == quote_asset:
+                fee_quote_qty += commission
+            elif commission_asset == base_asset:
+                fee_base_qty += commission
+            else:
+                avg_price_hint = (gross_quote_qty / executed_qty) if executed_qty > 0 else float(execution.avg_price or 0.0)
+                other_fee_usdt += self._convert_fee_asset_to_usdt(commission_asset, commission, avg_price_hint, base_asset, quote_asset)
+
+        if executed_qty <= 0 or gross_quote_qty <= 0:
+            return execution, metadata
+        avg_price = gross_quote_qty / executed_qty
+        reconciled = replace(
+            execution,
+            executed_qty=executed_qty,
+            net_base_qty=max(0.0, executed_qty - fee_base_qty),
+            gross_quote_qty=gross_quote_qty,
+            net_quote_qty=max(0.0, gross_quote_qty - fee_quote_qty),
+            avg_price=avg_price,
+            fee_quote_qty=fee_quote_qty,
+            fee_base_qty=fee_base_qty,
+        )
+        metadata = self._entry_fee_metadata_from_execution(symbol, reconciled, source="myTrades", other_fee_usdt=other_fee_usdt)
+        metadata["entry_fee_assets"] = fee_assets
+        metadata["entry_reconciled_trade_count"] = len(matches)
+        return reconciled, metadata
 
     def _state_payload(self) -> dict[str, object]:
         return {
@@ -1206,6 +1325,7 @@ class LiveBotRuntime:
                 "min_profit_factor": self.config.symbol_perf_gate_min_profit_factor,
                 "pause_hours": self.config.symbol_perf_gate_pause_hours,
             },
+            "reconcile_on_boot": bool(RECONCILE_ON_BOOT),
             "calibration": dict(self._calibration_manifest),
         }
         log.info("[BOOT] %s", _audit_json(manifest))
@@ -1375,6 +1495,7 @@ class LiveBotRuntime:
             "entry_fee_usdt": round(float(trade.entry_fee_usdt or 0.0) * (qty_to_close / qty_before), 8),
             "exit_fee_usdt": round(execution.fee_quote_qty, 8),
             "is_partial": True,
+            "metadata": dict(trade.metadata),
         }
         closed = self._enrich_closed_audit_fields(
             closed,
@@ -2060,6 +2181,13 @@ class LiveBotRuntime:
         if gross_quote_qty <= 0:
             gross_quote_qty = float(trade.entry_price * trade.qty)
         entry_cost = float(trade.entry_cost_usdt or gross_quote_qty)
+        estimated_entry_fee = float(trade.entry_fee_usdt or 0.0)
+        if estimated_entry_fee <= 0 and gross_quote_qty > 0:
+            estimated_entry_fee = gross_quote_qty * MEXC_SPOT_TAKER_FEE_RATE
+        tp_gross = (float(trade.tp_price) - float(trade.entry_price)) * float(trade.qty)
+        sl_gross = (float(trade.sl_price) - float(trade.entry_price)) * float(trade.qty)
+        tp_exit_fee = max(0.0, float(trade.tp_price) * float(trade.qty) * MEXC_SPOT_TAKER_FEE_RATE)
+        sl_exit_fee = max(0.0, float(trade.sl_price) * float(trade.qty) * MEXC_SPOT_TAKER_FEE_RATE)
         payload = {
             "symbol": trade.symbol,
             "strategy": trade.strategy,
@@ -2073,6 +2201,12 @@ class LiveBotRuntime:
             "net_entry_price": _audit_float(entry_cost / trade.qty, 12) if trade.qty > 0 else 0.0,
             "gross_quote_usdt": _audit_float(gross_quote_qty, 8),
             "entry_fee_usdt": _audit_float(trade.entry_fee_usdt, 8),
+            "estimated_fee_usdt": _audit_float(estimated_entry_fee + gross_quote_qty * MEXC_SPOT_TAKER_FEE_RATE, 8),
+            "tp_gross_usdt": _audit_float(tp_gross, 8),
+            "sl_gross_usdt": _audit_float(sl_gross, 8),
+            "tp_net_usdt": _audit_float(tp_gross - estimated_entry_fee - tp_exit_fee, 8),
+            "sl_net_usdt": _audit_float(sl_gross - estimated_entry_fee - sl_exit_fee, 8),
+            "entry_fee_source": str(trade.metadata.get("entry_fee_source") or ""),
             "entry_slippage_bps": _slippage_bps(float(trade.entry_price), float(opportunity.price or 0.0)),
             "tp_price": _audit_float(trade.tp_price, 12),
             "sl_price": _audit_float(trade.sl_price, 12),
@@ -2097,17 +2231,25 @@ class LiveBotRuntime:
         qty = float(exit_qty if exit_qty is not None else closed.get("qty", 0.0) or 0.0)
         exit_price = float(closed.get("exit_price", 0.0) or 0.0)
         entry_fee = float(closed.get("entry_fee_usdt", 0.0) or 0.0)
+        metadata = closed.get("metadata") if isinstance(closed.get("metadata"), dict) else {}
+        if closed.get("entry_fee_cash_usdt") is not None:
+            entry_fee_cash = float(closed.get("entry_fee_cash_usdt") or 0.0)
+        elif "entry_fee_cash_usdt" in metadata:
+            entry_fee_cash = float(metadata.get("entry_fee_cash_usdt") or 0.0)
+        else:
+            entry_fee_cash = entry_fee
         exit_fee = float(closed.get("exit_fee_usdt", 0.0) or 0.0)
         exit_gross = float(gross_quote_qty or 0.0)
         if exit_gross <= 0 and qty > 0 and exit_price > 0:
             exit_gross = exit_price * qty
-        entry_gross = max(0.0, float(entry_cost) - entry_fee)
+        entry_gross = max(0.0, float(entry_cost) - entry_fee_cash)
         gross_pnl = exit_gross - entry_gross
         net_pnl = float(net_proceeds) - float(entry_cost)
         closed.update(
             {
                 "entry_cost_usdt": _audit_float(entry_cost, 8),
                 "entry_gross_usdt": _audit_float(entry_gross, 8),
+                "entry_fee_cash_usdt": _audit_float(entry_fee_cash, 8),
                 "exit_gross_usdt": _audit_float(exit_gross, 8),
                 "net_proceeds_usdt": _audit_float(net_proceeds, 8),
                 "gross_pnl_usdt": _audit_float(gross_pnl, 8),
@@ -2398,6 +2540,55 @@ class LiveBotRuntime:
             "reason": "",
         }
 
+    def _reconcile_summary_lines(self, stats: dict[str, object], *, title: str) -> list[str]:
+        tracked_symbols = stats.get("tracked_symbols") or []
+        tracked_count = int(stats.get("tracked", 0) or 0)
+        lines = [
+            title,
+            f"Tracked healthy: <b>{tracked_count}</b>",
+        ]
+        if tracked_symbols:
+            preview = ", ".join(str(symbol) for symbol in list(tracked_symbols)[:10])
+            if len(tracked_symbols) > 10:
+                preview += f" (+{len(tracked_symbols) - 10} more)"
+            lines.append(f"  {preview}")
+        lines.extend(
+            [
+                f"Stale (closed off-exchange): <b>{stats['stale']}</b>",
+                f"Untracked (found on exchange): <b>{stats['untracked']}</b>",
+                f"Orphaned orders: <b>{stats['orphaned']}</b>",
+            ]
+        )
+        return lines
+
+    def _run_boot_reconcile(self) -> None:
+        if self.config.paper_trade:
+            log.info("Startup reconcile skipped in paper mode")
+            return
+        if not RECONCILE_ON_BOOT:
+            log.info("Startup reconcile disabled")
+            return
+        stats = self._reconcile_open_positions(notify=True, force=True)
+        if int(stats.get("skipped", 0) or 0):
+            reason = str(stats.get("reason") or "MEXC account endpoint unavailable")
+            log.warning("Startup reconcile deferred: %s", reason)
+            self._record_activity("Startup reconcile deferred")
+            self._notify("🔧 <b>Startup reconcile deferred</b>\n" + escape(reason[:500]))
+            return
+        self._record_activity(
+            "Startup reconcile tracked="
+            f"{int(stats.get('tracked', 0) or 0)} stale={int(stats.get('stale', 0) or 0)} "
+            f"untracked={int(stats.get('untracked', 0) or 0)} orphaned={int(stats.get('orphaned', 0) or 0)}"
+        )
+        log.info(
+            "Startup reconcile complete: tracked=%s stale=%s untracked=%s orphaned=%s",
+            int(stats.get("tracked", 0) or 0),
+            int(stats.get("stale", 0) or 0),
+            int(stats.get("untracked", 0) or 0),
+            int(stats.get("orphaned", 0) or 0),
+        )
+        self._notify("\n".join(self._reconcile_summary_lines(stats, title="🔧 <b>Startup reconcile complete</b>")))
+
     def _handle_telegram_commands(self) -> None:
         updates = self.telegram.get_updates(
             offset=self._last_telegram_update + 1 if self._last_telegram_update else None,
@@ -2522,25 +2713,7 @@ class LiveBotRuntime:
                     reason = str(stats.get("reason") or "MEXC account endpoint unavailable")
                     self._notify("🔧 <b>Reconcile deferred</b>\n" + escape(reason[:500]))
                     continue
-                tracked_symbols = stats.get("tracked_symbols") or []
-                tracked_count = int(stats.get("tracked", 0) or 0)
-                lines = [
-                    "🔧 <b>Reconcile complete</b>",
-                    f"Tracked healthy: <b>{tracked_count}</b>",
-                ]
-                if tracked_symbols:
-                    preview = ", ".join(tracked_symbols[:10])
-                    if len(tracked_symbols) > 10:
-                        preview += f" (+{len(tracked_symbols) - 10} more)"
-                    lines.append(f"  {preview}")
-                lines.extend(
-                    [
-                        f"Stale (closed off-exchange): <b>{stats['stale']}</b>",
-                        f"Untracked (found on exchange): <b>{stats['untracked']}</b>",
-                        f"Orphaned orders: <b>{stats['orphaned']}</b>",
-                    ]
-                )
-                self._notify("\n".join(lines))
+                self._notify("\n".join(self._reconcile_summary_lines(stats, title="🔧 <b>Reconcile complete</b>")))
             elif text == "/restart":
                 self._notify("🔄 <b>Restarting...</b>")
                 raise SystemExit(1)
@@ -3134,11 +3307,27 @@ class LiveBotRuntime:
 
         opportunity.metadata.pop("pretrade_block_reason", None)
         opportunity.metadata.pop("symbol_gate_detail", None)
+        if self._signal_lane_rejects(opportunity):
+            return False
         if self._symbol_performance_rejects(opportunity):
             return False
         if self._moonshot_per_symbol_rejects(opportunity):
             opportunity.metadata["pretrade_block_reason"] = "moonshot_symbol_gate"
             return False
+        return True
+
+    def _signal_lane_rejects(self, opportunity: Opportunity) -> bool:
+        blocked = {_normalise_signal_lane(item) for item in getattr(self.config, "blocked_signal_lanes", [])}
+        blocked.discard("")
+        if not blocked:
+            return False
+        lane = _signal_lane_key(opportunity.strategy, opportunity.entry_signal)
+        if lane not in blocked:
+            return False
+        opportunity.metadata["pretrade_block_reason"] = "blocked_signal_lane"
+        opportunity.metadata["symbol_gate_detail"] = lane
+        log.info("[SIGNAL_GATE] Blocked %s %s", opportunity.symbol, lane)
+        self._record_activity(f"Signal gate block {lane} {opportunity.symbol}")
         return True
 
     def _maybe_record_tax_lot_buy(
@@ -3485,9 +3674,13 @@ class LiveBotRuntime:
             fallback_price=opportunity.price,
             fallback_qty=requested_qty,
         )
+        execution, fee_metadata = self._reconcile_entry_execution(opportunity.symbol, execution)
         filled_qty = execution.net_base_qty if execution.net_base_qty > 0 else requested_qty
         entry_price = execution.avg_price if execution.avg_price > 0 else opportunity.price
-        entry_cost = execution.gross_quote_qty + execution.fee_quote_qty if execution.gross_quote_qty > 0 else entry_price * filled_qty
+        entry_fee_cash_usdt = float(fee_metadata.get("entry_fee_cash_usdt", 0.0) or 0.0)
+        entry_fee_usdt = float(fee_metadata.get("entry_fee_usdt", 0.0) or 0.0)
+        entry_gross_usdt = float(fee_metadata.get("entry_gross_usdt", 0.0) or 0.0)
+        entry_cost = entry_gross_usdt + entry_fee_cash_usdt if entry_gross_usdt > 0 else entry_price * filled_qty
         if filled_qty < min_qty:
             log.warning("%s filled qty %.6f below min %.6f, skipping", opportunity.symbol, filled_qty, min_qty)
             return None
@@ -3514,6 +3707,7 @@ class LiveBotRuntime:
                 )
                 tp_execution_mode = "internal"
         opportunity.metadata["tp_execution_mode"] = tp_execution_mode
+        opportunity.metadata.update(fee_metadata)
         trade = Trade(
             symbol=opportunity.symbol,
             entry_price=entry_price,
@@ -3536,7 +3730,7 @@ class LiveBotRuntime:
             metadata=dict(opportunity.metadata),
             entry_cost_usdt=round(entry_cost, 8),
             remaining_cost_usdt=round(entry_cost, 8),
-            entry_fee_usdt=round(execution.fee_quote_qty, 8),
+            entry_fee_usdt=round(entry_fee_usdt, 8),
             tp_order_id=tp_order_id,
         )
         log.info(
@@ -3907,6 +4101,7 @@ class LiveBotRuntime:
             "entry_fee_usdt": round(float(trade.entry_fee_usdt or 0.0) * (qty_to_close / qty_before), 8),
             "exit_fee_usdt": round(execution.fee_quote_qty, 8),
             "is_partial": True,
+            "metadata": dict(trade.metadata),
         }
         closed = self._enrich_closed_audit_fields(
             closed,
@@ -3954,6 +4149,7 @@ class LiveBotRuntime:
         self._log_boot_manifest(mode)
         self._flush_telegram_updates()
         self._send_startup_message()
+        self._run_boot_reconcile()
         if not self.config.paper_trade:
             self._price_monitor.start()
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -146,6 +146,7 @@ class LiveConfig:
     grid_btc_1h_floor: float
     grid_btc_24h_floor: float
     state_file: str
+    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER"])
     base_url: str = "https://api.mexc.com"
 
     @classmethod
@@ -167,7 +168,7 @@ class LiveConfig:
             scalper_threshold=env_float("SCALPER_THRESHOLD", env_float("SCORE_THRESHOLD", 42.0)),
             moonshot_min_score=env_float("MOONSHOT_MIN_SCORE", 32.0),
             max_open_positions=env_int("MAX_OPEN_POSITIONS", 3),
-            strategies=env_csv("MEXCBOT_STRATEGIES", "SCALPER,GRID,TRINITY,MOONSHOT,REVERSAL"),
+            strategies=env_csv("MEXCBOT_STRATEGIES", "SCALPER,GRID,MOONSHOT,REVERSAL"),
             moonshot_symbols=env_csv("MOONSHOT_SYMBOLS", "SOLUSDT,DOGEUSDT,PEPEUSDT,ENAUSDT,WIFUSDT"),
             reversal_symbols=env_csv("REVERSAL_SYMBOLS", "SOLUSDT,DOGEUSDT,ETHUSDT,PEPEUSDT,WIFUSDT"),
             grid_symbols=env_csv("GRID_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ADAUSDT"),
@@ -215,7 +216,7 @@ class LiveConfig:
             adaptive_min_offset=env_float("ADAPTIVE_MIN_OFFSET", -6.0),
             scalper_allocation_pct=env_float("SCALPER_ALLOCATION_PCT", 0.25),
             moonshot_allocation_pct=env_float("MOONSHOT_ALLOCATION_PCT", 0.45),
-            trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.10),
+            trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.00),
             grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.20),
             scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.42),
             moonshot_budget_pct=env_float("MOONSHOT_BUDGET_PCT", 0.048),
@@ -248,5 +249,6 @@ class LiveConfig:
             grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
             grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
             state_file=env_str("MEXCBOT_STATE_FILE", default_state_file()),
+            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER"),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
         )

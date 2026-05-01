@@ -88,20 +88,7 @@ def score_backtest_moonshot_candidates(
     if not scored:
         return []
 
-    re_scored: list[tuple[Opportunity, str, dict[str, float], bool]] = []
-    for base_candidate, data_key, metrics, is_new in scored:
-        candidate = score_moonshot_from_frame(
-            base_candidate.symbol,
-            frame_by_key[data_key],
-            score_threshold=score_threshold,
-            is_new=is_new,
-            is_trending=False,
-            social_boost=0.0,
-            threshold_margin=max_social_boost,
-        )
-        if candidate is None:
-            continue
-        re_scored.append((candidate, data_key, metrics, is_new))
+    re_scored = scored
 
     if not re_scored:
         return []

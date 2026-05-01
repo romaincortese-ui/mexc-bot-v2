@@ -43,7 +43,7 @@ def test_build_run_summary_includes_effective_window_and_runtime_settings():
         "strategy_allocations": {
             "SCALPER": 0.25,
             "MOONSHOT_POOL": 0.45,
-            "TRINITY": 0.10,
+            "TRINITY": 0.00,
             "GRID": 0.20,
         },
         "per_trade_budget_pct": {

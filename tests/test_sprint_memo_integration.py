@@ -33,6 +33,9 @@ def _reset_runtime_and_strategies():
         "USE_MOONSHOT_PER_SYMBOL_GATE",
         "USE_FIFO_TAX_LOTS",
         "USE_REVIEW_VALIDATION",
+        "USE_CRYPTO_EVENT_OVERLAY",
+        "USE_EVENT_OVERLAY",
+        "CRYPTO_EVENT_STATE_FILE",
         "PORTFOLIO_RISK_CAP_PCT",
     ):
         import os
@@ -101,6 +104,9 @@ def _reload_runtime(monkeypatch, flags: dict[str, str]):
         "USE_MOONSHOT_PER_SYMBOL_GATE",
         "USE_FIFO_TAX_LOTS",
         "USE_REVIEW_VALIDATION",
+        "USE_CRYPTO_EVENT_OVERLAY",
+        "USE_EVENT_OVERLAY",
+        "CRYPTO_EVENT_STATE_FILE",
         "PORTFOLIO_RISK_CAP_PCT",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -125,6 +131,9 @@ class _Stub:
         self._session_anchor_equity = None
         self._fifo_lot_ledger = None
         self._recent_activity = []
+        self._last_crypto_event_refresh_at = 0.0
+        self._crypto_event_state = {}
+        self.config = type("Config", (), {"redis_url": ""})()
 
     def __getattr__(self, name):
         # Called only when the normal attribute lookup fails.
@@ -219,6 +228,7 @@ class _FakeOpp:
     def __init__(self, strategy: str, symbol: str):
         self.strategy = strategy
         self.symbol = symbol
+        self.metadata = {}
 
 
 def test_moonshot_gate_flag_off_never_rejects(monkeypatch):

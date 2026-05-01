@@ -61,6 +61,54 @@ def compute_dynamic_sl(atr_pct: float) -> float:
     return max(DYNAMIC_SL_FLOOR, min(DYNAMIC_SL_CAP, atr_pct * DYNAMIC_SL_ATR_MULT))
 
 
+def calc_latest_rsi_values(series: pd.Series, period: int = 14) -> tuple[float, float]:
+    values = series.to_numpy(dtype=float, copy=False)
+    if len(values) <= period:
+        return float("nan"), float("nan")
+    deltas = np.diff(values)
+
+    def calculate(end: int) -> float:
+        if end < period:
+            return float("nan")
+        window = deltas[end - period:end]
+        gains = np.clip(window, 0.0, None).mean()
+        losses = (-np.clip(window, None, 0.0)).mean()
+        if losses == 0:
+            return float("nan")
+        relative_strength = gains / losses
+        return float(100 - (100 / (1 + relative_strength)))
+
+    current = calculate(len(deltas))
+    previous = calculate(len(deltas) - 1)
+    if np.isnan(previous):
+        previous = current
+    return current, previous
+
+
+def calc_latest_atr(frame: pd.DataFrame, period: int = 14) -> float:
+    if frame is None or len(frame) < period:
+        return float("nan")
+    high = frame["high"].to_numpy(dtype=float, copy=False)
+    low = frame["low"].to_numpy(dtype=float, copy=False)
+    close = frame["close"].to_numpy(dtype=float, copy=False)
+    previous_close = np.roll(close, 1)
+    previous_close[0] = np.nan
+    true_range = np.nanmax(
+        np.vstack(
+            (
+                high - low,
+                np.abs(high - previous_close),
+                np.abs(low - previous_close),
+            )
+        ),
+        axis=0,
+    )
+    latest = true_range[-period:]
+    if len(latest) < period or np.isnan(latest).any():
+        return float("nan")
+    return float(latest.mean())
+
+
 def calc_move_maturity(frame: pd.DataFrame, lookback: int) -> float:
     if frame is None or frame.empty or len(frame) < max(lookback, 4):
         return 0.0

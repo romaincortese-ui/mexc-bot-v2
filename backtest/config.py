@@ -67,7 +67,7 @@ class BacktestConfig:
     start: datetime
     end: datetime
     symbols: list[str]
-    strategies: list[str] = field(default_factory=lambda: ["SCALPER", "GRID", "TRINITY", "MOONSHOT", "REVERSAL"])
+    strategies: list[str] = field(default_factory=lambda: ["SCALPER", "GRID", "MOONSHOT", "REVERSAL"])
     scalper_symbols: list[str] = field(default_factory=list)
     grid_symbols: list[str] = field(default_factory=list)
     trinity_symbols: list[str] = field(default_factory=list)
@@ -105,7 +105,7 @@ class BacktestConfig:
     adaptive_min_offset: float = -6.0
     scalper_allocation_pct: float = 0.25
     moonshot_allocation_pct: float = 0.45
-    trinity_allocation_pct: float = 0.10
+    trinity_allocation_pct: float = 0.00
     grid_allocation_pct: float = 0.20
     scalper_budget_pct: float = 0.42
     moonshot_budget_pct: float = 0.048
@@ -138,6 +138,7 @@ class BacktestConfig:
     fear_greed_extreme_fear_threshold: int = 20
     fear_greed_extreme_fear_mult: float = 1.40
     fear_greed_bear_block_moonshot: bool = True
+    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER"])
 
     def symbols_for_strategy(self, strategy: str) -> list[str]:
         resolved = strategy.upper()
@@ -161,7 +162,7 @@ class BacktestConfig:
             start=start,
             end=end,
             symbols=env_csv("BACKTEST_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT"),
-            strategies=env_csv("MEXCBOT_STRATEGIES", "SCALPER,GRID,TRINITY,MOONSHOT,REVERSAL"),
+            strategies=env_csv("MEXCBOT_STRATEGIES", "SCALPER,GRID,MOONSHOT,REVERSAL"),
             scalper_symbols=env_csv(
                 "BACKTEST_SCALPER_SYMBOLS",
                 "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT",
@@ -208,7 +209,7 @@ class BacktestConfig:
             adaptive_min_offset=env_float("ADAPTIVE_MIN_OFFSET", -6.0),
             scalper_allocation_pct=env_float("SCALPER_ALLOCATION_PCT", 0.25),
             moonshot_allocation_pct=env_float("MOONSHOT_ALLOCATION_PCT", 0.45),
-            trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.10),
+            trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.00),
             grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.20),
             scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.42),
             moonshot_budget_pct=env_float("MOONSHOT_BUDGET_PCT", 0.048),
@@ -241,4 +242,5 @@ class BacktestConfig:
             fear_greed_extreme_fear_threshold=env_int("FG_EXTREME_FEAR_THRESHOLD", 20),
             fear_greed_extreme_fear_mult=env_float("FG_EXTREME_FEAR_MULT", 1.40),
             fear_greed_bear_block_moonshot=env_bool("FG_BEAR_BLOCK_MOONSHOT", True),
+            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER"),
         )

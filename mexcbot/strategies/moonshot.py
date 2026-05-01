@@ -12,9 +12,9 @@ import requests
 from mexcbot.config import LiveConfig
 from mexcbot.config import env_bool, env_float, env_int, env_str
 from mexcbot.exchange import MexcClient
-from mexcbot.indicators import calc_atr, calc_ema, calc_rsi
+from mexcbot.indicators import calc_ema
 from mexcbot.models import Opportunity
-from mexcbot.strategies.common import KELTNER_SCORE_BONUS, MATURITY_LOOKBACK, MATURITY_MOONSHOT_THRESHOLD, calc_move_maturity, calc_vol_zscore, classify_entry_signal, compute_dynamic_sl, keltner_breakout, maturity_penalty, maybe_apply_atr_stops_v2
+from mexcbot.strategies.common import KELTNER_SCORE_BONUS, MATURITY_LOOKBACK, MATURITY_MOONSHOT_THRESHOLD, calc_latest_atr, calc_latest_rsi_values, calc_move_maturity, calc_vol_zscore, classify_entry_signal, compute_dynamic_sl, keltner_breakout, maturity_penalty, maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -328,18 +328,16 @@ def score_moonshot_from_frame(
     if price_now <= 0:
         return None
 
-    rsi_series = calc_rsi(close)
-    current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else float("nan")
-    previous_rsi = float(rsi_series.iloc[-2]) if len(rsi_series.dropna()) >= 2 else current_rsi
-    if np.isnan(current_rsi):
-        return None
-    rsi_delta = current_rsi - previous_rsi if not np.isnan(previous_rsi) else 0.0
-
     avg_vol = float(volume.iloc[-20:-1].mean()) if len(volume) >= 21 else 0.0
     last_vol = float(volume.iloc[-1])
     vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
     if vol_ratio < params["min_vol_ratio"]:
         return None
+
+    current_rsi, previous_rsi = calc_latest_rsi_values(close)
+    if np.isnan(current_rsi):
+        return None
+    rsi_delta = current_rsi - previous_rsi if not np.isnan(previous_rsi) else 0.0
 
     rebound_context = (
         rsi_delta >= params["rebound_rsi_delta"]
@@ -384,7 +382,7 @@ def score_moonshot_from_frame(
     if score < min_allowed_score:
         return None
 
-    atr = calc_atr(frame, period=14)
+    atr = calc_latest_atr(frame, period=14)
     atr_pct = (atr / price_now) if not np.isnan(atr) and price_now > 0 else 0.012
     # Skip entries where realized volatility is too low to plausibly reach the
     # partial_tp trigger within the trend timeout.  See MOONSHOT_MIN_ATR_PCT

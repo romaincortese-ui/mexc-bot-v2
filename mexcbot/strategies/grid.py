@@ -9,9 +9,9 @@ from mexcbot.config import LiveConfig
 from mexcbot.config import env_float
 from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
-from mexcbot.indicators import calc_adx, calc_atr, calc_bollinger_bands, calc_rsi
+from mexcbot.indicators import calc_adx, calc_bollinger_bands
 from mexcbot.models import Opportunity
-from mexcbot.strategies.common import maybe_apply_atr_stops_v2
+from mexcbot.strategies.common import calc_latest_atr, calc_latest_rsi_values, maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -150,15 +150,6 @@ def score_grid_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: flo
     if width_percentile > params["bb_width_squeeze_pct"]:
         return None
 
-    adx = calc_adx(frame, period=14)
-    if np.isnan(adx) or adx > params["adx_max"]:
-        return None
-
-    rsi_series = calc_rsi(close)
-    current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else float("nan")
-    if np.isnan(current_rsi) or current_rsi < params["rsi_min"] or current_rsi > params["rsi_max"]:
-        return None
-
     bb_range = upper - lower
     if bb_range <= 0:
         return None
@@ -172,7 +163,15 @@ def score_grid_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: flo
     if vol_ratio < 0.3:
         return None
 
-    atr = calc_atr(frame, period=14)
+    adx = calc_adx(frame, period=14)
+    if np.isnan(adx) or adx > params["adx_max"]:
+        return None
+
+    current_rsi, _previous_rsi = calc_latest_rsi_values(close)
+    if np.isnan(current_rsi) or current_rsi < params["rsi_min"] or current_rsi > params["rsi_max"]:
+        return None
+
+    atr = calc_latest_atr(frame, period=14)
     atr_pct = (atr / price_now) if not np.isnan(atr) and price_now > 0 else 0.01
     safe_opens = opens.replace(0, np.nan)
     raw_candle_pct = ((close - opens).abs() / safe_opens).iloc[-10:].mean()

@@ -59,6 +59,18 @@ def test_backtest_config_parses_strategy_specific_symbol_universes(monkeypatch: 
     assert config.symbols_for_strategy("GRID") == ["BTCUSDT", "ETHUSDT"]
 
 
+def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MEXCBOT_STRATEGIES", raising=False)
+    monkeypatch.delenv("TRINITY_ALLOCATION_PCT", raising=False)
+    monkeypatch.delenv("MEXCBOT_BLOCKED_SIGNAL_LANES", raising=False)
+
+    config = BacktestConfig.from_env(now=datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
+
+    assert "TRINITY" not in config.strategies
+    assert config.trinity_allocation_pct == 0.0
+    assert config.blocked_signal_lanes == ["REVERSAL:DIVERGENCE_HAMMER"]
+
+
 def test_backtest_config_parses_synthetic_exchange_knobs(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("BACKTEST_SYNTHETIC_DEFENSIVE_UNLOCK_BARS", "2")
     monkeypatch.setenv("BACKTEST_SYNTHETIC_CLOSE_MAX_ATTEMPTS", "4")

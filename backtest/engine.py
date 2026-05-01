@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import pandas as pd
@@ -52,6 +52,13 @@ DEFENSIVE_EXIT_REASONS = {
     "EARLY_TIMEOUT",
 }
 
+def _signal_lane_key(strategy: object, entry_signal: object) -> str:
+    return f"{str(strategy or '').strip().upper()}:{str(entry_signal or '').strip().upper()}"
+
+
+def _normalise_signal_lane(value: object) -> str:
+    return str(value or "").strip().replace("/", ":").upper()
+
 
 class BacktestEngine:
     def __init__(
@@ -72,6 +79,7 @@ class BacktestEngine:
         self._dynamic_moonshot_budget: float | None = None
         self._moonshot_gate_open = True
         self._synthetic_fng: int = 50
+        self._score_cache: dict[tuple[str, int, float], Opportunity | None] = {}
         self._exchange_simulator = SyntheticExchangeSimulator(
             defensive_unlock_bars=self.config.synthetic_defensive_unlock_bars,
             close_max_attempts=self.config.synthetic_close_max_attempts,
@@ -686,12 +694,32 @@ class BacktestEngine:
         for symbol, frame in data.items():
             if symbol in excluded_symbols:
                 continue
-            window = frame[frame.index <= timestamp].tail(60)
+            window = self._window_until(frame, timestamp, 60)
             scored = self.scorer(symbol, window, self.config.score_threshold)
             if scored is not None:
                 candidates.append(scored)
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates
+
+    @staticmethod
+    def _window_until(frame: pd.DataFrame, timestamp: pd.Timestamp, length: int) -> pd.DataFrame:
+        end = int(frame.index.searchsorted(timestamp, side="right"))
+        if end <= 0:
+            return frame.iloc[0:0]
+        return frame.iloc[max(0, end - length):end]
+
+    @staticmethod
+    def _latest_bar_until(frame: pd.DataFrame, timestamp: pd.Timestamp) -> pd.Series | None:
+        end = int(frame.index.searchsorted(timestamp, side="right"))
+        if end <= 0:
+            return None
+        return frame.iloc[end - 1]
+
+    @staticmethod
+    def _clone_opportunity(opportunity: Opportunity | None) -> Opportunity | None:
+        if opportunity is None:
+            return None
+        return replace(opportunity, metadata=dict(opportunity.metadata))
 
     def _score_strategy_candidates(
         self,
@@ -708,8 +736,9 @@ class BacktestEngine:
             if dataset.symbol in excluded_symbols:
                 continue
             frame = data[dataset.key]
-            window = frame[frame.index <= timestamp].tail(dataset.window)
+            end_pos = int(frame.index.searchsorted(timestamp, side="right"))
             if dataset.strategy == "MOONSHOT":
+                window = frame.iloc[max(0, end_pos - dataset.window):end_pos] if end_pos > 0 else frame.iloc[0:0]
                 moonshot_datasets.append((dataset.symbol, dataset.key, window))
                 continue
             _, _, min_score, scorer = BACKTEST_STRATEGY_SPECS[dataset.strategy]
@@ -717,7 +746,13 @@ class BacktestEngine:
                 float(threshold_overrides.get(dataset.strategy, self._base_threshold(dataset.strategy))),
                 min_score,
             )
-            scored = scorer(dataset.symbol, window, effective_threshold)
+            cache_key = (dataset.key, end_pos, round(effective_threshold, 6))
+            if cache_key in self._score_cache:
+                scored = self._clone_opportunity(self._score_cache[cache_key])
+            else:
+                window = frame.iloc[max(0, end_pos - dataset.window):end_pos] if end_pos > 0 else frame.iloc[0:0]
+                scored = scorer(dataset.symbol, window, effective_threshold)
+                self._score_cache[cache_key] = self._clone_opportunity(scored)
             if scored is not None:
                 calibrated = apply_opportunity_calibration(
                     scored,
@@ -762,10 +797,10 @@ class BacktestEngine:
         for trade in open_trades:
             data_key = str(trade.get("data_key") or trade["symbol"])
             frame = data[data_key]
-            visible = frame[frame.index <= timestamp]
-            if visible.empty:
+            bar = self._latest_bar_until(frame, timestamp)
+            if bar is None:
                 continue
-            equity += trade["qty"] * float(visible.iloc[-1]["close"])
+            equity += trade["qty"] * float(bar["close"])
         return equity
 
     def _apply_scalper_correlation_filter(
@@ -784,7 +819,7 @@ class BacktestEngine:
             frame = data.get(data_key)
             if frame is None:
                 continue
-            visible = frame[frame.index <= timestamp].tail(25)
+            visible = self._window_until(frame, timestamp, 25)
             if not visible.empty:
                 open_frames.append(visible)
         if not open_frames:
@@ -800,7 +835,7 @@ class BacktestEngine:
             if frame is None:
                 filtered.append((candidate, data_key))
                 continue
-            visible = frame[frame.index <= timestamp].tail(25)
+            visible = self._window_until(frame, timestamp, 25)
             max_corr = max_correlation_to_open_positions(visible, open_frames)
             if max_corr is None:
                 filtered.append((candidate, data_key))
@@ -814,6 +849,17 @@ class BacktestEngine:
         if filtered or measurement_attempted:
             return filtered
         return candidates
+
+    def _apply_signal_lane_filter(self, candidates: list[tuple[Opportunity, str]]) -> list[tuple[Opportunity, str]]:
+        blocked = {_normalise_signal_lane(item) for item in self.config.blocked_signal_lanes}
+        blocked.discard("")
+        if not blocked:
+            return candidates
+        return [
+            (candidate, data_key)
+            for candidate, data_key in candidates
+            if _signal_lane_key(candidate.strategy, candidate.entry_signal) not in blocked
+        ]
 
     def run(self) -> tuple[list[dict], list[dict]]:
         strategy_mode = self.scorer is None
@@ -964,6 +1010,7 @@ class BacktestEngine:
             else:
                 scored_candidates = [(candidate, candidate.symbol) for candidate in self._score_candidates(data, timestamp, excluded_symbols)]
 
+            scored_candidates = self._apply_signal_lane_filter(scored_candidates)
             scored_candidates = self._apply_scalper_correlation_filter(scored_candidates, data, timestamp, open_trades)
 
             best_scalper_score = 0.0

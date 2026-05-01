@@ -23,6 +23,7 @@ class StubClient:
         self.sellable_qty = 10.0
         self.last_buy_error = ""
         self.buy_order_result = None
+        self.my_trades = []
         self.asset_balance = 0.0
         self.asset_balance_sequence = []
         self.order_status_by_id = {}
@@ -131,6 +132,9 @@ class StubClient:
 
     def get_order(self, symbol: str, order_id: str):
         return self.order_status_by_id.get(order_id, {"orderId": order_id, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"})
+
+    def get_my_trades(self, symbol: str, *, limit: int = 20):
+        return list(self.my_trades)
 
     def convert_dust(self):
         self.convert_dust_calls.append(True)
@@ -344,11 +348,39 @@ def test_open_and_close_emit_structured_trade_audit_lines(caplog):
     assert "[ENTRY]" in caplog.text
     assert "[EXIT]" in caplog.text
     assert '"symbol":"DOGEUSDT"' in caplog.text
+    assert '"tp_gross_usdt"' in caplog.text
+    assert '"tp_net_usdt"' in caplog.text
+    assert '"entry_fee_source":"order_response"' in caplog.text
     assert closed["gross_pnl_usdt"] == -5.0
     assert closed["net_pnl_usdt"] == -5.195
     assert closed["total_fees_usdt"] == 0.195
     assert closed["net_entry_price"] == 10.01
     assert closed["net_exit_price"] == 9.4905
+
+
+def test_open_position_reconciles_base_asset_entry_fee_from_my_trades():
+    client = StubClient()
+    client.buy_order_result = {"orderId": "BUY2", "status": "FILLED", "executedQty": "0", "cummulativeQuoteQty": "0"}
+    client.my_trades = [
+        {
+            "orderId": "BUY2",
+            "price": "10",
+            "qty": "10",
+            "quoteQty": "100",
+            "commission": "0.1",
+            "commissionAsset": "DOGE",
+        }
+    ]
+    runtime = LiveBotRuntime(_config(), client)
+
+    trade = runtime.open_position(_opportunity(), allocation_usdt=100.0)
+
+    assert trade is not None
+    assert trade.qty == 9.9
+    assert trade.entry_cost_usdt == 100.0
+    assert trade.entry_fee_usdt == 1.0
+    assert trade.metadata["entry_fee_cash_usdt"] == 0.0
+    assert trade.metadata["entry_fee_source"] == "myTrades"
 
 
 def test_build_status_message_refreshes_fear_and_greed(monkeypatch):
@@ -567,6 +599,20 @@ def test_symbol_performance_gate_blocks_symbol_after_loss_limit(caplog):
     assert "2 losses >= limit 2" in opportunity.metadata["symbol_gate_detail"]
     assert runtime.symbol_performance_paused_until["DOGEUSDT"] > time.time()
     assert "[SYMBOL_GATE] Blocked DOGEUSDT" in caplog.text
+
+
+def test_signal_lane_gate_blocks_configured_lane(caplog):
+    runtime = LiveBotRuntime(_config(blocked_signal_lanes=["REVERSAL:DIVERGENCE_HAMMER"]), StubClient())
+    opportunity = _opportunity(strategy="REVERSAL", symbol="CHIPUSDT")
+    opportunity.entry_signal = "DIVERGENCE_HAMMER"
+
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        allowed = runtime._passes_sprint_pretrade_gates(opportunity)
+
+    assert allowed is False
+    assert opportunity.metadata["pretrade_block_reason"] == "blocked_signal_lane"
+    assert opportunity.metadata["symbol_gate_detail"] == "REVERSAL:DIVERGENCE_HAMMER"
+    assert "[SIGNAL_GATE] Blocked CHIPUSDT REVERSAL:DIVERGENCE_HAMMER" in caplog.text
 
 
 def test_symbol_performance_gate_blocks_pf_below_floor_after_sample():
@@ -1723,6 +1769,45 @@ def test_reconcile_reconstructs_untracked_holding_into_open_trades():
     assert stats["untracked"] == 1
     assert any(trade.symbol == "TIAUSDT" for trade in runtime.open_trades)
     assert any("Reconciled holdings" in text for text, _mode in runtime.telegram.sent_messages)
+
+
+def test_boot_reconcile_reconstructs_untracked_holding_into_open_trades():
+    client = StubClient()
+    runtime = LiveBotRuntime(_config(), client)
+    runtime.telegram = StubTelegram()
+
+    def fake_private_get(path, params=None):
+        if path == "/api/v3/account":
+            return {"balances": [{"asset": "USDT", "free": "100", "locked": "0"}, {"asset": "TIA", "free": "26.1", "locked": "0"}]}
+        if path == "/api/v3/openOrders":
+            return []
+        raise AssertionError(path)
+
+    client.private_get = fake_private_get
+    client.public_get = lambda path, params=None: [{"symbol": "TIAUSDT", "price": "0.425"}] if path == "/api/v3/ticker/price" else []
+
+    runtime._run_boot_reconcile()
+
+    assert any(trade.symbol == "TIAUSDT" for trade in runtime.open_trades)
+    assert any("Reconciled holdings" in text for text, _mode in runtime.telegram.sent_messages)
+    assert any("Startup reconcile complete" in text for text, _mode in runtime.telegram.sent_messages)
+    assert any("Startup reconcile" in item for item in runtime._recent_activity)
+
+
+def test_boot_reconcile_skips_in_paper_mode():
+    client = StubClient()
+    runtime = LiveBotRuntime(_config(paper_trade=True), client)
+    runtime.telegram = StubTelegram()
+
+    def fake_private_get(path, params=None):
+        raise AssertionError("paper boot should not call private account endpoints")
+
+    client.private_get = fake_private_get
+
+    runtime._run_boot_reconcile()
+
+    assert runtime._last_reconcile_attempt_at == 0.0
+    assert runtime.telegram.sent_messages == []
 
 
 def test_reconcile_defers_during_account_endpoint_cooldown():

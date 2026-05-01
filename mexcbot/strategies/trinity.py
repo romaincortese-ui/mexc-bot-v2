@@ -9,9 +9,9 @@ from mexcbot.config import LiveConfig
 from mexcbot.config import env_float
 from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
-from mexcbot.indicators import calc_adx, calc_atr, calc_ema, calc_rsi
+from mexcbot.indicators import calc_adx, calc_ema
 from mexcbot.models import Opportunity
-from mexcbot.strategies.common import maybe_apply_atr_stops_v2
+from mexcbot.strategies.common import calc_latest_atr, calc_latest_rsi_values, maybe_apply_atr_stops_v2
 
 
 log = logging.getLogger(__name__)
@@ -76,12 +76,7 @@ def score_trinity_from_frame(
     ema21_now = float(ema21.iloc[-1])
     ema55_now = float(ema55.iloc[-1])
 
-    rsi_series = calc_rsi(close)
-    current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else float("nan")
-
-    adx = calc_adx(frame, period=14)
-    atr = calc_atr(frame, period=14)
-    atr_pct = (atr / price_now) if not np.isnan(atr) and price_now > 0 else 0.01
+    current_rsi, _previous_rsi = calc_latest_rsi_values(close)
 
     avg_vol = float(volume.iloc[-21:-1].mean()) if len(volume) >= 21 else 0.0
     curr_vol = float(volume.iloc[-1])
@@ -98,15 +93,11 @@ def score_trinity_from_frame(
     if np.isnan(current_rsi) or not (TRINITY_MIN_RSI <= current_rsi <= TRINITY_MAX_RSI):
         return None
 
-    # --- Gate 3: ADX rising / trending ---
-    if np.isnan(adx) or adx < TRINITY_MIN_ADX:
-        return None
-
-    # --- Gate 4: Volume confirmation ---
+    # --- Gate 3: Volume confirmation ---
     if vol_ratio < TRINITY_MIN_VOL_RATIO:
         return None
 
-    # --- Gate 5: Breakout above recent consolidation high ---
+    # --- Gate 4: Breakout above recent consolidation high ---
     lookback = min(TRINITY_BREAKOUT_LOOKBACK, len(high) - 4)
     consolidation_high = float(high.iloc[-(lookback + 1):-1].max())
     breakout_pct = (price_now - consolidation_high) / consolidation_high if consolidation_high > 0 else 0.0
@@ -114,10 +105,18 @@ def score_trinity_from_frame(
     if breakout_pct < TRINITY_MIN_BREAKOUT_PCT:
         return None
 
-    # --- Gate 6: At least 2 of last 3 candles are green ---
+    # --- Gate 5: At least 2 of last 3 candles are green ---
     greens = sum(1 for i in (-3, -2, -1) if float(close.iloc[i]) >= float(opens.iloc[i]))
     if greens < 2:
         return None
+
+    # --- Gate 6: ADX rising / trending ---
+    adx = calc_adx(frame, period=14)
+    if np.isnan(adx) or adx < TRINITY_MIN_ADX:
+        return None
+
+    atr = calc_latest_atr(frame, period=14)
+    atr_pct = (atr / price_now) if not np.isnan(atr) and price_now > 0 else 0.01
 
     # --- Signal classification ---
     ema9_prev = float(ema9.iloc[-2])
