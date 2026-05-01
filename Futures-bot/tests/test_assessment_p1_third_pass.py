@@ -179,6 +179,24 @@ def test_get_symbol_taker_fee_rate_returns_default_when_unknown(tmp_path):
     assert runtime.get_symbol_taker_fee_rate("UNKNOWN_USDT") == pytest.approx(0.0004)
 
 
+def test_default_symbol_profiles_apply_and_env_overrides_win(tmp_path, monkeypatch):
+    cfg = replace(_config(tmp_path), symbols=("BTC_USDT", "PEPE_USDT", "TAO_USDT"))
+
+    pepe = cfg.for_symbol("PEPE_USDT")
+    tao = cfg.for_symbol("TAO_USDT")
+
+    assert pepe.leverage_max == 25
+    assert pepe.consolidation_max_range_pct > cfg.consolidation_max_range_pct
+    assert tao.consolidation_max_range_pct > cfg.consolidation_max_range_pct
+
+    monkeypatch.setenv("FUTURES_PEPEUSDT_LEVERAGE_MAX", "18")
+    monkeypatch.setenv("FUTURES_PEPEUSDT_CONSOLIDATION_MAX_RANGE_PCT", "0.033")
+    overridden = cfg.for_symbol("PEPE_USDT")
+
+    assert overridden.leverage_max == 18
+    assert overridden.consolidation_max_range_pct == pytest.approx(0.033)
+
+
 # ---------------------------------------------------------------------------
 # Cost-budget gate per-symbol env override
 # ---------------------------------------------------------------------------

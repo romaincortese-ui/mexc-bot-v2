@@ -173,6 +173,52 @@ def test_side_specific_threshold_relief_is_directional(monkeypatch):
     assert signal.side == "SHORT"
 
 
+def test_event_catalyst_creates_long_candidate_with_market_penalty(monkeypatch):
+    monkeypatch.setenv("FUTURES_EVENT_CATALYST_ENABLED", "1")
+    monkeypatch.setenv("FUTURES_EVENT_CATALYST_MIN_MOVE_ATR", "0.10")
+    monkeypatch.setenv("FUTURES_EVENT_CATALYST_ADX_MIN", "0")
+    monkeypatch.setenv("FUTURES_EVENT_CATALYST_VOLUME_FLOOR", "0.50")
+    monkeypatch.setenv("FUTURES_EVENT_CATALYST_RSI_15_LONG_MAX", "100")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [100000 + math.sin(idx / 7.0) * 80 - idx * 1.2 for idx in range(520)]
+    anchor = base[-10]
+    for offset in range(9):
+        base[-9 + offset] = anchor * (1.0 + 0.0008 * (offset + 1))
+    frame = _frame_from_prices(base)
+    cfg = replace(_config(), min_confidence_score=52.0, trend_24h_floor=0.08, trend_6h_floor=0.04)
+
+    signal = score_btc_futures_setup(
+        frame,
+        cfg,
+        event_bias_score=0.95,
+        event_max_severity=1.0,
+        event_count=1,
+    )
+
+    assert signal is not None
+    assert signal.side == "LONG"
+    assert signal.entry_signal == "EVENT_CATALYST_LONG"
+    assert signal.metadata["event_catalyst"] == 1.0
+    assert signal.metadata["market_gate_penalty"] > 0
+
+
+def test_signal_includes_shadow_net_rr_metadata_by_default(monkeypatch):
+    monkeypatch.setenv("FUTURES_COST_BUDGET_MODE", "shadow")
+    monkeypatch.setenv("USE_COST_BUDGET_RR", "0")
+    base = [90000 + idx * 12 + math.sin(idx / 5.0) * 38 + math.cos(idx / 11.0) * 22 + ((idx % 5) - 2) * 14 for idx in range(520)]
+    base[-20:-1] = [base[-21] + ((idx % 4) - 1) * 15 for idx in range(19)]
+    base[-1] = max(base[-20:-1]) + 220
+    frame = _frame_from_prices(base)
+
+    signal = score_btc_futures_setup(frame, _config())
+
+    assert signal is not None
+    assert signal.metadata["cost_budget_mode"] == "shadow"
+    assert signal.metadata["gross_rr"] > 0
+    assert signal.metadata["net_rr"] > 0
+    assert "fee_bps" in signal.metadata
+
+
 def test_impulse_rejection_diagnostic_contains_actionable_fields():
     frame = _frame_from_prices([100000 + math.sin(idx / 6.0) * 35 for idx in range(520)])
 

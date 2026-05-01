@@ -15,6 +15,52 @@ load_dotenv()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+DEFAULT_SYMBOL_PARAMETER_PROFILES: dict[str, dict[str, float | int]] = {
+    # BTC remains the reference profile; values intentionally match the global defaults.
+    "BTC_USDT": {},
+    "ETH_USDT": {
+        "trend_24h_floor": 0.008,
+        "trend_6h_floor": 0.0025,
+        "consolidation_max_range_pct": 0.020,
+        "adx_floor": 17.0,
+    },
+    "SOL_USDT": {
+        "trend_24h_floor": 0.010,
+        "trend_6h_floor": 0.003,
+        "consolidation_max_range_pct": 0.025,
+        "adx_floor": 17.0,
+    },
+    "BNB_USDT": {
+        "trend_24h_floor": 0.007,
+        "trend_6h_floor": 0.002,
+        "consolidation_max_range_pct": 0.016,
+        "adx_floor": 17.0,
+    },
+    "PEPE_USDT": {
+        "min_confidence_score": 60.0,
+        "trend_24h_floor": 0.018,
+        "trend_6h_floor": 0.0045,
+        "consolidation_max_range_pct": 0.045,
+        "consolidation_atr_mult": 2.20,
+        "volume_ratio_floor": 1.10,
+        "leverage_max": 25,
+        "min_reward_risk": 1.25,
+        "funding_rate_abs_max": 0.00025,
+    },
+    "TAO_USDT": {
+        "min_confidence_score": 57.0,
+        "trend_24h_floor": 0.014,
+        "trend_6h_floor": 0.002,
+        "consolidation_max_range_pct": 0.040,
+        "consolidation_atr_mult": 2.00,
+        "volume_ratio_floor": 1.05,
+        "leverage_max": 25,
+        "min_reward_risk": 1.20,
+        "funding_rate_abs_max": 0.00022,
+    },
+}
+
+
 def env_str(name: str, default: str = "") -> str:
     value = os.getenv(name)
     return default if value is None else value.strip()
@@ -332,40 +378,56 @@ class FuturesConfig:
 
         Looks up ``FUTURES_<SYMBOL>_<PARAM>`` env vars (symbol with non-alphanumerics
         stripped) for each tunable strategy / risk parameter. Missing overrides fall
-        back to the values loaded on the base config.
+        back to the default per-symbol profile first, then the base config.
         """
 
         sym = symbol.upper()
-        if sym == self.symbol and not _has_symbol_overrides(sym):
+        profile = _default_symbol_profile(sym)
+        if sym == self.symbol and not _has_symbol_overrides(sym) and not profile:
             return self
-        leverage_max = env_int_for_symbol(sym, "LEVERAGE_MAX", self.leverage_max)
-        leverage_min = min(env_int_for_symbol(sym, "LEVERAGE_MIN", self.leverage_min), leverage_max)
+
+        def prof_float(field_name: str, fallback: float) -> float:
+            raw = profile.get(field_name)
+            try:
+                return float(raw) if raw is not None else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        def prof_int(field_name: str, fallback: int) -> int:
+            raw = profile.get(field_name)
+            try:
+                return int(raw) if raw is not None else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        leverage_max = env_int_for_symbol(sym, "LEVERAGE_MAX", prof_int("leverage_max", self.leverage_max))
+        leverage_min = min(env_int_for_symbol(sym, "LEVERAGE_MIN", prof_int("leverage_min", self.leverage_min)), leverage_max)
         return dataclasses.replace(
             self,
             symbol=sym,
             leverage_min=leverage_min,
             leverage_max=leverage_max,
-            min_confidence_score=env_float_for_symbol(sym, "SCORE_THRESHOLD", self.min_confidence_score),
-            hard_loss_cap_pct=env_float_for_symbol(sym, "HARD_LOSS_CAP_PCT", self.hard_loss_cap_pct),
-            adx_floor=env_float_for_symbol(sym, "ADX_FLOOR", self.adx_floor),
-            trend_24h_floor=env_float_for_symbol(sym, "TREND_24H_FLOOR", self.trend_24h_floor),
-            trend_6h_floor=env_float_for_symbol(sym, "TREND_6H_FLOOR", self.trend_6h_floor),
-            breakout_buffer_atr=env_float_for_symbol(sym, "BREAKOUT_BUFFER_ATR", self.breakout_buffer_atr),
-            consolidation_window_bars=env_int_for_symbol(sym, "CONSOLIDATION_WINDOW_BARS", self.consolidation_window_bars),
-            consolidation_max_range_pct=env_float_for_symbol(sym, "CONSOLIDATION_MAX_RANGE_PCT", self.consolidation_max_range_pct),
-            consolidation_atr_mult=env_float_for_symbol(sym, "CONSOLIDATION_ATR_MULT", self.consolidation_atr_mult),
-            volume_ratio_floor=env_float_for_symbol(sym, "VOLUME_RATIO_FLOOR", self.volume_ratio_floor),
-            tp_atr_mult=env_float_for_symbol(sym, "TP_ATR_MULT", self.tp_atr_mult),
-            tp_range_mult=env_float_for_symbol(sym, "TP_RANGE_MULT", self.tp_range_mult),
-            tp_floor_pct=env_float_for_symbol(sym, "TP_FLOOR_PCT", self.tp_floor_pct),
-            sl_buffer_atr_mult=env_float_for_symbol(sym, "SL_BUFFER_ATR_MULT", self.sl_buffer_atr_mult),
-            sl_trend_atr_mult=env_float_for_symbol(sym, "SL_TREND_ATR_MULT", self.sl_trend_atr_mult),
-            min_reward_risk=env_float_for_symbol(sym, "MIN_REWARD_RISK", self.min_reward_risk),
-            early_exit_tp_progress=env_float_for_symbol(sym, "EARLY_EXIT_TP_PROGRESS", self.early_exit_tp_progress),
-            early_exit_min_profit_pct=env_float_for_symbol(sym, "EARLY_EXIT_MIN_PROFIT_PCT", self.early_exit_min_profit_pct),
-            early_exit_buffer_pct=env_float_for_symbol(sym, "EARLY_EXIT_BUFFER_PCT", self.early_exit_buffer_pct),
+            min_confidence_score=env_float_for_symbol(sym, "SCORE_THRESHOLD", prof_float("min_confidence_score", self.min_confidence_score)),
+            hard_loss_cap_pct=env_float_for_symbol(sym, "HARD_LOSS_CAP_PCT", prof_float("hard_loss_cap_pct", self.hard_loss_cap_pct)),
+            adx_floor=env_float_for_symbol(sym, "ADX_FLOOR", prof_float("adx_floor", self.adx_floor)),
+            trend_24h_floor=env_float_for_symbol(sym, "TREND_24H_FLOOR", prof_float("trend_24h_floor", self.trend_24h_floor)),
+            trend_6h_floor=env_float_for_symbol(sym, "TREND_6H_FLOOR", prof_float("trend_6h_floor", self.trend_6h_floor)),
+            breakout_buffer_atr=env_float_for_symbol(sym, "BREAKOUT_BUFFER_ATR", prof_float("breakout_buffer_atr", self.breakout_buffer_atr)),
+            consolidation_window_bars=env_int_for_symbol(sym, "CONSOLIDATION_WINDOW_BARS", prof_int("consolidation_window_bars", self.consolidation_window_bars)),
+            consolidation_max_range_pct=env_float_for_symbol(sym, "CONSOLIDATION_MAX_RANGE_PCT", prof_float("consolidation_max_range_pct", self.consolidation_max_range_pct)),
+            consolidation_atr_mult=env_float_for_symbol(sym, "CONSOLIDATION_ATR_MULT", prof_float("consolidation_atr_mult", self.consolidation_atr_mult)),
+            volume_ratio_floor=env_float_for_symbol(sym, "VOLUME_RATIO_FLOOR", prof_float("volume_ratio_floor", self.volume_ratio_floor)),
+            tp_atr_mult=env_float_for_symbol(sym, "TP_ATR_MULT", prof_float("tp_atr_mult", self.tp_atr_mult)),
+            tp_range_mult=env_float_for_symbol(sym, "TP_RANGE_MULT", prof_float("tp_range_mult", self.tp_range_mult)),
+            tp_floor_pct=env_float_for_symbol(sym, "TP_FLOOR_PCT", prof_float("tp_floor_pct", self.tp_floor_pct)),
+            sl_buffer_atr_mult=env_float_for_symbol(sym, "SL_BUFFER_ATR_MULT", prof_float("sl_buffer_atr_mult", self.sl_buffer_atr_mult)),
+            sl_trend_atr_mult=env_float_for_symbol(sym, "SL_TREND_ATR_MULT", prof_float("sl_trend_atr_mult", self.sl_trend_atr_mult)),
+            min_reward_risk=env_float_for_symbol(sym, "MIN_REWARD_RISK", prof_float("min_reward_risk", self.min_reward_risk)),
+            early_exit_tp_progress=env_float_for_symbol(sym, "EARLY_EXIT_TP_PROGRESS", prof_float("early_exit_tp_progress", self.early_exit_tp_progress)),
+            early_exit_min_profit_pct=env_float_for_symbol(sym, "EARLY_EXIT_MIN_PROFIT_PCT", prof_float("early_exit_min_profit_pct", self.early_exit_min_profit_pct)),
+            early_exit_buffer_pct=env_float_for_symbol(sym, "EARLY_EXIT_BUFFER_PCT", prof_float("early_exit_buffer_pct", self.early_exit_buffer_pct)),
             session_hours_utc=env_str_for_symbol(sym, "SESSION_HOURS_UTC", self.session_hours_utc),
-            funding_rate_abs_max=env_float_for_symbol(sym, "FUNDING_RATE_ABS_MAX", self.funding_rate_abs_max),
+            funding_rate_abs_max=env_float_for_symbol(sym, "FUNDING_RATE_ABS_MAX", prof_float("funding_rate_abs_max", self.funding_rate_abs_max)),
         )
 
 
@@ -402,6 +464,12 @@ def _has_symbol_overrides(symbol: str) -> bool:
         if os.getenv(f"{prefix}_{suffix}"):
             return True
     return False
+
+
+def _default_symbol_profile(symbol: str) -> dict[str, float | int]:
+    if not env_bool("FUTURES_SYMBOL_PROFILES_ENABLED", True):
+        return {}
+    return dict(DEFAULT_SYMBOL_PARAMETER_PROFILES.get(symbol.upper(), {}))
 
 
 def detect_misnamed_symbol_env_keys(symbols: tuple[str, ...]) -> list[tuple[str, str]]:

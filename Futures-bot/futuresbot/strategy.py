@@ -36,6 +36,76 @@ def _side_threshold(config: "StrategyConfig", side: str, offset: float) -> float
     return max(1.0, float(config.min_confidence_score) + env_offset + float(offset or 0.0))
 
 
+def _cost_budget_mode() -> str:
+    raw = os.environ.get("FUTURES_COST_BUDGET_MODE", "shadow")
+    mode = str(raw or "shadow").strip().lower()
+    if mode in {"0", "false", "no", "off", "disabled"}:
+        return "off"
+    if mode in {"1", "true", "yes", "on", "enforce", "binding", "live"}:
+        return "enforce"
+    return "shadow"
+
+
+def _cost_budget_enforced() -> bool:
+    legacy = str(os.environ.get("USE_COST_BUDGET_RR", "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return legacy or _cost_budget_mode() == "enforce"
+
+
+def _cost_budget_projection(
+    *,
+    entry_price: float,
+    tp_price: float,
+    sl_price: float,
+    leverage: int,
+    symbol: str | None = None,
+) -> dict[str, float | str] | None:
+    if _cost_budget_mode() == "off" and not _cost_budget_enforced():
+        return None
+    try:
+        from futuresbot.cost_budget import compute_cost_bps
+
+        if entry_price <= 0:
+            return None
+        tp_distance_pct = abs(tp_price - entry_price) / entry_price
+        sl_distance_pct = abs(entry_price - sl_price) / entry_price
+        if tp_distance_pct <= 0 or sl_distance_pct <= 0:
+            return None
+        hold_hours = _env_float("COST_BUDGET_HOLD_HOURS", 4.0)
+        funding_rate = _env_float("COST_BUDGET_FUNDING_RATE_8H", 0.0001)
+        taker_fee = _env_float("COST_BUDGET_TAKER_FEE_RATE", 0.0004)
+        if symbol:
+            normalized = "".join(ch if ch.isalnum() else "_" for ch in symbol.upper())
+            override = os.environ.get(f"COST_BUDGET_TAKER_FEE_RATE_{normalized}")
+            if override is not None:
+                try:
+                    taker_fee = float(override)
+                except (TypeError, ValueError):
+                    pass
+        cost = compute_cost_bps(
+            leverage=leverage,
+            hold_hours=hold_hours,
+            funding_rate_8h=funding_rate,
+            taker_fee_rate=taker_fee,
+        )
+        cost_pct = max(0.0, cost.total_bps) / 10_000.0
+        gross_rr = tp_distance_pct / sl_distance_pct if sl_distance_pct > 0 else 0.0
+        net_rr = tp_distance_pct / (sl_distance_pct + cost_pct) if sl_distance_pct + cost_pct > 0 else 0.0
+        min_rr = _env_float("MIN_NET_RR", 1.8)
+        return {
+            "cost_budget_mode": "enforce" if _cost_budget_enforced() else _cost_budget_mode(),
+            "gross_rr": round(gross_rr, 4),
+            "net_rr": round(net_rr, 4),
+            "min_net_rr": round(max(0.0, min_rr), 4),
+            "fee_bps": round(cost.fees_bps, 4),
+            "slippage_bps": round(cost.slippage_bps, 4),
+            "funding_bps": round(cost.funding_bps, 4),
+            "total_cost_bps": round(cost.total_bps, 4),
+            "cost_budget_pass": 1.0 if net_rr >= max(0.0, min_rr) else 0.0,
+        }
+    except Exception:
+        return None
+
+
 class StrategyConfig(Protocol):
     symbol: str
     min_confidence_score: float
@@ -136,45 +206,17 @@ def _passes_cost_budget_gate(
     behaviour) so live trading is not interrupted by a Sprint 1 plumbing bug.
     """
 
-    if os.environ.get("USE_COST_BUDGET_RR", "0").strip() not in {"1", "true", "yes", "y", "on"}:
+    if not _cost_budget_enforced():
         return True
     try:
-        from futuresbot.cost_budget import compute_cost_bps, passes_cost_adjusted_rr
-
-        if entry_price <= 0:
-            return True
-        tp_distance_pct = abs(tp_price - entry_price) / entry_price
-        sl_distance_pct = abs(entry_price - sl_price) / entry_price
-        hold_hours = _env_float("COST_BUDGET_HOLD_HOURS", 4.0)
-        funding_rate = _env_float("COST_BUDGET_FUNDING_RATE_8H", 0.0001)
-        # P1 (third assessment) §5 #1+#2 — prefer the per-symbol taker fee
-        # resolved at boot from the venue contract-detail endpoint
-        # (``COST_BUDGET_TAKER_FEE_RATE_<NORMALIZED_SYMBOL>``) over the
-        # global env default. Falls back to the global default when the
-        # runtime hasn't populated a per-symbol entry (e.g. tests or first
-        # boot before ``_emit_contract_specs`` runs).
-        taker_fee = _env_float("COST_BUDGET_TAKER_FEE_RATE", 0.0004)
-        if symbol:
-            normalized = "".join(ch if ch.isalnum() else "_" for ch in symbol.upper())
-            override = os.environ.get(f"COST_BUDGET_TAKER_FEE_RATE_{normalized}")
-            if override is not None:
-                try:
-                    taker_fee = float(override)
-                except (TypeError, ValueError):
-                    pass
-        cost = compute_cost_bps(
+        projection = _cost_budget_projection(
+            entry_price=entry_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
             leverage=leverage,
-            hold_hours=hold_hours,
-            funding_rate_8h=funding_rate,
-            taker_fee_rate=taker_fee,
+            symbol=symbol,
         )
-        min_rr = _env_float("MIN_NET_RR", 1.8)
-        return passes_cost_adjusted_rr(
-            tp_distance_pct=tp_distance_pct,
-            sl_distance_pct=sl_distance_pct,
-            cost_bps=cost.total_bps,
-            min_rr=min_rr,
-        )
+        return True if projection is None else float(projection.get("cost_budget_pass", 1.0)) >= 1.0
     except Exception:
         return True
 
@@ -203,6 +245,13 @@ def _build_signal(
     )
     if leverage is None:
         return None
+    cost_projection = _cost_budget_projection(
+        entry_price=entry_price,
+        tp_price=tp_price,
+        sl_price=sl_price,
+        leverage=leverage,
+        symbol=getattr(config, "symbol", None),
+    )
     if not _passes_cost_budget_gate(
         entry_price=entry_price,
         tp_price=tp_price,
@@ -226,6 +275,7 @@ def _build_signal(
             "sl_distance_pct": round(sl_distance_pct, 6),
             "tp_distance_pct": round(abs(tp_price - entry_price) / entry_price if entry_price > 0 else 0.0, 6),
             "hourly_exit_progress": config.early_exit_tp_progress,
+            **(cost_projection or {}),
         },
     )
 
@@ -236,6 +286,9 @@ def score_btc_futures_setup(
     *,
     long_threshold_offset: float = 0.0,
     short_threshold_offset: float = 0.0,
+    event_bias_score: float = 0.0,
+    event_max_severity: float = 0.0,
+    event_count: int = 0,
 ) -> FuturesSignal | None:
     if frame_15m is None or len(frame_15m) < 220:
         return None
@@ -373,6 +426,63 @@ def score_btc_futures_setup(
     impulse_ema_extension = abs(current_price - current_ema20) / current_atr_1h if current_atr_1h > 0 else 999.0
     impulse_volume_ok = volume_ratio >= impulse_volume_floor
     impulse_body = abs(float(close_15.iloc[-1]) - float(open_15.iloc[-1])) / current_atr_15 if current_atr_15 > 0 else 0.0
+    long_stack = current_ema20 > current_ema50 > current_ema100
+    short_stack = current_ema20 < current_ema50 < current_ema100
+
+    def directional_market_penalty(side: str) -> float:
+        penalty = 0.0
+        if consolidation_range_pct > consolidation_cap:
+            over = (consolidation_range_pct - consolidation_cap) / max(consolidation_cap, 1e-9)
+            penalty += min(8.0, max(0.0, over * 4.0))
+        if side == "LONG":
+            if trend_24h < config.trend_24h_floor:
+                miss = (config.trend_24h_floor - trend_24h) / max(config.trend_24h_floor, 1e-9)
+                penalty += min(8.0, max(0.0, miss * 3.0))
+            if trend_6h < config.trend_6h_floor:
+                miss = (config.trend_6h_floor - trend_6h) / max(config.trend_6h_floor, 1e-9)
+                penalty += min(6.0, max(0.0, miss * 2.5))
+            if not long_stack:
+                penalty += 5.0
+            if ema_slope <= 0:
+                penalty += 3.0
+        else:
+            if trend_24h > -config.trend_24h_floor:
+                miss = (config.trend_24h_floor + trend_24h) / max(config.trend_24h_floor, 1e-9)
+                penalty += min(8.0, max(0.0, miss * 3.0))
+            if trend_6h > -config.trend_6h_floor:
+                miss = (config.trend_6h_floor + trend_6h) / max(config.trend_6h_floor, 1e-9)
+                penalty += min(6.0, max(0.0, miss * 2.5))
+            if not short_stack:
+                penalty += 5.0
+            if ema_slope >= 0:
+                penalty += 3.0
+        return round(penalty, 4)
+
+    impulse_soft_market_gates = _env_bool("FUTURES_IMPULSE_SOFT_MARKET_GATES", True)
+    impulse_long_market_ok = (trend_6h >= impulse_trend_6h_min or ema_slope > 0) and current_price > current_ema20
+    impulse_short_market_ok = (trend_6h <= -impulse_trend_6h_min or ema_slope < 0) and current_price < current_ema20
+    impulse_long_penalty = directional_market_penalty("LONG") if impulse_soft_market_gates else 0.0
+    impulse_short_penalty = directional_market_penalty("SHORT") if impulse_soft_market_gates else 0.0
+
+    event_catalyst_enabled = _env_bool("FUTURES_EVENT_CATALYST_ENABLED", True)
+    event_min_abs_bias = _env_float("FUTURES_EVENT_CATALYST_MIN_ABS_BIAS", 0.55)
+    event_min_severity = _env_float("FUTURES_EVENT_CATALYST_MIN_SEVERITY", 0.70)
+    event_min_move_pct = _env_float("FUTURES_EVENT_CATALYST_MIN_MOVE_PCT", 0.002)
+    event_min_move_atr = _env_float("FUTURES_EVENT_CATALYST_MIN_MOVE_ATR", 0.35)
+    event_volume_floor = _env_float("FUTURES_EVENT_CATALYST_VOLUME_FLOOR", 0.95)
+    event_adx_min = _env_float("FUTURES_EVENT_CATALYST_ADX_MIN", 10.0)
+    event_max_ema_extension_atr = _env_float("FUTURES_EVENT_CATALYST_MAX_EMA_EXTENSION_ATR", 3.75)
+    event_rsi_15_long_min = _env_float("FUTURES_EVENT_CATALYST_RSI_15_LONG_MIN", 47.0)
+    event_rsi_15_long_max = _env_float("FUTURES_EVENT_CATALYST_RSI_15_LONG_MAX", 86.0)
+    event_rsi_15_short_max = _env_float("FUTURES_EVENT_CATALYST_RSI_15_SHORT_MAX", 53.0)
+    event_rsi_15_short_min = _env_float("FUTURES_EVENT_CATALYST_RSI_15_SHORT_MIN", 14.0)
+    event_abs_bias = abs(float(event_bias_score or 0.0))
+    event_active = (
+        event_catalyst_enabled
+        and int(event_count or 0) > 0
+        and event_abs_bias >= event_min_abs_bias
+        and float(event_max_severity or 0.0) >= event_min_severity
+    )
 
     range_expansion_enabled = _env_bool("FUTURES_RANGE_EXPANSION_ENABLED", True)
     range_expansion_symbol_ok = _symbol_enabled(
@@ -402,8 +512,7 @@ def score_btc_futures_setup(
         and current_rsi_1h >= impulse_rsi_1h_long_min
         and current_rsi_15 >= impulse_rsi_15_long_min
         and current_rsi_15 <= impulse_rsi_15_long_max
-        and (trend_6h >= impulse_trend_6h_min or ema_slope > 0)
-        and current_price > current_ema20
+        and (impulse_soft_market_gates or impulse_long_market_ok)
         and impulse_close_near_high
         and impulse_ema_extension <= impulse_max_ema_extension_atr
     )
@@ -416,8 +525,7 @@ def score_btc_futures_setup(
         and current_rsi_1h <= impulse_rsi_1h_short_max
         and current_rsi_15 <= impulse_rsi_15_short_max
         and current_rsi_15 >= impulse_rsi_15_short_min
-        and (trend_6h <= -impulse_trend_6h_min or ema_slope < 0)
-        and current_price < current_ema20
+        and (impulse_soft_market_gates or impulse_short_market_ok)
         and impulse_close_near_low
         and impulse_ema_extension <= impulse_max_ema_extension_atr
     )
@@ -451,13 +559,37 @@ def score_btc_futures_setup(
         and impulse_close_near_low
         and impulse_ema_extension <= range_max_ema_extension_atr
     )
+    event_catalyst_long_ok = (
+        event_active
+        and event_bias_score > 0
+        and current_adx >= event_adx_min
+        and volume_ratio >= event_volume_floor
+        and impulse_move_pct >= event_min_move_pct
+        and impulse_move_atr >= event_min_move_atr
+        and current_rsi_15 >= event_rsi_15_long_min
+        and current_rsi_15 <= event_rsi_15_long_max
+        and (impulse_close_near_high or current_price >= current_ema20 or ema_slope > 0)
+        and impulse_ema_extension <= event_max_ema_extension_atr
+    )
+    event_catalyst_short_ok = (
+        event_active
+        and event_bias_score < 0
+        and current_adx >= event_adx_min
+        and volume_ratio >= event_volume_floor
+        and impulse_move_pct <= -event_min_move_pct
+        and impulse_move_atr >= event_min_move_atr
+        and current_rsi_15 <= event_rsi_15_short_max
+        and current_rsi_15 >= event_rsi_15_short_min
+        and (impulse_close_near_low or current_price <= current_ema20 or ema_slope < 0)
+        and impulse_ema_extension <= event_max_ema_extension_atr
+    )
 
     long_ok = (
         consolidation_ok
         and current_adx >= config.adx_floor
         and trend_24h >= config.trend_24h_floor
         and trend_6h >= config.trend_6h_floor
-        and current_ema20 > current_ema50 > current_ema100
+        and long_stack
         and ema_slope > 0
         and current_rsi_1h >= rsi_1h_long_min
         and current_rsi_15 >= rsi_15_long_min
@@ -469,7 +601,7 @@ def score_btc_futures_setup(
         and current_adx >= config.adx_floor
         and trend_24h <= -config.trend_24h_floor
         and trend_6h <= -config.trend_6h_floor
-        and current_ema20 < current_ema50 < current_ema100
+        and short_stack
         and ema_slope < 0
         and current_rsi_1h <= rsi_1h_short_max
         and current_rsi_15 <= rsi_15_short_max
@@ -514,6 +646,7 @@ def score_btc_futures_setup(
         long_score += min(6.0, max(0.0, (current_adx - impulse_adx_min) * 0.8))
         long_score += 4.0 if trend_6h > 0 else 0.0
         long_score += 3.0 if current_ema20 > current_ema50 or ema_slope > 0 else 0.0
+        long_score -= impulse_long_penalty
     elif range_expansion_long_ok:
         long_score += min(16.0, max(0.0, trend_24h * 230.0))
         long_score += min(10.0, max(0.0, impulse_move_atr * 2.0))
@@ -521,6 +654,15 @@ def score_btc_futures_setup(
         long_score += min(7.0, max(0.0, (current_adx - range_adx_min) * 0.7))
         long_score += min(6.0, max(0.0, consolidation_range_pct * 130.0))
         long_score += 3.0 if ema_slope > 0 else 0.0
+    elif event_catalyst_long_ok:
+        event_penalty = directional_market_penalty("LONG")
+        long_score += min(15.0, max(0.0, event_abs_bias * 12.0 + float(event_max_severity or 0.0) * 4.0))
+        long_score += min(10.0, max(0.0, impulse_move_atr * 2.0))
+        long_score += min(8.0, max(0.0, (volume_ratio - event_volume_floor) * 8.0))
+        long_score += min(6.0, max(0.0, (current_adx - event_adx_min) * 0.7))
+        long_score += 4.0 if impulse_close_near_high else 0.0
+        long_score += 3.0 if trend_6h > 0 or ema_slope > 0 else 0.0
+        long_score -= event_penalty
 
     short_score = 40.0
     if short_ok:
@@ -545,6 +687,7 @@ def score_btc_futures_setup(
         short_score += min(6.0, max(0.0, (current_adx - impulse_adx_min) * 0.8))
         short_score += 4.0 if trend_6h < 0 else 0.0
         short_score += 3.0 if current_ema20 < current_ema50 or ema_slope < 0 else 0.0
+        short_score -= impulse_short_penalty
     elif range_expansion_short_ok:
         short_score += min(16.0, max(0.0, abs(trend_24h) * 230.0))
         short_score += min(10.0, max(0.0, impulse_move_atr * 2.0))
@@ -552,6 +695,15 @@ def score_btc_futures_setup(
         short_score += min(7.0, max(0.0, (current_adx - range_adx_min) * 0.7))
         short_score += min(6.0, max(0.0, consolidation_range_pct * 130.0))
         short_score += 3.0 if ema_slope < 0 else 0.0
+    elif event_catalyst_short_ok:
+        event_penalty = directional_market_penalty("SHORT")
+        short_score += min(15.0, max(0.0, event_abs_bias * 12.0 + float(event_max_severity or 0.0) * 4.0))
+        short_score += min(10.0, max(0.0, impulse_move_atr * 2.0))
+        short_score += min(8.0, max(0.0, (volume_ratio - event_volume_floor) * 8.0))
+        short_score += min(6.0, max(0.0, (current_adx - event_adx_min) * 0.7))
+        short_score += 4.0 if impulse_close_near_low else 0.0
+        short_score += 3.0 if trend_6h < 0 or ema_slope < 0 else 0.0
+        short_score -= event_penalty
 
     long_threshold = _side_threshold(config, "LONG", long_threshold_offset)
     short_threshold = _side_threshold(config, "SHORT", short_threshold_offset)
@@ -564,8 +716,11 @@ def score_btc_futures_setup(
         if side == "LONG":
             impulse_path = impulse_long_ok and not (long_ok or continuation_long_ok)
             range_expansion_path = range_expansion_long_ok and not (long_ok or continuation_long_ok or impulse_long_ok)
-            if impulse_path or range_expansion_path:
-                leverage_max = max(1, int(_env_float("FUTURES_IMPULSE_LEVERAGE_MAX", min(float(config.leverage_max), 8.0))))
+            event_path = event_catalyst_long_ok and not (long_ok or continuation_long_ok or impulse_long_ok or range_expansion_long_ok)
+            if impulse_path or range_expansion_path or event_path:
+                default_cap = min(float(config.leverage_max), 8.0)
+                leverage_var = "FUTURES_EVENT_CATALYST_LEVERAGE_MAX" if event_path else "FUTURES_IMPULSE_LEVERAGE_MAX"
+                leverage_max = max(1, int(_env_float(leverage_var, _env_float("FUTURES_IMPULSE_LEVERAGE_MAX", default_cap))))
                 leverage_min = min(config.leverage_min, leverage_max)
                 tp_move = max(_env_float("FUTURES_IMPULSE_TP_ATR_MULT", 5.0) * current_atr_15, _env_float("FUTURES_IMPULSE_TP_FLOOR_PCT", 0.012) * current_price)
                 sl_price = max(
@@ -593,7 +748,8 @@ def score_btc_futures_setup(
                     else "PRESSURE_BREAK_LONG" if long_ok and pressure_long
                     else "TREND_CONTINUATION_LONG" if continuation_long_ok
                     else "IMPULSE_EVENT_CONTINUATION_LONG" if impulse_path
-                    else "RANGE_EXPANSION_CONTINUATION_LONG"
+                    else "RANGE_EXPANSION_CONTINUATION_LONG" if range_expansion_path
+                    else "EVENT_CATALYST_LONG"
                 ),
                 config=config,
                 leverage_min_override=leverage_min,
@@ -608,13 +764,21 @@ def score_btc_futures_setup(
                     "impulse_move_atr": round(impulse_move_atr, 4),
                     "impulse_body_atr": round(impulse_body, 4),
                     "range_expansion": 1.0 if range_expansion_path else 0.0,
+                    "event_catalyst": 1.0 if event_path else 0.0,
+                    "market_gate_penalty": directional_market_penalty("LONG") if impulse_path or event_path else 0.0,
+                    "crypto_event_bias": round(float(event_bias_score or 0.0), 4),
+                    "crypto_event_max_severity": round(float(event_max_severity or 0.0), 4),
+                    "crypto_event_count": float(event_count or 0),
                 },
             )
 
         impulse_path = impulse_short_ok and not (short_ok or continuation_short_ok)
         range_expansion_path = range_expansion_short_ok and not (short_ok or continuation_short_ok or impulse_short_ok)
-        if impulse_path or range_expansion_path:
-            leverage_max = max(1, int(_env_float("FUTURES_IMPULSE_LEVERAGE_MAX", min(float(config.leverage_max), 8.0))))
+        event_path = event_catalyst_short_ok and not (short_ok or continuation_short_ok or impulse_short_ok or range_expansion_short_ok)
+        if impulse_path or range_expansion_path or event_path:
+            default_cap = min(float(config.leverage_max), 8.0)
+            leverage_var = "FUTURES_EVENT_CATALYST_LEVERAGE_MAX" if event_path else "FUTURES_IMPULSE_LEVERAGE_MAX"
+            leverage_max = max(1, int(_env_float(leverage_var, _env_float("FUTURES_IMPULSE_LEVERAGE_MAX", default_cap))))
             leverage_min = min(config.leverage_min, leverage_max)
             tp_move = max(_env_float("FUTURES_IMPULSE_TP_ATR_MULT", 5.0) * current_atr_15, _env_float("FUTURES_IMPULSE_TP_FLOOR_PCT", 0.012) * current_price)
             sl_price = min(
@@ -642,7 +806,8 @@ def score_btc_futures_setup(
                 else "PRESSURE_BREAK_SHORT" if short_ok and pressure_short
                 else "TREND_CONTINUATION_SHORT" if continuation_short_ok
                 else "IMPULSE_EVENT_CONTINUATION_SHORT" if impulse_path
-                else "RANGE_EXPANSION_CONTINUATION_SHORT"
+                else "RANGE_EXPANSION_CONTINUATION_SHORT" if range_expansion_path
+                else "EVENT_CATALYST_SHORT"
             ),
             config=config,
             leverage_min_override=leverage_min,
@@ -657,6 +822,11 @@ def score_btc_futures_setup(
                 "impulse_move_atr": round(impulse_move_atr, 4),
                 "impulse_body_atr": round(impulse_body, 4),
                 "range_expansion": 1.0 if range_expansion_path else 0.0,
+                "event_catalyst": 1.0 if event_path else 0.0,
+                "market_gate_penalty": directional_market_penalty("SHORT") if impulse_path or event_path else 0.0,
+                "crypto_event_bias": round(float(event_bias_score or 0.0), 4),
+                "crypto_event_max_severity": round(float(event_max_severity or 0.0), 4),
+                "crypto_event_count": float(event_count or 0),
             },
         )
 

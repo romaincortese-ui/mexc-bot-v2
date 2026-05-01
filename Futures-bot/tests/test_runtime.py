@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pandas as pd
 
 from futuresbot.config import FuturesConfig
-from futuresbot.models import FuturesPosition
+from futuresbot.models import FuturesPosition, FuturesSignal
 from futuresbot.runtime import FuturesRuntime
 
 
@@ -362,6 +364,66 @@ def test_funding_gate_fails_open_when_client_lacks_method(tmp_path):
     assert runtime._funding_gate_ok(scoped) is True
 
 
+def test_log_net_rr_shadow_emits_cost_breakdown(tmp_path, caplog):
+    runtime = FuturesRuntime(_config(tmp_path), StubClient())
+    signal = SimpleNamespace(
+        symbol="BTC_USDT",
+        side="LONG",
+        entry_signal="COIL_BREAKOUT_LONG",
+        metadata={
+            "cost_budget_mode": "shadow",
+            "gross_rr": 2.1,
+            "fee_bps": 8.0,
+            "slippage_bps": 25.0,
+            "funding_bps": 0.5,
+            "total_cost_bps": 33.5,
+            "net_rr": 1.82,
+            "min_net_rr": 1.8,
+            "cost_budget_pass": 1.0,
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="futuresbot.runtime"):
+        runtime._log_net_rr_shadow(signal)
+
+    assert any("[NET_RR_SHADOW]" in record.message and "gross_rr=2.10" in record.message for record in caplog.records)
+
+
+def test_fetch_signal_passes_fresh_event_context_to_strategy(tmp_path, monkeypatch):
+    runtime = FuturesRuntime(replace(_config(tmp_path), symbols=("BTC_USDT",), redis_url=""), StubClient())
+    runtime._active_symbols = ("BTC_USDT",)
+    event_state = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "events": [{"title": "ETF approval", "direction": "risk_on", "severity": "high", "symbols": ["BTCUSDT"]}],
+    }
+    runtime._refresh_crypto_event_state = lambda: event_state  # type: ignore[method-assign]
+    captured: dict[str, object] = {}
+
+    def fake_score(frame, config, **kwargs):
+        captured.update(kwargs)
+        return FuturesSignal(
+            symbol="BTC_USDT",
+            side="LONG",
+            score=72.0,
+            certainty=0.8,
+            entry_price=91000.0,
+            tp_price=93000.0,
+            sl_price=90000.0,
+            leverage=20,
+            entry_signal="EVENT_CATALYST_LONG",
+            metadata={"net_rr": 1.9, "gross_rr": 2.0, "cost_budget_mode": "shadow"},
+        )
+
+    monkeypatch.setattr("futuresbot.runtime.score_btc_futures_setup", fake_score)
+
+    signal = runtime._fetch_signal()
+
+    assert signal is not None
+    assert captured["event_bias_score"] > 0
+    assert captured["event_max_severity"] >= 1.0
+    assert captured["event_count"] >= 1
+
+
 def test_enter_trade_rejects_duplicate_symbol(tmp_path):
     runtime = FuturesRuntime(_config(tmp_path), StubClient())
     runtime._register_position(_make_position("BTC_USDT"))
@@ -408,6 +470,38 @@ def test_enter_trade_respects_portfolio_margin_cap(tmp_path):
     # With margin_budget_usdt default, projected margin ≈ margin_budget (e.g. 30). 40 + 30 > 50 → reject.
     assert runtime._enter_trade(signal) is False
     assert "ETH_USDT" not in runtime.open_positions
+
+
+def test_first_trade_execution_canary_reports_on_close(tmp_path, caplog):
+    class ContractClient(StubClient):
+        def get_contract_detail(self, symbol: str) -> dict[str, object]:
+            return {"contractSize": 0.01, "minVol": 1}
+
+    runtime = FuturesRuntime(replace(_config(tmp_path), margin_budget_usdt=50.0), ContractClient())
+    signal = {
+        "side": "LONG",
+        "entry_price": 100.0,
+        "leverage": 5,
+        "symbol": "BTC_USDT",
+        "tp_price": 104.0,
+        "sl_price": 98.0,
+        "score": 70.0,
+        "certainty": 0.75,
+        "entry_signal": "EVENT_CATALYST_LONG",
+        "metadata": {},
+    }
+
+    assert runtime._enter_trade(signal) is True
+    position = runtime.open_position
+    assert position is not None
+    assert "execution_canary" in position.metadata
+
+    with caplog.at_level(logging.INFO, logger="futuresbot.runtime"):
+        runtime._close_history_trade(position, exit_price=104.0, reason="TAKE_PROFIT")
+
+    assert runtime.trade_history[-1]["execution_canary_reported"] is True
+    assert runtime.trade_history[-1]["execution_canary"]["realized_pnl_usdt"] > 0
+    assert any("[EXECUTION_CANARY]" in record.message for record in caplog.records)
 
 
 def test_state_round_trip_preserves_multiple_positions(tmp_path):

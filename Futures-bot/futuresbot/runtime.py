@@ -1200,7 +1200,8 @@ class FuturesRuntime:
     def _close_history_trade(self, position: FuturesPosition, *, exit_price: float, reason: str) -> None:
         direction = 1.0 if position.side == "LONG" else -1.0
         gross_pnl = position.base_qty * (exit_price - position.entry_price) * direction
-        fees = (position.base_qty * position.entry_price + position.base_qty * exit_price) * 0.0004
+        taker_fee_rate = self.get_symbol_taker_fee_rate(position.symbol)
+        fees = (position.base_qty * position.entry_price + position.base_qty * exit_price) * taker_fee_rate
         pnl = gross_pnl - fees
         trade = (
             {
@@ -1223,6 +1224,15 @@ class FuturesRuntime:
             }
         )
         self.trade_history.append(trade)
+        self._emit_execution_canary_report(
+            position=position,
+            exit_price=exit_price,
+            reason=reason,
+            gross_pnl=gross_pnl,
+            fees=fees,
+            pnl=pnl,
+            trade=trade,
+        )
         # P2 §6 #13 — structured JSON audit line for after-the-fact P&L
         # reconstruction independent of broker statements.
         self._emit_audit_event(
@@ -1398,6 +1408,45 @@ class FuturesRuntime:
     def _available_slots(self) -> int:
         return max(0, int(self.config.max_concurrent_positions) - len(self.open_positions))
 
+    def _event_candidate_side(self, decision: Any) -> str | None:
+        try:
+            if not getattr(decision, "fresh", False):
+                return None
+            bias = float(getattr(decision, "bias_score", 0.0) or 0.0)
+            severity = float(getattr(decision, "max_severity", 0.0) or 0.0)
+            count = int(getattr(decision, "event_count", 0) or 0)
+            min_bias = float(self._env_float("FUTURES_EVENT_CANDIDATE_LOG_MIN_ABS_BIAS", 0.55))
+            min_severity = float(self._env_float("FUTURES_EVENT_CANDIDATE_LOG_MIN_SEVERITY", 0.70))
+            if count <= 0 or abs(bias) < min_bias or severity < min_severity:
+                return None
+            return "LONG" if bias > 0 else "SHORT"
+        except Exception:
+            return None
+
+    def _log_net_rr_shadow(self, signal: Any) -> None:
+        metadata = getattr(signal, "metadata", {}) or {}
+        if "net_rr" not in metadata:
+            return
+        mode = str(metadata.get("cost_budget_mode") or "shadow")
+        label = "[NET_RR_ENFORCE]" if mode == "enforce" else "[NET_RR_SHADOW]"
+        log.info(
+            "%s symbol=%s side=%s entry_signal=%s gross_rr=%.2f fees_bps=%.2f "
+            "slippage_bps=%.2f funding_bps=%.2f total_cost_bps=%.2f net_rr=%.2f "
+            "min_net_rr=%.2f pass=%s",
+            label,
+            getattr(signal, "symbol", "?"),
+            getattr(signal, "side", "?"),
+            getattr(signal, "entry_signal", "?"),
+            float(metadata.get("gross_rr") or 0.0),
+            float(metadata.get("fee_bps") or 0.0),
+            float(metadata.get("slippage_bps") or 0.0),
+            float(metadata.get("funding_bps") or 0.0),
+            float(metadata.get("total_cost_bps") or 0.0),
+            float(metadata.get("net_rr") or 0.0),
+            float(metadata.get("min_net_rr") or 0.0),
+            "true" if float(metadata.get("cost_budget_pass") or 0.0) >= 1.0 else "false",
+        )
+
     def _fetch_signal(self) -> dict[str, Any] | None:
         if self._available_slots() <= 0:
             return None
@@ -1465,6 +1514,9 @@ class FuturesRuntime:
                 scoring_config,
                 long_threshold_offset=long_threshold_offset,
                 short_threshold_offset=short_threshold_offset,
+                event_bias_score=event_scan_decision.bias_score if event_scan_decision.fresh else 0.0,
+                event_max_severity=event_scan_decision.max_severity if event_scan_decision.fresh else 0.0,
+                event_count=event_scan_decision.event_count if event_scan_decision.fresh else 0,
             )
             # Sprint 3 §3.2 — mean-reversion fallback. When regime is CHOP (or the
             # primary coil-breakout scorer returned nothing) and
@@ -1493,7 +1545,19 @@ class FuturesRuntime:
                 self._last_cycle_gate_blocks[sym] = reason
                 log.info("[GATE_BLOCK] symbol=%s reason=%s", sym, reason)
                 log.info("[IMPULSE_GATE_BLOCK] symbol=%s reason=%s", sym, impulse_reason)
+                event_side = self._event_candidate_side(event_scan_decision)
+                if event_side is not None:
+                    log.info(
+                        "[EVENT_CANDIDATE_BLOCK] symbol=%s side=%s bias=%.2f severity=%.2f setup_reason=%s impulse_reason=%s",
+                        sym,
+                        event_side,
+                        event_scan_decision.bias_score,
+                        event_scan_decision.max_severity,
+                        reason,
+                        impulse_reason,
+                    )
                 continue
+            self._log_net_rr_shadow(raw_signal)
             raw_signal = self._apply_crypto_event_overlay(raw_signal, crypto_event_state, event_now)
             if raw_signal is None:
                 continue
@@ -2363,6 +2427,127 @@ class FuturesRuntime:
     # warning at boot (see ``_warn_deprecated_monitor_flags``) instead of an
     # always-on Telegram noise loop.
 
+    def _execution_canary_enabled(self) -> bool:
+        raw = os.environ.get("FUTURES_EXECUTION_CANARY_ENABLED", "1")
+        return str(raw or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _should_attach_execution_canary(self, *, mode: str) -> bool:
+        if not self._execution_canary_enabled():
+            return False
+        mode_scope = os.environ.get("FUTURES_EXECUTION_CANARY_SCOPE", "all").strip().lower()
+        if mode_scope == "live" and mode != "live":
+            return False
+        if any(isinstance(pos.metadata, dict) and pos.metadata.get("execution_canary") for pos in self.open_positions.values()):
+            return False
+        for trade in self.trade_history:
+            if trade.get("execution_canary_reported") or trade.get("execution_canary"):
+                return False
+        return True
+
+    def _attach_execution_canary(
+        self,
+        *,
+        position: FuturesPosition,
+        intended_price: float,
+        fill_price: float,
+        mode: str,
+        order_id: str,
+        maker_filled: bool,
+    ) -> None:
+        if not self._should_attach_execution_canary(mode=mode):
+            return
+        try:
+            intended_notional = float(position.contracts) * float(position.contract_size) * float(intended_price)
+            actual_notional = float(position.contracts) * float(position.contract_size) * float(fill_price)
+            taker_fee_rate = self.get_symbol_taker_fee_rate(position.symbol)
+            if intended_price > 0:
+                raw_bps = (float(fill_price) - float(intended_price)) / float(intended_price) * 10_000.0
+                entry_slippage_bps = raw_bps if position.side == "LONG" else -raw_bps
+            else:
+                entry_slippage_bps = 0.0
+            canary = {
+                "canary_id": f"{position.symbol}-{int(position.opened_at.timestamp())}",
+                "mode": mode,
+                "symbol": position.symbol,
+                "side": position.side,
+                "entry_signal": position.entry_signal,
+                "intended_entry_price": float(intended_price),
+                "actual_entry_price": float(fill_price),
+                "intended_notional_usdt": float(intended_notional),
+                "actual_notional_usdt": float(actual_notional),
+                "notional_delta_usdt": float(actual_notional - intended_notional),
+                "entry_slippage_bps": float(entry_slippage_bps),
+                "estimated_entry_fee_usdt": float(actual_notional * taker_fee_rate),
+                "estimated_round_trip_fee_usdt": float(actual_notional * taker_fee_rate * 2.0),
+                "taker_fee_rate": float(taker_fee_rate),
+                "contracts": int(position.contracts),
+                "contract_size": float(position.contract_size),
+                "leverage": int(position.leverage),
+                "margin_usdt": float(position.margin_usdt),
+                "tp_price": float(position.tp_price),
+                "sl_price": float(position.sl_price),
+                "maker_filled": bool(maker_filled),
+                "order_id": order_id or "",
+                "opened_at": position.opened_at.isoformat(),
+            }
+            position.metadata = {**(position.metadata or {}), "execution_canary": canary}
+            log.info(
+                "[EXECUTION_CANARY_ENTRY] symbol=%s side=%s intended_notional=%.2f actual_notional=%.2f "
+                "entry_slippage_bps=%+.2f estimated_round_trip_fee=%.4f",
+                position.symbol,
+                position.side,
+                intended_notional,
+                actual_notional,
+                entry_slippage_bps,
+                actual_notional * taker_fee_rate * 2.0,
+            )
+        except Exception as exc:  # pragma: no cover — never block an entry on canary logging
+            log.debug("Execution canary attach skipped: %s", exc)
+
+    def _emit_execution_canary_report(
+        self,
+        *,
+        position: FuturesPosition,
+        exit_price: float,
+        reason: str,
+        gross_pnl: float,
+        fees: float,
+        pnl: float,
+        trade: dict[str, Any],
+    ) -> None:
+        canary = (position.metadata or {}).get("execution_canary")
+        if not isinstance(canary, dict):
+            return
+        try:
+            exit_notional = float(position.base_qty) * float(exit_price)
+            intended_exit_reference = float(position.tp_price if pnl >= 0 else position.sl_price)
+            if intended_exit_reference > 0:
+                raw_exit_bps = (float(exit_price) - intended_exit_reference) / intended_exit_reference * 10_000.0
+                exit_slippage_bps = raw_exit_bps if position.side == "SHORT" else -raw_exit_bps
+            else:
+                exit_slippage_bps = 0.0
+            hold_seconds = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
+            report = {
+                **canary,
+                "exit_price": float(exit_price),
+                "exit_reason": reason,
+                "exit_notional_usdt": float(exit_notional),
+                "intended_exit_reference": float(intended_exit_reference),
+                "exit_slippage_bps": float(exit_slippage_bps),
+                "hold_minutes": round(max(0.0, hold_seconds) / 60.0, 2),
+                "gross_pnl_usdt": float(gross_pnl),
+                "fees_usdt": float(fees),
+                "realized_pnl_usdt": float(pnl),
+                "realized_pnl_pct": float(trade.get("pnl_pct") or 0.0),
+                "closed_at": trade.get("exit_time"),
+            }
+            trade["execution_canary_reported"] = True
+            trade["execution_canary"] = report
+            log.info("[EXECUTION_CANARY] %s", json.dumps(report, separators=(",", ":"), sort_keys=True, default=str))
+            self._emit_audit_event("EXECUTION_CANARY", report)
+        except Exception as exc:  # pragma: no cover — never block close reconciliation
+            log.debug("Execution canary report skipped: %s", exc)
+
     def _enter_trade(self, signal_payload: dict[str, Any]) -> bool:
         side_name = str(signal_payload["side"])
         side = 1 if side_name == "LONG" else 3
@@ -2457,6 +2642,14 @@ class FuturesRuntime:
                 entry_signal=str(signal_payload["entry_signal"]),
                 metadata=dict(signal_payload.get("metadata", {}) or {}),
             )
+            self._attach_execution_canary(
+                position=position,
+                intended_price=entry_price,
+                fill_price=entry_price,
+                mode="paper",
+                order_id="PAPER",
+                maker_filled=False,
+            )
             self._register_position(position)
             self._log_entry_fill(
                 position=position,
@@ -2533,6 +2726,14 @@ class FuturesRuntime:
             certainty=float(signal_payload["certainty"]),
             entry_signal=str(signal_payload["entry_signal"]),
             metadata=dict(signal_payload.get("metadata", {}) or {}),
+        )
+        self._attach_execution_canary(
+            position=position,
+            intended_price=entry_price,
+            fill_price=fill_price,
+            mode="live",
+            order_id=order_id,
+            maker_filled=maker_filled,
         )
         self._register_position(position)
         self._log_entry_fill(
