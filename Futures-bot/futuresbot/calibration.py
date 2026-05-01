@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pandas as pd
 
@@ -59,6 +60,40 @@ def _group_trade_metrics(trades_df: pd.DataFrame, keys: list[str]) -> dict[str, 
             node = node.setdefault(str(key), {})
         node[str(raw_keys[-1])] = _summarize_trade_group(group)
     return grouped
+
+
+def setup_regime_for_signal(entry_signal: str | None, side: str | None = None) -> str:
+    signal = str(entry_signal or "").upper()
+    side_name = str(side or "").upper()
+    if "EVENT_CATALYST" in signal:
+        return "RISK_OFF_SHORT" if side_name == "SHORT" or signal.endswith("_SHORT") else "EVENT_CATALYST_LONG"
+    if "IMPULSE_EVENT" in signal:
+        return "IMPULSE_EVENT_SHORT" if side_name == "SHORT" or signal.endswith("_SHORT") else "IMPULSE_EVENT_LONG"
+    if "RANGE_EXPANSION" in signal:
+        return "RANGE_EXPANSION_SHORT" if side_name == "SHORT" or signal.endswith("_SHORT") else "RANGE_EXPANSION_LONG"
+    if "TREND_CONTINUATION" in signal:
+        return "TREND_CONTINUATION_SHORT" if side_name == "SHORT" or signal.endswith("_SHORT") else "TREND_CONTINUATION_LONG"
+    if "MEAN_REVERSION" in signal:
+        return "MEAN_REVERSION"
+    if signal.startswith("COIL_") or signal.startswith("PRESSURE_"):
+        return "BREAKOUT_SHORT" if side_name == "SHORT" or signal.endswith("_SHORT") else "BREAKOUT_LONG"
+    if side_name == "SHORT":
+        return "OTHER_SHORT"
+    if side_name == "LONG":
+        return "OTHER_LONG"
+    return "UNKNOWN"
+
+
+def _trade_setup_regime(row: Mapping[str, Any]) -> str:
+    metadata = row.get("metadata")
+    if isinstance(metadata, Mapping):
+        raw = metadata.get("setup_regime")
+        if raw:
+            return str(raw).upper()
+    raw = row.get("setup_regime")
+    if raw:
+        return str(raw).upper()
+    return setup_regime_for_signal(str(row.get("entry_signal") or ""), str(row.get("side") or ""))
 
 
 def _derive_entry_adjustment(
@@ -134,22 +169,29 @@ def build_trade_calibration(
             "total_trades": 0,
             "by_strategy": {},
             "by_strategy_signal": {},
+            "by_strategy_regime": {},
             "by_strategy_symbol": {},
+            "by_strategy_symbol_regime": {},
             "by_strategy_symbol_signal": {},
             "entry_adjustments": {
                 "by_strategy": {},
                 "by_strategy_signal": {},
+                "by_strategy_regime": {},
                 "by_strategy_symbol": {},
+                "by_strategy_symbol_regime": {},
                 "by_strategy_symbol_signal": {},
             },
         }
     normalized = trades_df.copy()
-    for column in ("strategy", "symbol", "entry_signal"):
+    for column in ("strategy", "symbol", "entry_signal", "side"):
         normalized[column] = normalized.get(column, "UNKNOWN")
         normalized[column] = normalized[column].fillna("UNKNOWN").astype(str)
+    normalized["setup_regime"] = normalized.apply(_trade_setup_regime, axis=1)
     by_strategy = _group_trade_metrics(normalized, ["strategy"])
     by_strategy_signal = _group_trade_metrics(normalized, ["strategy", "entry_signal"])
+    by_strategy_regime = _group_trade_metrics(normalized, ["strategy", "setup_regime"])
     by_strategy_symbol = _group_trade_metrics(normalized, ["strategy", "symbol"])
+    by_strategy_symbol_regime = _group_trade_metrics(normalized, ["strategy", "symbol", "setup_regime"])
     by_strategy_symbol_signal = _group_trade_metrics(normalized, ["strategy", "symbol", "entry_signal"])
     entry_by_strategy = {
         strategy: _derive_entry_adjustment(metrics, min_trades=min_strategy_trades, min_trades_loosen=strategy_loosen)
@@ -161,12 +203,25 @@ def build_trade_calibration(
             entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_strategy_trades, min_trades_loosen=strategy_loosen)
             if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
                 entry_by_strategy_signal.setdefault(strategy, {})[signal] = entry_adjustment
+    entry_by_strategy_regime: dict[str, dict[str, Any]] = {}
+    for strategy, regimes in by_strategy_regime.items():
+        for regime, metrics in regimes.items():
+            entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_strategy_trades, min_trades_loosen=strategy_loosen)
+            if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
+                entry_by_strategy_regime.setdefault(strategy, {})[regime] = entry_adjustment
     entry_by_strategy_symbol: dict[str, dict[str, Any]] = {}
     for strategy, symbols in by_strategy_symbol.items():
         for symbol, metrics in symbols.items():
             entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_symbol_trades, min_trades_loosen=symbol_loosen)
             if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
                 entry_by_strategy_symbol.setdefault(strategy, {})[symbol] = entry_adjustment
+    entry_by_strategy_symbol_regime: dict[str, dict[str, dict[str, Any]]] = {}
+    for strategy, symbols in by_strategy_symbol_regime.items():
+        for symbol, regimes in symbols.items():
+            for regime, metrics in regimes.items():
+                entry_adjustment = _derive_entry_adjustment(metrics, min_trades=min_symbol_trades, min_trades_loosen=symbol_loosen)
+                if entry_adjustment != {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}:
+                    entry_by_strategy_symbol_regime.setdefault(strategy, {}).setdefault(symbol, {})[regime] = entry_adjustment
     entry_by_strategy_symbol_signal: dict[str, dict[str, dict[str, Any]]] = {}
     for strategy, symbols in by_strategy_symbol_signal.items():
         for symbol, signals in symbols.items():
@@ -181,12 +236,16 @@ def build_trade_calibration(
         "total_trades": int(len(normalized)),
         "by_strategy": by_strategy,
         "by_strategy_signal": by_strategy_signal,
+        "by_strategy_regime": by_strategy_regime,
         "by_strategy_symbol": by_strategy_symbol,
+        "by_strategy_symbol_regime": by_strategy_symbol_regime,
         "by_strategy_symbol_signal": by_strategy_symbol_signal,
         "entry_adjustments": {
             "by_strategy": entry_by_strategy,
             "by_strategy_signal": entry_by_strategy_signal,
+            "by_strategy_regime": entry_by_strategy_regime,
             "by_strategy_symbol": entry_by_strategy_symbol,
+            "by_strategy_symbol_regime": entry_by_strategy_symbol_regime,
             "by_strategy_symbol_signal": entry_by_strategy_symbol_signal,
         },
     }
@@ -263,26 +322,50 @@ def load_trade_calibration(*, redis_url: str, redis_key: str, file_path: str) ->
     return None, None
 
 
-def _lookup_adjustment(section: Mapping[str, Any], strategy: str, symbol: str, entry_signal: str | None = None) -> dict[str, Any]:
+def _lookup_adjustment(
+    section: Mapping[str, Any],
+    strategy: str,
+    symbol: str,
+    entry_signal: str | None = None,
+    setup_regime: str | None = None,
+) -> dict[str, Any]:
     strategy_name = strategy.upper()
     symbol_name = symbol.upper()
     signal_name = (entry_signal or "").upper()
+    regime_name = (setup_regime or "").upper()
     strategy_adjustment = dict(section.get("by_strategy", {}).get(strategy_name, {}))
+    strategy_regime_adjustment = dict(section.get("by_strategy_regime", {}).get(strategy_name, {}).get(regime_name, {})) if regime_name else {}
     strategy_signal_adjustment = dict(section.get("by_strategy_signal", {}).get(strategy_name, {}).get(signal_name, {})) if signal_name else {}
     symbol_adjustment = dict(section.get("by_strategy_symbol", {}).get(strategy_name, {}).get(symbol_name, {}))
+    symbol_regime_adjustment = (
+        dict(section.get("by_strategy_symbol_regime", {}).get(strategy_name, {}).get(symbol_name, {}).get(regime_name, {}))
+        if regime_name
+        else {}
+    )
     symbol_signal_adjustment = (
         dict(section.get("by_strategy_symbol_signal", {}).get(strategy_name, {}).get(symbol_name, {}).get(signal_name, {}))
         if signal_name
         else {}
     )
-    merged = {**strategy_adjustment, **strategy_signal_adjustment, **symbol_adjustment, **symbol_signal_adjustment}
+    merged = {
+        **strategy_adjustment,
+        **strategy_regime_adjustment,
+        **strategy_signal_adjustment,
+        **symbol_adjustment,
+        **symbol_regime_adjustment,
+        **symbol_signal_adjustment,
+    }
     if merged:
         if symbol_signal_adjustment:
             merged["source"] = "pair_signal"
+        elif symbol_regime_adjustment:
+            merged["source"] = "pair_regime"
         elif symbol_adjustment:
             merged["source"] = "pair"
         elif strategy_signal_adjustment:
             merged["source"] = "strategy_signal"
+        elif strategy_regime_adjustment:
+            merged["source"] = "strategy_regime"
         else:
             merged["source"] = "strategy"
     return merged
@@ -293,10 +376,11 @@ def get_entry_adjustment(
     strategy: str,
     symbol: str,
     entry_signal: str | None = None,
+    setup_regime: str | None = None,
 ) -> dict[str, Any]:
     if not calibration:
         return {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None, "source": None}
-    merged = _lookup_adjustment(calibration.get("entry_adjustments", {}), strategy, symbol, entry_signal)
+    merged = _lookup_adjustment(calibration.get("entry_adjustments", {}), strategy, symbol, entry_signal, setup_regime)
     if not merged:
         return {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None, "source": None}
     merged.setdefault("threshold_offset", 0.0)
@@ -315,7 +399,8 @@ def apply_signal_calibration(
     leverage_min: int,
     leverage_max: int,
 ) -> FuturesSignal | None:
-    adjustment = get_entry_adjustment(calibration, "BTC_FUTURES", signal.symbol, signal.entry_signal)
+    setup_regime = str((signal.metadata or {}).get("setup_regime") or setup_regime_for_signal(signal.entry_signal, signal.side)).upper()
+    adjustment = get_entry_adjustment(calibration, "BTC_FUTURES", signal.symbol, signal.entry_signal, setup_regime)
     block_reason = str(adjustment.get("block_reason") or "")
     if block_reason:
         signal.metadata["calibration_block_reason"] = block_reason
@@ -340,6 +425,8 @@ def apply_signal_calibration(
             "calibrated_threshold": threshold,
             "calibration_risk_mult": risk_mult,
             "calibration_source": adjustment.get("source"),
+            "setup_regime": setup_regime,
+            "calibration_setup_regime": setup_regime,
         },
     )
     return calibrated
@@ -352,4 +439,5 @@ __all__ = [
     "publish_trade_calibration",
     "load_trade_calibration",
     "validate_trade_calibration_payload",
+    "setup_regime_for_signal",
 ]

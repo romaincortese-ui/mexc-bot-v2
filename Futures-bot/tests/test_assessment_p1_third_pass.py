@@ -69,6 +69,7 @@ def _reset_env(monkeypatch):
             "MEXC_API_KEY",
             "MEXC_API_SECRET",
             "MEXC_PERP_DEFAULT_TAKER_FEE_RATE",
+            "MEXC_PERP_FEE_TIER_VERIFIED",
             "USE_COST_BUDGET_RR",
         }:
             monkeypatch.delenv(key, raising=False)
@@ -125,6 +126,48 @@ def test_resolve_taker_fee_falls_back_when_api_missing(tmp_path):
     assert raw is None
 
 
+def test_resolve_taker_fee_requires_verification_for_sub_standard_api_tier(tmp_path):
+    client = _SpecClient({"BTC_USDT": {"takerFeeRate": 0.0003}})
+    runtime = FuturesRuntime(_config(tmp_path), client)
+    rate, src, raw = runtime._resolve_taker_fee({"takerFeeRate": 0.0003})
+    assert src == "default_unverified_api"
+    assert rate == pytest.approx(0.0004)
+    assert raw == pytest.approx(0.0003)
+
+
+def test_resolve_taker_fee_accepts_sub_standard_api_tier_when_verified(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEXC_PERP_FEE_TIER_VERIFIED", "1")
+    client = _SpecClient({"BTC_USDT": {"takerFeeRate": 0.0003}})
+    runtime = FuturesRuntime(_config(tmp_path), client)
+    rate, src, raw = runtime._resolve_taker_fee({"takerFeeRate": 0.0003})
+    assert src == "api"
+    assert rate == pytest.approx(0.0003)
+    assert raw == pytest.approx(0.0003)
+
+
+def test_unverified_low_default_fee_override_is_clamped(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEXC_PERP_DEFAULT_TAKER_FEE_RATE", "0.0003")
+    client = _SpecClient({"BTC_USDT": {}})
+    runtime = FuturesRuntime(_config(tmp_path), client)
+    monkeypatch.setattr(runtime, "_DEFAULT_TAKER_FEE_RATE", 0.0003, raising=False)
+    rate, src, raw = runtime._resolve_taker_fee({})
+    assert src == "default_unverified_low_override"
+    assert rate == pytest.approx(0.0004)
+    assert raw is None
+
+
+def test_verified_low_default_fee_override_is_used(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEXC_PERP_DEFAULT_TAKER_FEE_RATE", "0.0003")
+    monkeypatch.setenv("MEXC_PERP_FEE_TIER_VERIFIED", "1")
+    client = _SpecClient({"BTC_USDT": {}})
+    runtime = FuturesRuntime(_config(tmp_path), client)
+    monkeypatch.setattr(runtime, "_DEFAULT_TAKER_FEE_RATE", 0.0003, raising=False)
+    rate, src, raw = runtime._resolve_taker_fee({})
+    assert src == "default"
+    assert rate == pytest.approx(0.0003)
+    assert raw is None
+
+
 def test_resolve_taker_fee_default_overridable_via_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MEXC_PERP_DEFAULT_TAKER_FEE_RATE", "0.0006")
     # Re-import is unnecessary — the class-level constant is read from env at
@@ -161,6 +204,21 @@ def test_emit_contract_specs_populates_per_symbol_env_and_cache(tmp_path):
     assert pepe_src == "default"
     assert pepe_rate == pytest.approx(0.0004)
     assert os.environ["COST_BUDGET_TAKER_FEE_RATE_PEPE_USDT"] == "0.000400"
+
+
+def test_emit_contract_specs_logs_fee_tier_verification_warning(tmp_path, caplog):
+    cfg = replace(_config(tmp_path), symbols=("BTC_USDT",))
+    client = _SpecClient({"BTC_USDT": {"takerFeeRate": 0.0003, "contractSize": 0.0001, "minVol": 1}})
+    runtime = FuturesRuntime(cfg, client)
+    runtime._active_symbols = cfg.symbols
+
+    with caplog.at_level(logging.WARNING, logger="futuresbot.runtime"):
+        runtime._emit_contract_specs()
+
+    rate, src = runtime._symbol_taker_fee["BTC_USDT"]
+    assert src == "default_unverified_api"
+    assert rate == pytest.approx(0.0004)
+    assert any("[FEE_TIER_VERIFY]" in record.message for record in caplog.records)
 
 
 def test_emit_contract_specs_handles_lookup_exception_safely(tmp_path):

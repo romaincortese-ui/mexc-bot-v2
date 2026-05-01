@@ -17,7 +17,7 @@ import pandas as pd
 
 from futuresbot.telegram import TelegramClient
 
-from futuresbot.calibration import load_trade_calibration, validate_trade_calibration_payload
+from futuresbot.calibration import load_trade_calibration, setup_regime_for_signal, validate_trade_calibration_payload
 from futuresbot.config import FuturesConfig
 from futuresbot.marketdata import MexcFuturesClient
 from futuresbot.models import FuturesPosition
@@ -79,6 +79,8 @@ class FuturesRuntime:
         self._crypto_event_state: dict[str, Any] | None = None
         self._last_crypto_event_refresh_at = 0.0
         self._last_crypto_event_error_at = 0.0
+        self.missed_opportunities: dict[str, dict[str, Any]] = {}
+        self._missed_opportunities_dirty = False
         self._load_state()
 
     # ------------------------------------------------------------------
@@ -255,6 +257,7 @@ class FuturesRuntime:
     # so operators can audit fee assumptions without reading the source.
     # ------------------------------------------------------------------
     _DEFAULT_TAKER_FEE_RATE = float(os.environ.get("MEXC_PERP_DEFAULT_TAKER_FEE_RATE", "0.0004") or "0.0004")
+    _STANDARD_TAKER_FEE_RATE = 0.0004
     # Below this threshold we treat the API value as "implausibly low"
     # (almost certainly a maker rate mis-mapped or a tier promo that won't
     # survive a stop-out) and fall back to the venue default. MEXC's
@@ -278,12 +281,27 @@ class FuturesRuntime:
     def _normalize_symbol_for_env(symbol: str) -> str:
         return "".join(ch if ch.isalnum() else "_" for ch in symbol.upper())
 
+    @staticmethod
+    def _fee_tier_verified() -> bool:
+        raw = os.environ.get("MEXC_PERP_FEE_TIER_VERIFIED", "0")
+        return str(raw or "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _conservative_default_taker_fee(self) -> tuple[float, str]:
+        configured = float(self._DEFAULT_TAKER_FEE_RATE or self._STANDARD_TAKER_FEE_RATE)
+        if configured < self._STANDARD_TAKER_FEE_RATE and not self._fee_tier_verified():
+            return self._STANDARD_TAKER_FEE_RATE, "default_unverified_low_override"
+        return configured, "default"
+
     def _resolve_taker_fee(self, contract: dict[str, Any]) -> tuple[float, str, float | None]:
         """Return ``(taker_fee_rate, source, raw_api_value_or_None)``.
 
         ``source`` is one of:
 
-        - ``api`` — venue returned a plausible taker rate; used as-is.
+                - ``api`` — venue returned a plausible verified taker rate; used as-is.
+                - ``default_unverified_api`` — venue returned a sub-standard taker
+                    tier but ``MEXC_PERP_FEE_TIER_VERIFIED`` is not set; use 4 bp.
+                - ``default_unverified_low_override`` — env default is below 4 bp
+                    but the venue tier has not been explicitly verified; use 4 bp.
         - ``default_low_api`` — venue returned a value below
           ``_IMPLAUSIBLE_TAKER_FEE_FLOOR`` (likely a maker-rate or promo);
           we fall back to the venue default to keep cost-budget RR honest.
@@ -295,10 +313,13 @@ class FuturesRuntime:
             if "takerFeeRate" in contract
             else contract.get("taker_fee_rate")
         )
+        default_fee, default_src = self._conservative_default_taker_fee()
         if api_taker is None:
-            return self._DEFAULT_TAKER_FEE_RATE, "default", None
+            return default_fee, default_src, None
         if api_taker < self._IMPLAUSIBLE_TAKER_FEE_FLOOR:
-            return self._DEFAULT_TAKER_FEE_RATE, "default_low_api", api_taker
+            return default_fee, "default_low_api", api_taker
+        if api_taker < self._STANDARD_TAKER_FEE_RATE and not self._fee_tier_verified():
+            return default_fee, "default_unverified_api", api_taker
         return api_taker, "api", api_taker
 
     def _emit_contract_specs(self) -> None:
@@ -309,17 +330,19 @@ class FuturesRuntime:
                 log.warning("[CONTRACT_SPEC] symbol=%s lookup_failed=%s", sym, exc)
                 # Even on lookup failure, seed the per-symbol fee with the
                 # venue default so the cost-budget gate has something safe.
-                self._symbol_taker_fee[sym.upper()] = (self._DEFAULT_TAKER_FEE_RATE, "default")
+                default_fee, default_src = self._conservative_default_taker_fee()
+                self._symbol_taker_fee[sym.upper()] = (default_fee, default_src)
                 os.environ[
                     f"COST_BUDGET_TAKER_FEE_RATE_{self._normalize_symbol_for_env(sym)}"
-                ] = f"{self._DEFAULT_TAKER_FEE_RATE:.6f}"
+                ] = f"{default_fee:.6f}"
                 continue
             if not isinstance(contract, dict) or not contract:
                 log.warning("[CONTRACT_SPEC] symbol=%s empty_contract_detail", sym)
-                self._symbol_taker_fee[sym.upper()] = (self._DEFAULT_TAKER_FEE_RATE, "default")
+                default_fee, default_src = self._conservative_default_taker_fee()
+                self._symbol_taker_fee[sym.upper()] = (default_fee, default_src)
                 os.environ[
                     f"COST_BUDGET_TAKER_FEE_RATE_{self._normalize_symbol_for_env(sym)}"
-                ] = f"{self._DEFAULT_TAKER_FEE_RATE:.6f}"
+                ] = f"{default_fee:.6f}"
                 continue
             try:
                 contract_size = float(contract.get("contractSize") or 0.0)
@@ -359,24 +382,24 @@ class FuturesRuntime:
                 "?" if api_taker_raw is None else f"{api_taker_raw:.6f}",
                 "?" if api_maker is None else f"{api_maker:.6f}",
             )
-            if taker_src == "default_low_api":
+            if taker_src in {"default_low_api", "default_unverified_api", "default_unverified_low_override"}:
                 log.warning(
-                    "[CONTRACT_SPEC] symbol=%s api_taker_fee_rate=%.6f below "
-                    "implausible-low floor=%.4f; using default=%.6f to keep "
-                    "cost-budget RR honest. Override with "
-                    "MEXC_PERP_DEFAULT_TAKER_FEE_RATE if your venue tier is "
-                    "genuinely below %.4f.",
+                    "[FEE_TIER_VERIFY] symbol=%s src=%s api_taker_fee_rate=%s using_taker_fee_rate=%.6f "
+                    "standard_taker_fee_rate=%.6f verified=%s. Set MEXC_PERP_FEE_TIER_VERIFIED=1 "
+                    "only after exchange/account-tier evidence confirms the lower taker tier.",
                     sym,
-                    api_taker_raw or 0.0,
-                    self._IMPLAUSIBLE_TAKER_FEE_FLOOR,
-                    self._DEFAULT_TAKER_FEE_RATE,
-                    self._IMPLAUSIBLE_TAKER_FEE_FLOOR,
+                    taker_src,
+                    "?" if api_taker_raw is None else f"{api_taker_raw:.6f}",
+                    taker_resolved,
+                    self._STANDARD_TAKER_FEE_RATE,
+                    "true" if self._fee_tier_verified() else "false",
                 )
 
     def get_symbol_taker_fee_rate(self, symbol: str) -> float:
         """Return the resolved per-symbol taker fee rate (post-fallback)."""
 
-        rate, _src = self._symbol_taker_fee.get(symbol.upper(), (self._DEFAULT_TAKER_FEE_RATE, "default"))
+        default_fee, default_src = self._conservative_default_taker_fee()
+        rate, _src = self._symbol_taker_fee.get(symbol.upper(), (default_fee, default_src))
         return float(rate)
 
     def _notify(self, message: str, *, parse_mode: str = "HTML") -> None:
@@ -962,6 +985,8 @@ class FuturesRuntime:
                 except Exception as exc:
                     log.warning("Failed to deserialize legacy single position: %s", exc)
         self.trade_history = list(payload.get("trade_history", []) or [])
+        raw_missed = payload.get("missed_opportunities", {})
+        self.missed_opportunities = raw_missed if isinstance(raw_missed, dict) else {}
         self._paused = bool(payload.get("paused", False))
         self._recent_activity = deque((str(item) for item in payload.get("recent_activity", [])), maxlen=RECENT_ACTIVITY_LIMIT)
         log.info("Loaded futures runtime state from %s", self._state_path)
@@ -976,6 +1001,7 @@ class FuturesRuntime:
             # / external readers can still pick up the primary position.
             "open_position": primary.to_dict() if primary is not None else None,
             "trade_history": self.trade_history[-200:],
+            "missed_opportunities": self.missed_opportunities,
             "paused": self._paused,
             "recent_activity": list(self._recent_activity),
         }
@@ -1144,6 +1170,7 @@ class FuturesRuntime:
             "last_signal": signal,
             "calibration_loaded": bool(self.calibration),
             "daily_review_loaded": bool(self.daily_review),
+            "missed_opportunities": self.missed_opportunities,
         }
 
     def _write_status(self, *, signal: dict[str, Any] | None = None, price: float | None = None) -> None:
@@ -1218,12 +1245,22 @@ class FuturesRuntime:
                 "entry_signal": position.entry_signal,
                 "score": position.score,
                 "certainty": position.certainty,
+                "setup_regime": str((position.metadata or {}).get("setup_regime") or setup_regime_for_signal(position.entry_signal, position.side)).upper(),
                 "exit_reason": reason,
+                "fees_usdt": fees,
                 "pnl_usdt": pnl,
                 "pnl_pct": (pnl / position.margin_usdt * 100.0) if position.margin_usdt > 0 else 0.0,
             }
         )
         self.trade_history.append(trade)
+        self._attach_execution_quality_report(
+            position=position,
+            exit_price=exit_price,
+            reason=reason,
+            fees=fees,
+            pnl=pnl,
+            trade=trade,
+        )
         self._emit_execution_canary_report(
             position=position,
             exit_price=exit_price,
@@ -1251,6 +1288,7 @@ class FuturesRuntime:
                 "pnl_usdt": float(pnl),
                 "pnl_pct": float(trade["pnl_pct"]),
                 "entry_signal": position.entry_signal,
+                "setup_regime": str((position.metadata or {}).get("setup_regime") or setup_regime_for_signal(position.entry_signal, position.side)).upper(),
                 "exit_reason": reason,
                 "opened_at": position.opened_at.isoformat(),
                 "closed_at": trade["exit_time"],
@@ -1447,6 +1485,142 @@ class FuturesRuntime:
             "true" if float(metadata.get("cost_budget_pass") or 0.0) >= 1.0 else "false",
         )
 
+    def _missed_opportunity_enabled(self) -> bool:
+        raw = os.environ.get("FUTURES_MISSED_OPPORTUNITY_REPORT_ENABLED", "1")
+        return str(raw or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _prune_missed_opportunities(self, now_ts: float | None = None) -> None:
+        if not self.missed_opportunities:
+            return
+        now_value = float(now_ts if now_ts is not None else time.time())
+        max_age = max(1.0, self._env_float("FUTURES_MISSED_OPPORTUNITY_MAX_AGE_HOURS", 168.0)) * 3600.0
+        stale = []
+        for symbol, record in self.missed_opportunities.items():
+            try:
+                first_seen = float(record.get("first_seen_ts") or now_value)
+            except (TypeError, ValueError):
+                first_seen = now_value
+            if now_value - first_seen > max_age:
+                stale.append(symbol)
+        for symbol in stale:
+            self.missed_opportunities.pop(symbol, None)
+            self._missed_opportunities_dirty = True
+
+    def _record_missed_opportunity(
+        self,
+        *,
+        symbol: str,
+        frame_15m: "pd.DataFrame",
+        reason: str,
+        impulse_reason: str,
+        event_side: str | None = None,
+    ) -> None:
+        if not self._missed_opportunity_enabled() or frame_15m is None or frame_15m.empty:
+            return
+        try:
+            from futuresbot.indicators import calc_atr
+
+            frame = frame_15m.copy()
+            close = frame["close"].astype(float)
+            high = frame["high"].astype(float)
+            low = frame["low"].astype(float)
+            if len(close) < 25:
+                return
+            now_ts = time.time()
+            self._prune_missed_opportunities(now_ts)
+            current_price = float(close.iloc[-1])
+            if current_price <= 0:
+                return
+            move_6h = (current_price / float(close.iloc[-25])) - 1.0
+            move_24h = (current_price / float(close.iloc[-97])) - 1.0 if len(close) >= 97 else move_6h
+            dominant_move = move_24h if abs(move_24h) >= abs(move_6h) else move_6h
+            min_move = self._env_float("FUTURES_MISSED_OPPORTUNITY_MIN_ABS_MOVE", 0.006)
+            if abs(dominant_move) < min_move:
+                return
+            side = event_side or ("LONG" if dominant_move >= 0 else "SHORT")
+            atr_series = calc_atr(frame, 14)
+            current_atr = float(atr_series.iloc[-1]) if len(atr_series) else 0.0
+            risk_pct = max(
+                self._env_float("FUTURES_MISSED_OPPORTUNITY_MIN_RISK_PCT", 0.012),
+                (current_atr * self._env_float("FUTURES_MISSED_OPPORTUNITY_ATR_RISK_MULT", 3.0)) / current_price if current_atr > 0 else 0.0,
+            )
+            existing = self.missed_opportunities.get(symbol.upper())
+            if isinstance(existing, dict) and float(existing.get("abs_move_pct", 0.0) or 0.0) > abs(dominant_move):
+                entry_price = float(existing.get("entry_price") or current_price)
+                risk_pct = float(existing.get("risk_pct") or risk_pct)
+                side = str(existing.get("side") or side).upper()
+                high_since_entry = max(float(existing.get("high_since_entry") or entry_price), float(high.iloc[-1]), current_price)
+                low_since_entry = min(float(existing.get("low_since_entry") or entry_price), float(low.iloc[-1]), current_price)
+                if side == "LONG":
+                    mfe_r = (high_since_entry - entry_price) / max(entry_price * risk_pct, 1e-9)
+                    mae_r = (low_since_entry - entry_price) / max(entry_price * risk_pct, 1e-9)
+                    current_r = (current_price - entry_price) / max(entry_price * risk_pct, 1e-9)
+                else:
+                    mfe_r = (entry_price - low_since_entry) / max(entry_price * risk_pct, 1e-9)
+                    mae_r = (entry_price - high_since_entry) / max(entry_price * risk_pct, 1e-9)
+                    current_r = (entry_price - current_price) / max(entry_price * risk_pct, 1e-9)
+                existing.update(
+                    {
+                        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                        "last_seen_ts": now_ts,
+                        "last_price": round(current_price, 10),
+                        "high_since_entry": round(high_since_entry, 10),
+                        "low_since_entry": round(low_since_entry, 10),
+                        "mfe_r": round(mfe_r, 4),
+                        "mae_r": round(mae_r, 4),
+                        "current_r": round(current_r, 4),
+                        "updates": int(existing.get("updates", 0) or 0) + 1,
+                    }
+                )
+                self._missed_opportunities_dirty = True
+                return
+
+            entry_price = current_price
+            high_since_entry = max(float(high.iloc[-1]), entry_price)
+            low_since_entry = min(float(low.iloc[-1]), entry_price)
+            if side == "LONG":
+                mfe_r = (high_since_entry - entry_price) / max(entry_price * risk_pct, 1e-9)
+                mae_r = (low_since_entry - entry_price) / max(entry_price * risk_pct, 1e-9)
+            else:
+                mfe_r = (entry_price - low_since_entry) / max(entry_price * risk_pct, 1e-9)
+                mae_r = (entry_price - high_since_entry) / max(entry_price * risk_pct, 1e-9)
+            record = {
+                "symbol": symbol.upper(),
+                "side": side,
+                "first_seen_at": datetime.now(timezone.utc).isoformat(),
+                "first_seen_ts": now_ts,
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                "last_seen_ts": now_ts,
+                "entry_price": round(entry_price, 10),
+                "last_price": round(current_price, 10),
+                "move_6h_pct": round(move_6h, 6),
+                "move_24h_pct": round(move_24h, 6),
+                "abs_move_pct": round(abs(dominant_move), 6),
+                "blocking_gate": reason,
+                "impulse_gate": impulse_reason,
+                "risk_pct": round(risk_pct, 6),
+                "high_since_entry": round(high_since_entry, 10),
+                "low_since_entry": round(low_since_entry, 10),
+                "mfe_r": round(mfe_r, 4),
+                "mae_r": round(mae_r, 4),
+                "current_r": 0.0,
+                "updates": 1,
+            }
+            self.missed_opportunities[symbol.upper()] = record
+            self._missed_opportunities_dirty = True
+            log.info(
+                "[MISSED_OPPORTUNITY] symbol=%s side=%s move_6h=%+.2f%% move_24h=%+.2f%% blocked_by=%s theoretical_mfe_r=%.2f theoretical_mae_r=%.2f",
+                symbol.upper(),
+                side,
+                move_6h * 100.0,
+                move_24h * 100.0,
+                reason,
+                mfe_r,
+                mae_r,
+            )
+        except Exception as exc:  # pragma: no cover - reporting must never block scanning
+            log.debug("Missed opportunity record skipped for %s: %s", symbol, exc)
+
     def _fetch_signal(self) -> dict[str, Any] | None:
         if self._available_slots() <= 0:
             return None
@@ -1556,6 +1730,13 @@ class FuturesRuntime:
                         reason,
                         impulse_reason,
                     )
+                self._record_missed_opportunity(
+                    symbol=sym,
+                    frame_15m=frame,
+                    reason=reason,
+                    impulse_reason=impulse_reason,
+                    event_side=event_side,
+                )
                 continue
             self._log_net_rr_shadow(raw_signal)
             raw_signal = self._apply_crypto_event_overlay(raw_signal, crypto_event_state, event_now)
@@ -1602,6 +1783,9 @@ class FuturesRuntime:
             score = float(calibrated.score)
             if best is None or score > best[0]:
                 best = (score, calibrated)
+        if self._missed_opportunities_dirty:
+            self._save_state()
+            self._missed_opportunities_dirty = False
         if best is None:
             return None
         return best[1].to_dict()
@@ -2504,6 +2688,47 @@ class FuturesRuntime:
         except Exception as exc:  # pragma: no cover — never block an entry on canary logging
             log.debug("Execution canary attach skipped: %s", exc)
 
+    def _attach_execution_quality(
+        self,
+        *,
+        position: FuturesPosition,
+        intended_price: float,
+        fill_price: float,
+        mode: str,
+        order_id: str,
+        maker_filled: bool,
+    ) -> None:
+        try:
+            intended_notional = float(position.contracts) * float(position.contract_size) * float(intended_price)
+            actual_notional = float(position.contracts) * float(position.contract_size) * float(fill_price)
+            taker_fee_rate = self.get_symbol_taker_fee_rate(position.symbol)
+            if intended_price > 0:
+                raw_bps = (float(fill_price) - float(intended_price)) / float(intended_price) * 10_000.0
+                entry_slippage_bps = raw_bps if position.side == "LONG" else -raw_bps
+            else:
+                entry_slippage_bps = 0.0
+            position.metadata = {
+                **(position.metadata or {}),
+                "execution_quality": {
+                    "mode": mode,
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "entry_signal": position.entry_signal,
+                    "intended_entry_price": float(intended_price),
+                    "actual_entry_price": float(fill_price),
+                    "intended_notional_usdt": float(intended_notional),
+                    "actual_notional_usdt": float(actual_notional),
+                    "entry_slippage_bps": float(entry_slippage_bps),
+                    "estimated_round_trip_fee_usdt": float(actual_notional * taker_fee_rate * 2.0),
+                    "taker_fee_rate": float(taker_fee_rate),
+                    "maker_filled": bool(maker_filled),
+                    "order_id": order_id or "",
+                    "opened_at": position.opened_at.isoformat(),
+                },
+            }
+        except Exception as exc:  # pragma: no cover — never block an entry on quality metadata
+            log.debug("Execution quality attach skipped: %s", exc)
+
     def _emit_execution_canary_report(
         self,
         *,
@@ -2548,6 +2773,106 @@ class FuturesRuntime:
         except Exception as exc:  # pragma: no cover — never block close reconciliation
             log.debug("Execution canary report skipped: %s", exc)
 
+    def _attach_execution_quality_report(
+        self,
+        *,
+        position: FuturesPosition,
+        exit_price: float,
+        reason: str,
+        fees: float,
+        pnl: float,
+        trade: dict[str, Any],
+    ) -> None:
+        quality = (position.metadata or {}).get("execution_quality")
+        if not isinstance(quality, dict):
+            return
+        try:
+            intended_exit_reference = float(position.tp_price if pnl >= 0 else position.sl_price)
+            if intended_exit_reference > 0:
+                raw_exit_bps = (float(exit_price) - intended_exit_reference) / intended_exit_reference * 10_000.0
+                exit_slippage_bps = raw_exit_bps if position.side == "SHORT" else -raw_exit_bps
+            else:
+                exit_slippage_bps = 0.0
+            report = {
+                **quality,
+                "exit_price": float(exit_price),
+                "exit_reason": reason,
+                "exit_slippage_bps": float(exit_slippage_bps),
+                "fees_usdt": float(fees),
+                "realized_pnl_usdt": float(pnl),
+                "realized_pnl_pct": float(trade.get("pnl_pct") or 0.0),
+                "closed_at": trade.get("exit_time"),
+            }
+            trade["execution_quality"] = report
+        except Exception as exc:  # pragma: no cover — never block close reconciliation
+            log.debug("Execution quality report skipped: %s", exc)
+
+    def _capital_scaling_enabled(self) -> bool:
+        raw = os.environ.get("FUTURES_CAPITAL_SCALING_ENABLED", "1")
+        return str(raw or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _capital_scaling_multiplier(self) -> tuple[float, dict[str, Any]]:
+        if not self._capital_scaling_enabled():
+            return 1.0, {"reason": "disabled"}
+        min_clean = max(1, int(self._env_float("FUTURES_CAPITAL_SCALE_MIN_CLEAN_FILLS", 5.0)))
+        step_trades = max(1, int(self._env_float("FUTURES_CAPITAL_SCALE_STEP_TRADES", 5.0)))
+        increment = max(0.0, self._env_float("FUTURES_CAPITAL_SCALE_INCREMENT", 0.25))
+        max_mult = max(1.0, self._env_float("FUTURES_CAPITAL_SCALE_MAX_MULT", 2.0))
+        require_live = str(os.environ.get("FUTURES_CAPITAL_SCALE_REQUIRE_LIVE", "1") or "1").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        max_entry_slippage = max(0.0, self._env_float("FUTURES_CAPITAL_SCALE_MAX_ENTRY_SLIPPAGE_BPS", 8.0))
+        max_exit_slippage = max(0.0, self._env_float("FUTURES_CAPITAL_SCALE_MAX_EXIT_SLIPPAGE_BPS", 12.0))
+        max_fee_ratio = max(1.0, self._env_float("FUTURES_CAPITAL_SCALE_MAX_FEE_RATIO", 1.20))
+        min_profit_factor = max(0.0, self._env_float("FUTURES_CAPITAL_SCALE_MIN_PROFIT_FACTOR", 1.05))
+        min_win_rate = min(1.0, max(0.0, self._env_float("FUTURES_CAPITAL_SCALE_MIN_WIN_RATE", 0.40)))
+        clean: list[dict[str, Any]] = []
+        rejected = 0
+        for trade in self.trade_history[-100:]:
+            quality = trade.get("execution_canary") if isinstance(trade, dict) else None
+            if not isinstance(quality, dict) and isinstance(trade, dict):
+                quality = trade.get("execution_quality")
+            if not isinstance(quality, dict):
+                rejected += 1
+                continue
+            mode = str(quality.get("mode") or "").lower()
+            if require_live and mode != "live":
+                rejected += 1
+                continue
+            entry_slip = abs(float(quality.get("entry_slippage_bps") or 0.0))
+            exit_slip = abs(float(quality.get("exit_slippage_bps") or 0.0))
+            actual_fees = float(quality.get("fees_usdt") or trade.get("fees_usdt") or 0.0)
+            estimated_fees = float(quality.get("estimated_round_trip_fee_usdt") or 0.0)
+            fee_ratio = actual_fees / estimated_fees if estimated_fees > 0 else 1.0
+            if entry_slip > max_entry_slippage or exit_slip > max_exit_slippage or fee_ratio > max_fee_ratio:
+                rejected += 1
+                continue
+            clean.append(trade)
+        if len(clean) < min_clean:
+            return 1.0, {"reason": "insufficient_clean_fills", "clean_fills": len(clean), "required": min_clean, "rejected": rejected}
+        pnls = [float(trade.get("pnl_usdt") or 0.0) for trade in clean]
+        wins = [pnl for pnl in pnls if pnl > 0]
+        losses = [pnl for pnl in pnls if pnl < 0]
+        profit_factor = (sum(wins) / abs(sum(losses))) if losses else (float("inf") if wins else 0.0)
+        win_rate = len(wins) / len(pnls) if pnls else 0.0
+        if profit_factor < min_profit_factor or win_rate < min_win_rate:
+            return 1.0, {
+                "reason": "performance_floor",
+                "clean_fills": len(clean),
+                "profit_factor": profit_factor,
+                "win_rate": win_rate,
+            }
+        scale_steps = 1 + max(0, (len(clean) - min_clean) // step_trades)
+        multiplier = min(max_mult, 1.0 + increment * scale_steps)
+        return multiplier, {
+            "reason": "scaled",
+            "clean_fills": len(clean),
+            "rejected": rejected,
+            "profit_factor": profit_factor,
+            "win_rate": win_rate,
+            "max_mult": max_mult,
+        }
+
     def _enter_trade(self, signal_payload: dict[str, Any]) -> bool:
         side_name = str(signal_payload["side"])
         side = 1 if side_name == "LONG" else 3
@@ -2563,6 +2888,8 @@ class FuturesRuntime:
         # Sprint 2 §2.9 — funding-regime stop-loss adjustment. Mutates the
         # payload so the order submitted to the exchange reflects the new SL.
         original_sl = float(signal_payload.get("sl_price") or 0.0)
+        signal_metadata = dict(signal_payload.get("metadata", {}) or {})
+        signal_metadata.setdefault("setup_regime", setup_regime_for_signal(str(signal_payload.get("entry_signal") or ""), side_name))
         adjusted_sl = self._adjust_sl_for_funding(
             scoped=scoped,
             side=side_name,
@@ -2573,7 +2900,19 @@ class FuturesRuntime:
             signal_payload["sl_price"] = adjusted_sl
         contract = self.client.get_contract_detail(symbol)
         contract_size = float(contract.get("contractSize", 0.0001) or 0.0001)
-        margin_budget = scoped.margin_budget_usdt
+        capital_multiplier, capital_scaling = self._capital_scaling_multiplier()
+        margin_budget = scoped.margin_budget_usdt * capital_multiplier
+        if capital_multiplier > 1.0:
+            log.info(
+                "[CAPITAL_SCALE] symbol=%s multiplier=%.2f margin_budget=%.2f base_margin_budget=%.2f clean_fills=%s pf=%s win_rate=%s",
+                symbol,
+                capital_multiplier,
+                margin_budget,
+                scoped.margin_budget_usdt,
+                capital_scaling.get("clean_fills"),
+                capital_scaling.get("profit_factor"),
+                capital_scaling.get("win_rate"),
+            )
         # Sprint 1 §2.8 — session-aligned leverage cap (no-op when flag off).
         leverage = self._apply_session_leverage_cap(leverage)
         # Sprint 1 §2.7 — portfolio drawdown kill (returns size_multiplier in [0,1]).
@@ -2605,7 +2944,7 @@ class FuturesRuntime:
         # Portfolio margin cap. Default 0 means: cap = max_concurrent_positions * margin_budget.
         cap = self.config.max_total_margin_usdt
         if cap <= 0:
-            cap = self.config.margin_budget_usdt * self.config.max_concurrent_positions
+            cap = self.config.margin_budget_usdt * self.config.max_concurrent_positions * max(1.0, capital_multiplier)
         if self._total_open_margin() + projected_margin > cap * 1.0001:
             log.info(
                 "Futures signal skipped for %s: portfolio margin cap (%.2f + %.2f > %.2f)",
@@ -2640,7 +2979,15 @@ class FuturesRuntime:
                 score=float(signal_payload["score"]),
                 certainty=float(signal_payload["certainty"]),
                 entry_signal=str(signal_payload["entry_signal"]),
-                metadata=dict(signal_payload.get("metadata", {}) or {}),
+                metadata=signal_metadata,
+            )
+            self._attach_execution_quality(
+                position=position,
+                intended_price=entry_price,
+                fill_price=entry_price,
+                mode="paper",
+                order_id="PAPER",
+                maker_filled=False,
             )
             self._attach_execution_canary(
                 position=position,
@@ -2725,7 +3072,15 @@ class FuturesRuntime:
             score=float(signal_payload["score"]),
             certainty=float(signal_payload["certainty"]),
             entry_signal=str(signal_payload["entry_signal"]),
-            metadata=dict(signal_payload.get("metadata", {}) or {}),
+            metadata=signal_metadata,
+        )
+        self._attach_execution_quality(
+            position=position,
+            intended_price=entry_price,
+            fill_price=fill_price,
+            mode="live",
+            order_id=order_id,
+            maker_filled=maker_filled,
         )
         self._attach_execution_canary(
             position=position,

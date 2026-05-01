@@ -424,6 +424,29 @@ def test_fetch_signal_passes_fresh_event_context_to_strategy(tmp_path, monkeypat
     assert captured["event_count"] >= 1
 
 
+def test_missed_opportunity_report_records_and_persists_blocked_move(tmp_path, caplog):
+    runtime = FuturesRuntime(_config(tmp_path), StubClient())
+
+    with caplog.at_level(logging.INFO, logger="futuresbot.runtime"):
+        runtime._record_missed_opportunity(
+            symbol="BTC_USDT",
+            frame_15m=runtime.client.frame,
+            reason="volume_ratio=0.8<1.0",
+            impulse_reason="impulse_score=40<55",
+        )
+    runtime._save_state()
+
+    record = runtime.missed_opportunities["BTC_USDT"]
+    assert record["blocking_gate"] == "volume_ratio=0.8<1.0"
+    assert record["abs_move_pct"] > 0.0
+    assert "mfe_r" in record
+    assert any("[MISSED_OPPORTUNITY]" in entry.message for entry in caplog.records)
+
+    reloaded = FuturesRuntime(_config(tmp_path), StubClient())
+    assert reloaded.missed_opportunities["BTC_USDT"]["blocking_gate"] == "volume_ratio=0.8<1.0"
+    assert reloaded._status_payload()["missed_opportunities"]["BTC_USDT"]["abs_move_pct"] == record["abs_move_pct"]
+
+
 def test_enter_trade_rejects_duplicate_symbol(tmp_path):
     runtime = FuturesRuntime(_config(tmp_path), StubClient())
     runtime._register_position(_make_position("BTC_USDT"))
@@ -472,6 +495,56 @@ def test_enter_trade_respects_portfolio_margin_cap(tmp_path):
     assert "ETH_USDT" not in runtime.open_positions
 
 
+def test_capital_scaling_increases_margin_only_after_clean_fills(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUTURES_CAPITAL_SCALE_REQUIRE_LIVE", "0")
+    monkeypatch.setenv("FUTURES_CAPITAL_SCALE_MIN_CLEAN_FILLS", "3")
+    monkeypatch.setenv("FUTURES_CAPITAL_SCALE_INCREMENT", "0.5")
+    monkeypatch.setenv("FUTURES_CAPITAL_SCALE_MAX_MULT", "1.5")
+
+    class ContractClient(StubClient):
+        def get_contract_detail(self, symbol: str) -> dict[str, object]:
+            return {"contractSize": 0.01, "minVol": 1}
+
+    runtime = FuturesRuntime(replace(_config(tmp_path), margin_budget_usdt=50.0), ContractClient())
+    for _ in range(3):
+        runtime.trade_history.append(
+            {
+                "pnl_usdt": 5.0,
+                "fees_usdt": 1.0,
+                "execution_quality": {
+                    "mode": "paper",
+                    "entry_slippage_bps": 0.0,
+                    "exit_slippage_bps": 0.0,
+                    "estimated_round_trip_fee_usdt": 1.0,
+                    "fees_usdt": 1.0,
+                },
+            }
+        )
+
+    multiplier, details = runtime._capital_scaling_multiplier()
+    assert multiplier == 1.5
+    assert details["clean_fills"] == 3
+
+    signal = {
+        "side": "LONG",
+        "entry_price": 100.0,
+        "leverage": 5,
+        "symbol": "BTC_USDT",
+        "tp_price": 104.0,
+        "sl_price": 98.0,
+        "score": 70.0,
+        "certainty": 0.75,
+        "entry_signal": "EVENT_CATALYST_LONG",
+        "metadata": {},
+    }
+
+    assert runtime._enter_trade(signal) is True
+    position = runtime.open_position
+    assert position is not None
+    assert position.margin_usdt > 50.0
+    assert position.metadata["setup_regime"] == "EVENT_CATALYST_LONG"
+
+
 def test_first_trade_execution_canary_reports_on_close(tmp_path, caplog):
     class ContractClient(StubClient):
         def get_contract_detail(self, symbol: str) -> dict[str, object]:
@@ -500,6 +573,7 @@ def test_first_trade_execution_canary_reports_on_close(tmp_path, caplog):
         runtime._close_history_trade(position, exit_price=104.0, reason="TAKE_PROFIT")
 
     assert runtime.trade_history[-1]["execution_canary_reported"] is True
+    assert "execution_quality" in runtime.trade_history[-1]
     assert runtime.trade_history[-1]["execution_canary"]["realized_pnl_usdt"] > 0
     assert any("[EXECUTION_CANARY]" in record.message for record in caplog.records)
 

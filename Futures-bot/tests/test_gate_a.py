@@ -23,10 +23,14 @@ from futuresbot.calibration import (
     _derive_entry_adjustment,
     _json_safe,
     _profit_factor,
+    apply_signal_calibration,
     build_trade_calibration,
+    get_entry_adjustment,
+    setup_regime_for_signal,
     write_trade_calibration,
 )
 from futuresbot.config import FuturesConfig
+from futuresbot.models import FuturesSignal
 from futuresbot.runtime import FuturesRuntime
 from futuresbot.strategy import diagnose_setup_rejection
 
@@ -143,6 +147,91 @@ def test_below_tighten_floor_holds_neutral():
     }
     adj = _derive_entry_adjustment(metrics, min_trades=4, min_trades_loosen=40)
     assert adj == {"threshold_offset": 0.0, "risk_mult": 1.0, "block_reason": None}
+
+
+def test_trade_calibration_builds_setup_regime_buckets():
+    now = datetime.now(timezone.utc)
+    trades = []
+    for _ in range(8):
+        trades.append(
+            {
+                "pnl_usdt": -2.0,
+                "strategy": "BTC_FUTURES",
+                "symbol": "TAO_USDT",
+                "side": "LONG",
+                "entry_signal": "IMPULSE_EVENT_LONG",
+            }
+        )
+        trades.append(
+            {
+                "pnl_usdt": 2.0,
+                "strategy": "BTC_FUTURES",
+                "symbol": "BTC_USDT",
+                "side": "LONG",
+                "entry_signal": "COIL_BREAKOUT_LONG",
+            }
+        )
+
+    calib = build_trade_calibration(
+        trades,
+        window_start=now - timedelta(days=60),
+        window_end=now,
+        min_strategy_trades=4,
+        min_symbol_trades=4,
+        min_strategy_trades_loosen=40,
+        min_symbol_trades_loosen=40,
+    )
+
+    assert "IMPULSE_EVENT_LONG" in calib["by_strategy_regime"]["BTC_FUTURES"]
+    assert "BREAKOUT_LONG" in calib["by_strategy_regime"]["BTC_FUTURES"]
+    impulse_adj = get_entry_adjustment(
+        calib,
+        "BTC_FUTURES",
+        "TAO_USDT",
+        "IMPULSE_EVENT_LONG",
+        setup_regime_for_signal("IMPULSE_EVENT_LONG", "LONG"),
+    )
+    coil_adj = get_entry_adjustment(
+        calib,
+        "BTC_FUTURES",
+        "BTC_USDT",
+        "COIL_BREAKOUT_LONG",
+        setup_regime_for_signal("COIL_BREAKOUT_LONG", "LONG"),
+    )
+    assert impulse_adj["threshold_offset"] > 0.0
+    assert impulse_adj["risk_mult"] < 1.0
+    assert coil_adj["threshold_offset"] == 0.0
+
+
+def test_apply_signal_calibration_uses_risk_off_short_regime_block():
+    calibration = {
+        "entry_adjustments": {
+            "by_strategy_regime": {
+                "BTC_FUTURES": {
+                    "RISK_OFF_SHORT": {
+                        "threshold_offset": 0.0,
+                        "risk_mult": 1.0,
+                        "block_reason": "calibration block: weak risk-off shorts",
+                    }
+                }
+            }
+        }
+    }
+    signal = FuturesSignal(
+        symbol="ETH_USDT",
+        side="SHORT",
+        score=90.0,
+        certainty=0.8,
+        entry_price=3000.0,
+        tp_price=2900.0,
+        sl_price=3050.0,
+        leverage=20,
+        entry_signal="EVENT_CATALYST_SHORT",
+        metadata={},
+    )
+
+    assert apply_signal_calibration(signal, calibration, base_threshold=50.0, leverage_min=5, leverage_max=50) is None
+    assert signal.metadata["calibration_block_reason"] == "calibration block: weak risk-off shorts"
 
 
 # ---------------------------------------------------------------------------
