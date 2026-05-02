@@ -69,6 +69,14 @@ def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatc
     assert "TRINITY" not in config.strategies
     assert config.trinity_allocation_pct == 0.0
     assert config.blocked_signal_lanes == ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"]
+    assert config.scalper_allocation_pct == 0.25
+    assert config.moonshot_allocation_pct == 0.65
+    assert config.grid_allocation_pct == 0.10
+    assert config.scalper_budget_pct == 0.50
+    assert config.moonshot_budget_pct == 0.03
+    assert config.reversal_budget_pct == 0.85
+    assert config.grid_budget_pct == 0.45
+    assert config.min_expected_net_profit_usdt == 0.20
 
 
 def test_backtest_config_parses_synthetic_exchange_knobs(monkeypatch: pytest.MonkeyPatch):

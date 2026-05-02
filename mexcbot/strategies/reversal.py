@@ -55,6 +55,13 @@ REVERSAL_SL_ATR_MULT = env_float("REVERSAL_SL_ATR_MULT", 1.5)
 REVERSAL_MIN_REWARD_RISK = env_float("REVERSAL_MIN_REWARD_RISK", 0.30)
 
 REVERSAL_MIN_SCORE = env_float("REVERSAL_MIN_SCORE", 45.0)
+REVERSAL_DIVERGENCE_CLIMAX_MIN_SCORE = env_float("REVERSAL_DIVERGENCE_CLIMAX_MIN_SCORE", 70.0)
+
+
+def _passes_entry_signal_score_gate(entry_signal: str, score: float) -> bool:
+    if entry_signal == "DIVERGENCE_CLIMAX" and score < REVERSAL_DIVERGENCE_CLIMAX_MIN_SCORE:
+        return False
+    return True
 
 
 def _detect_rsi_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 20) -> float:
@@ -280,6 +287,8 @@ def score_reversal_from_frame(
     score = round(drop_score + rsi_score + div_score + climax_score + hammer_score + bounce_score + vol_score, 2)
 
     if score < max(score_threshold, REVERSAL_MIN_SCORE):
+        return None
+    if not _passes_entry_signal_score_gate(entry_signal, score):
         return None
 
     # --- TP / SL ---

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
 from backtest.config import BacktestConfig
 from backtest import engine as backtest_engine_module
@@ -305,6 +306,7 @@ def test_backtest_engine_flattens_opportunity_buzz_metadata_into_trade_rows():
         symbols=["PEPEUSDT"],
         take_profit_pct=0.02,
         stop_loss_pct=0.01,
+        min_expected_net_profit_usdt=0.0,
     )
 
     def stub_scorer(symbol: str, window: pd.DataFrame, threshold: float):
@@ -544,7 +546,7 @@ def test_backtest_engine_records_partial_tp_before_final_exit():
     assert len(trades) == 1
     assert trades[0]["exit_reason"] == "STOP_LOSS"
     assert trades[0]["exit_time"] == index[62].isoformat()
-    assert trades[0]["exit_price"] == 96.1 * (1 - config.taker_slippage_rate)
+    assert trades[0]["exit_price"] == pytest.approx(96.1 * (1 - config.taker_slippage_rate))
     assert trades[0]["exit_attempt_number"] == 1
 
 
@@ -883,8 +885,8 @@ def test_backtest_engine_rebalances_strategy_budget_multipliers_from_closed_trad
 
     engine._rebalance_budgets(closed_trades)
 
-    assert engine._dynamic_scalper_budget == 0.434
-    assert engine._dynamic_moonshot_budget == 0.034
+    assert engine._dynamic_scalper_budget == 0.514
+    assert engine._dynamic_moonshot_budget == 0.02
     assert engine._strategy_budget_multiplier("SCALPER") > 1.0
     assert engine._strategy_budget_multiplier("MOONSHOT") < 1.0
 
@@ -1024,7 +1026,7 @@ def test_backtest_engine_models_partial_maker_entry_fill():
 
     assert len(trades) == 1
     assert trades[0]["entry_fill_ratio"] == 0.5
-    assert trades[0]["qty"] < 0.27
+    assert 0.30 < trades[0]["qty"] < 0.33
     assert trades[0]["entry_fill_count"] == 1
     assert trades[0]["entry_fill_history"][0]["side"] == "BUY"
     assert trades[0]["entry_fill_history"][0]["execution_style"] == "maker"

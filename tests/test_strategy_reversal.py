@@ -1,6 +1,12 @@
 import pandas as pd
 
-from mexcbot.strategies.reversal import score_reversal_from_frame
+from mexcbot.strategies.reversal import _passes_entry_signal_score_gate, score_reversal_from_frame
+
+
+def test_divergence_climax_requires_high_score_before_sizing():
+    assert _passes_entry_signal_score_gate("DIVERGENCE_CLIMAX", 69.99) is False
+    assert _passes_entry_signal_score_gate("DIVERGENCE_CLIMAX", 70.0) is True
+    assert _passes_entry_signal_score_gate("MULTI_REVERSAL", 50.0) is True
 
 
 def test_score_reversal_from_frame_returns_capitulation_bounce_setup():
