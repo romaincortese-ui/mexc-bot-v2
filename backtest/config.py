@@ -76,7 +76,7 @@ class BacktestConfig:
     interval: str = "5m"
     initial_balance: float = 500.0
     trade_budget: float = 50.0
-    max_open_positions: int = 3
+    max_open_positions: int = 5
     reentry_cooldown_bars: int = 12
     timeout_cooldown_bars: int = 288  # 24h at 5-min bars; extended cooldown after TIMEOUT exits
     maker_fee_rate: float = 0.0
@@ -194,7 +194,7 @@ class BacktestConfig:
             interval=interval,
             initial_balance=env_float("BACKTEST_INITIAL_BALANCE", 500.0),
             trade_budget=env_float("BACKTEST_TRADE_BUDGET", env_float("TRADE_BUDGET", 50.0)),
-            max_open_positions=env_int("BACKTEST_MAX_OPEN_POSITIONS", env_int("MAX_OPEN_POSITIONS", 3)),
+            max_open_positions=env_int("BACKTEST_MAX_OPEN_POSITIONS", env_int("MAX_OPEN_POSITIONS", 5)),
             reentry_cooldown_bars=env_int("BACKTEST_REENTRY_COOLDOWN_BARS", 12),
             timeout_cooldown_bars=env_int("BACKTEST_TIMEOUT_COOLDOWN_BARS", 288),
             maker_fee_rate=env_float("BACKTEST_MAKER_FEE_RATE", 0.0),

@@ -185,7 +185,7 @@ class LiveConfig:
             score_threshold=env_float("SCORE_THRESHOLD", 37.0),
             scalper_threshold=env_float("SCALPER_THRESHOLD", env_float("SCORE_THRESHOLD", 42.0)),
             moonshot_min_score=env_float("MOONSHOT_MIN_SCORE", 32.0),
-            max_open_positions=env_int("MAX_OPEN_POSITIONS", 3),
+            max_open_positions=env_int("MAX_OPEN_POSITIONS", 5),
             strategies=env_csv("MEXCBOT_STRATEGIES", "SCALPER,GRID,MOONSHOT,REVERSAL"),
             moonshot_symbols=env_csv("MOONSHOT_SYMBOLS", "SOLUSDT,DOGEUSDT,PEPEUSDT,ENAUSDT,WIFUSDT"),
             reversal_symbols=env_csv("REVERSAL_SYMBOLS", "SOLUSDT,DOGEUSDT,ETHUSDT,PEPEUSDT,WIFUSDT"),

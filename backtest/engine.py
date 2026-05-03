@@ -526,24 +526,21 @@ class BacktestEngine:
         total_equity: float,
         open_trades: list[dict],
     ) -> float:
-        allocation_mult = float(opportunity.metadata.get("allocation_mult", 1.0) or 1.0)
-        pool_cap = total_equity * self._strategy_capital_pct(opportunity.strategy)
-        per_trade_cap = pool_cap * self._strategy_budget_pct(opportunity.strategy) * allocation_mult
-        available_pool_cap = self._strategy_available_capital(
-            opportunity.strategy,
-            total_equity=total_equity,
-            open_trades=open_trades,
-        )
-        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
-        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
-        opportunity.metadata["strategy_available_cap_usdt"] = round(available_pool_cap, 4)
+        # Simplified confidence-based allocation:
+        # minimum 10% of cash balance, up to 20% scaled by score (0-100).
+        if cash_balance <= 0:
+            return 0.0
+        score = float(opportunity.score or 0.0)
+        score_fraction = min(1.0, max(0.0, score / 100.0))
+        # 10% base + up to 10% extra based on confidence
+        alloc_pct = 0.10 + score_fraction * 0.10  # range: [0.10, 0.20]
+        opportunity.metadata["strategy_budget_pct"] = round(alloc_pct, 4)
+        opportunity.metadata["score_fraction"] = round(score_fraction, 4)
         context = self._market_context()
         opportunity.metadata["market_context"] = str(context["label"])
         opportunity.metadata["market_context_budget_mult"] = round(float(context["budget_mult"]), 4)
-        allocation = min(cash_balance, available_pool_cap, per_trade_cap) * float(context["budget_mult"])
-        if allocation <= 0:
-            return 0.0
-        return allocation
+        allocation = cash_balance * alloc_pct * float(context["budget_mult"])
+        return max(0.0, allocation)
 
     def _update_market_regime(self, timestamp: pd.Timestamp, btc_frame: pd.DataFrame | None) -> None:
         if btc_frame is None or btc_frame.empty:

@@ -3613,36 +3613,22 @@ class LiveBotRuntime:
         )
 
     def _allocation_usdt_for_opportunity_with_equity(self, opportunity: Opportunity, *, available_balance: float, total_equity: float) -> float:
-        allocation_mult = float(opportunity.metadata.get("allocation_mult", 1.0) or 1.0)
-        pool_cap = total_equity * self._strategy_capital_pct(opportunity.strategy)
-        per_trade_cap = pool_cap * self._strategy_budget_pct(opportunity.strategy) * allocation_mult
-        available_pool_cap = self._strategy_available_capital(opportunity.strategy, total_equity=total_equity)
-        opportunity.metadata["strategy_pool_cap_usdt"] = round(pool_cap, 4)
-        opportunity.metadata["strategy_budget_pct"] = round(self._strategy_budget_pct(opportunity.strategy), 6)
-        opportunity.metadata["strategy_available_cap_usdt"] = round(available_pool_cap, 4)
-        capped_budget = min(per_trade_cap, available_pool_cap, available_balance)
-        if capped_budget <= 0:
+        # Simplified confidence-based allocation:
+        # minimum 10% of available balance, up to 20% scaled by score (0-100).
+        if available_balance <= 0:
             return 0.0
-        # Sprint memo composite multiplier (1.0 when all flags OFF).
+        score = float(opportunity.score or 0.0)
+        score_fraction = min(1.0, max(0.0, score / 100.0))
+        # 10% base + up to 10% extra based on confidence
+        alloc_pct = 0.10 + score_fraction * 0.10  # range: [0.10, 0.20]
+        opportunity.metadata["strategy_budget_pct"] = round(alloc_pct, 4)
+        opportunity.metadata["score_fraction"] = round(score_fraction, 4)
+        opportunity.metadata.pop("kelly_mult", None)
+        opportunity.metadata.pop("risk_budget_usdt", None)
+        # Sprint memo composite multiplier handles market-context / event overlays.
         sprint_mult = self._sprint_sizing_multiplier(opportunity, total_equity=total_equity)
-        if opportunity.strategy.upper() != "SCALPER":
-            opportunity.metadata.pop("kelly_mult", None)
-            opportunity.metadata.pop("risk_budget_usdt", None)
-            return capped_budget * sprint_mult
-
-        sl_pct = float(opportunity.sl_pct or 0.0)
-        if sl_pct <= 0:
-            opportunity.metadata.pop("kelly_mult", None)
-            opportunity.metadata.pop("risk_budget_usdt", None)
-            return capped_budget * sprint_mult
-
-        kelly_mult = self._kelly_multiplier(opportunity)
-        risk_per_trade = min(SCALPER_RISK_PER_TRADE * kelly_mult, KELLY_RISK_CAP)
-        risk_budget = total_equity * risk_per_trade / sl_pct
-        allocation = min(risk_budget, capped_budget) * sprint_mult
-        opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
-        opportunity.metadata["risk_budget_usdt"] = round(allocation, 4)
-        return allocation
+        allocation = available_balance * alloc_pct * sprint_mult
+        return max(0.0, allocation)
 
     def _expected_profit_fields(self, opportunity: Opportunity, allocation_usdt: float) -> dict[str, float]:
         tp_pct = float(opportunity.tp_pct if opportunity.tp_pct is not None else self.config.take_profit_pct)
