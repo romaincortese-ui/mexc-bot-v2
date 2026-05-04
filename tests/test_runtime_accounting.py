@@ -6,6 +6,7 @@ from pathlib import Path
 import mexcbot.runtime as runtime_module
 
 from mexcbot.config import LiveConfig
+from mexcbot.depth_sizing import BookLevel
 from mexcbot.models import Trade
 from mexcbot.runtime import LiveBotRuntime, compute_market_regime_multiplier
 
@@ -28,6 +29,7 @@ class StubClient:
         self.asset_balance_sequence = []
         self.order_status_by_id = {}
         self.price_by_symbol = {}
+        self.orderbook_levels_by_symbol = {}
         self.convert_dust_result = {"converted": [], "failed": [], "total_mx": 0.0, "fee_mx": 0.0, "requested": []}
         self.convert_dust_calls = []
         self.chase_limit_result = None
@@ -162,6 +164,13 @@ class StubClient:
     def get_orderbook_spread(self, symbol: str, limit: int = 5):
         return 0.001
 
+    def get_orderbook_levels(self, symbol: str, *, side: str = "BUY", limit: int = 20):
+        configured = self.orderbook_levels_by_symbol.get(symbol)
+        if configured is not None:
+            return list(configured)
+        price = self.get_price(symbol)
+        return [BookLevel(price=price, qty=10_000.0)]
+
     def get_klines(self, symbol: str, interval: str = "5m", limit: int = 60):
         if symbol == "BTCUSDT" and interval == "1h":
             if self.btc_klines_failures > 0:
@@ -264,6 +273,11 @@ def _config(**overrides) -> LiveConfig:
         signal_perf_gate_lookback_trades=30,
         signal_perf_gate_pause_hours=24,
         min_expected_net_profit_usdt=0.10,
+        depth_sizing_enabled=True,
+        depth_sizing_impact_budget_bps=5.0,
+        depth_sizing_depth_factor=0.40,
+        depth_sizing_orderbook_limit=20,
+        depth_sizing_min_notional_usdt=5.0,
         market_context_enabled=True,
         market_context_bull_budget_mult=1.10,
         market_context_sideways_budget_mult=1.00,
@@ -374,6 +388,28 @@ def test_open_and_close_emit_structured_trade_audit_lines(caplog):
     assert closed["total_fees_usdt"] == 0.195
     assert closed["net_entry_price"] == 10.01
     assert closed["net_exit_price"] == 9.4905
+
+
+def test_open_position_caps_allocation_to_orderbook_depth():
+    client = StubClient()
+    client.orderbook_levels_by_symbol["DOGEUSDT"] = [BookLevel(price=10.0, qty=2.0)]
+    client.buy_order_result = {
+        "orderId": "BUY_DEPTH",
+        "status": "FILLED",
+        "executedQty": "1",
+        "cummulativeQuoteQty": "10",
+        "fills": [{"price": "10", "qty": "1", "commission": "0.01", "commissionAsset": "USDT"}],
+    }
+    runtime = LiveBotRuntime(_config(depth_sizing_depth_factor=0.50), client)
+    opportunity = _opportunity()
+
+    trade = runtime.open_position(opportunity, allocation_usdt=100.0)
+
+    assert trade is not None
+    assert client.buy_order_calls[0][1] == 1.0
+    assert opportunity.metadata["depth_requested_notional"] == 100.0
+    assert opportunity.metadata["depth_capped_notional"] == 10.0
+    assert opportunity.metadata["depth_binding_constraint"] == "book_exhausted"
 
 
 def test_open_position_reconciles_base_asset_entry_fee_from_my_trades():
@@ -1092,7 +1128,7 @@ def test_rebalance_budgets_shifts_allocation_toward_better_strategy():
     assert runtime._strategy_budget_multiplier("MOONSHOT") < 1.0
 
 
-def test_scalper_kelly_sizing_reduces_low_conviction_allocation_below_budget_cap():
+def test_scalper_kelly_sizing_reduces_low_conviction_score_allocation():
     runtime = LiveBotRuntime(_config(trade_budget=500.0), StubClient())
     opportunity = _opportunity(strategy="SCALPER")
     opportunity.score = 30.0
@@ -1100,11 +1136,11 @@ def test_scalper_kelly_sizing_reduces_low_conviction_allocation_below_budget_cap
 
     allocation = runtime._allocation_usdt_for_opportunity(opportunity, available_balance=1000.0)
 
-    assert allocation == 105.0
+    assert allocation == 75.0
     assert opportunity.metadata["kelly_mult"] == 0.5
 
 
-def test_scalper_kelly_sizing_caps_high_conviction_allocation_at_budget_cap():
+def test_scalper_kelly_sizing_expands_high_conviction_score_allocation():
     runtime = LiveBotRuntime(_config(trade_budget=500.0), StubClient())
     opportunity = _opportunity(strategy="SCALPER")
     opportunity.score = 70.0
@@ -1116,7 +1152,7 @@ def test_scalper_kelly_sizing_caps_high_conviction_allocation_at_budget_cap():
         total_equity=5000.0,
     )
 
-    assert allocation == 525.0
+    assert allocation == 375.0
     assert opportunity.metadata["kelly_mult"] == 1.5
 
 
@@ -1158,7 +1194,7 @@ def test_strategy_available_capital_uses_shared_moonshot_pool():
     assert available == 10.0
 
 
-def test_reversal_uses_dedicated_trade_cap_inside_moonshot_pool():
+def test_reversal_and_moonshot_use_score_based_allocation_metadata():
     runtime = LiveBotRuntime(_config(), StubClient())
     reversal = _opportunity(strategy="REVERSAL")
     moonshot = _opportunity(strategy="MOONSHOT")
@@ -1174,22 +1210,22 @@ def test_reversal_uses_dedicated_trade_cap_inside_moonshot_pool():
         total_equity=227.0,
     )
 
-    assert round(reversal_allocation, 3) == 12.258
-    assert round(moonshot_allocation, 3) == 4.903
-    assert reversal.metadata["strategy_budget_pct"] == 0.12
-    assert moonshot.metadata["strategy_budget_pct"] == 0.048
+    assert round(reversal_allocation, 3) == 10.0
+    assert round(moonshot_allocation, 3) == 16.0
+    assert reversal.metadata["strategy_budget_pct"] == 0.1
+    assert moonshot.metadata["strategy_budget_pct"] == 0.16
 
 
-def test_trinity_allocation_is_capped_by_trinity_pool_and_per_trade_budget_pct():
+def test_trinity_allocation_uses_score_floor_when_below_threshold():
     runtime = LiveBotRuntime(_config(), StubClient())
     opportunity = _opportunity(strategy="TRINITY")
 
     allocation = runtime._allocation_usdt_for_opportunity_with_equity(opportunity, available_balance=100.0, total_equity=100.0)
 
-    assert allocation == 2.0
+    assert allocation == 10.0
 
 
-def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeypatch, caplog):
+def test_fill_open_slots_can_use_score_allocation_when_legacy_pool_is_exhausted(monkeypatch, caplog):
     runtime = LiveBotRuntime(_config(strategies=["TRINITY"]), StubClient())
     existing = Trade(
         symbol="BTCUSDT",
@@ -1224,10 +1260,9 @@ def test_fill_open_slots_skips_candidate_when_strategy_pool_is_exhausted(monkeyp
     with caplog.at_level(logging.INFO, logger="mexcbot"):
         runtime._fill_open_slots()
 
-    assert len(runtime.open_trades) == 1
+    assert len(runtime.open_trades) == 2
     assert captured["calls"] >= 2
-    assert "[ENTRY_BLOCK]" in caplog.text
-    assert "strategy_pool_or_cash_exhausted" in caplog.text
+    assert "[ENTRY]" in caplog.text
 
 
 def test_dead_coin_blacklist_trips_after_repeated_liquidity_failures():

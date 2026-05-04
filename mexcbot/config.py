@@ -110,6 +110,11 @@ class LiveConfig:
     signal_perf_gate_lookback_trades: int
     signal_perf_gate_pause_hours: int
     min_expected_net_profit_usdt: float
+    depth_sizing_enabled: bool
+    depth_sizing_impact_budget_bps: float
+    depth_sizing_depth_factor: float
+    depth_sizing_orderbook_limit: int
+    depth_sizing_min_notional_usdt: float
     market_context_enabled: bool
     market_context_bull_budget_mult: float
     market_context_sideways_budget_mult: float
@@ -231,6 +236,11 @@ class LiveConfig:
             signal_perf_gate_lookback_trades=env_int("SIGNAL_PERF_GATE_LOOKBACK_TRADES", 30),
             signal_perf_gate_pause_hours=env_int("SIGNAL_PERF_GATE_PAUSE_HOURS", 24),
             min_expected_net_profit_usdt=env_float("MIN_EXPECTED_NET_PROFIT_USDT", env_float("MEXCBOT_MIN_EXPECTED_NET_PROFIT_USDT", 0.20)),
+            depth_sizing_enabled=env_bool("DEPTH_SIZING_ENABLED", True),
+            depth_sizing_impact_budget_bps=env_float("DEPTH_SIZING_IMPACT_BPS", 5.0),
+            depth_sizing_depth_factor=env_float("DEPTH_SIZING_DEPTH_FACTOR", 0.40),
+            depth_sizing_orderbook_limit=env_int("DEPTH_SIZING_ORDERBOOK_LIMIT", 20),
+            depth_sizing_min_notional_usdt=env_float("DEPTH_SIZING_MIN_NOTIONAL_USDT", 5.0),
             market_context_enabled=env_bool("MARKET_CONTEXT_ENABLED", True),
             market_context_bull_budget_mult=env_float("MARKET_CONTEXT_BULL_BUDGET_MULT", 1.10),
             market_context_sideways_budget_mult=env_float("MARKET_CONTEXT_SIDEWAYS_BUDGET_MULT", 1.00),

@@ -1026,7 +1026,7 @@ def test_backtest_engine_models_partial_maker_entry_fill():
 
     assert len(trades) == 1
     assert trades[0]["entry_fill_ratio"] == 0.5
-    assert 0.30 < trades[0]["qty"] < 0.33
+    assert 0.12 < trades[0]["qty"] < 0.13
     assert trades[0]["entry_fill_count"] == 1
     assert trades[0]["entry_fill_history"][0]["side"] == "BUY"
     assert trades[0]["entry_fill_history"][0]["execution_style"] == "maker"

@@ -25,6 +25,7 @@ from mexcbot.calibration import (
 )
 from mexcbot.config import LiveConfig, env_bool, env_float, env_int
 from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
+from mexcbot.depth_sizing import size_against_book
 from mexcbot.exchange import MexcClient, OrderExecution
 from mexcbot.exits import evaluate_trade_action
 from mexcbot.event_overlay import evaluate_event_state_opportunity_boost, evaluate_event_state_overlay
@@ -3864,6 +3865,62 @@ class LiveBotRuntime:
             self._record_liquidity_blocked_opportunity(opportunity, vol_24h=vol_24h, spread=spread)
         return passed
 
+    def _apply_depth_sizing_cap(self, opportunity: Opportunity, allocation_usdt: float) -> float:
+        opportunity.metadata["depth_sizing_enabled"] = bool(self.config.depth_sizing_enabled)
+        if allocation_usdt <= 0 or not self.config.depth_sizing_enabled:
+            return max(0.0, float(allocation_usdt))
+        try:
+            levels = self.client.get_orderbook_levels(
+                opportunity.symbol,
+                side="BUY",
+                limit=max(1, int(self.config.depth_sizing_orderbook_limit or 1)),
+            )
+        except Exception as exc:
+            opportunity.metadata["depth_sizing_error"] = str(exc)[:160]
+            return max(0.0, float(allocation_usdt))
+        if not levels:
+            opportunity.metadata["depth_sizing_error"] = "empty_orderbook"
+            return max(0.0, float(allocation_usdt))
+
+        reference_price = float(levels[0].price or opportunity.price)
+        sizing = size_against_book(
+            side="BUY",
+            reference_price=reference_price,
+            target_notional=float(allocation_usdt),
+            levels=levels,
+            impact_budget_bps=float(self.config.depth_sizing_impact_budget_bps),
+            depth_factor=float(self.config.depth_sizing_depth_factor),
+        )
+        capped_allocation = min(float(allocation_usdt), max(0.0, float(sizing.max_notional)))
+        opportunity.metadata.update(
+            {
+                "depth_sizing_applied": True,
+                "depth_requested_notional": round(float(allocation_usdt), 8),
+                "depth_max_notional": round(float(sizing.max_notional), 8),
+                "depth_capped_notional": round(capped_allocation, 8),
+                "depth_reference_price": round(reference_price, 12),
+                "depth_vwap": round(float(sizing.vwap), 12),
+                "depth_impact_bps": round(float(sizing.impact_bps), 6),
+                "depth_binding_constraint": sizing.binding_constraint,
+                "depth_book_levels": len(levels),
+            }
+        )
+        min_notional = max(0.0, float(self.config.depth_sizing_min_notional_usdt or 0.0))
+        if capped_allocation < min_notional:
+            opportunity.metadata["depth_sizing_block_reason"] = "cap_below_min_notional"
+            return 0.0
+        if capped_allocation < float(allocation_usdt) * 0.999:
+            log.info(
+                "Depth cap %s [%s] allocation %.2f -> %.2f USDT | impact %.2fbps | %s",
+                opportunity.symbol,
+                opportunity.strategy,
+                allocation_usdt,
+                capped_allocation,
+                sizing.impact_bps,
+                sizing.binding_constraint,
+            )
+        return capped_allocation
+
     def _update_adaptive_thresholds(self) -> None:
         min_trades_for_adjust = max(10, self.config.adaptive_window // 2)
         for strategy in ADAPTIVE_THRESHOLD_STRATEGIES:
@@ -4038,6 +4095,11 @@ class LiveBotRuntime:
             return 0.0
 
     def open_position(self, opportunity: Opportunity, allocation_usdt: float) -> Trade | None:
+        if not opportunity.metadata.get("depth_sizing_applied"):
+            allocation_usdt = self._apply_depth_sizing_cap(opportunity, allocation_usdt)
+            if allocation_usdt <= 0:
+                log.warning("%s depth cap below minimum notional, skipping", opportunity.symbol)
+                return None
         lot = self.client.get_lot_size(opportunity.symbol)
         step = float(lot.get("stepSize", 0.001))
         min_qty = float(lot.get("minQty", 0.001))
@@ -4203,6 +4265,18 @@ class LiveBotRuntime:
                     total_equity=_audit_float(total_equity or available_balance, 4),
                     pool_cap_usdt=_audit_float(opportunity.metadata.get("strategy_pool_cap_usdt"), 4),
                     strategy_budget_pct=_audit_float(opportunity.metadata.get("strategy_budget_pct"), 6),
+                )
+                cycle_excluded.add(opportunity.symbol)
+                continue
+            allocation_usdt = self._apply_depth_sizing_cap(opportunity, allocation_usdt)
+            if allocation_usdt <= 0:
+                self._log_entry_block(
+                    opportunity,
+                    "depth_sizing",
+                    detail=str(opportunity.metadata.get("depth_sizing_block_reason") or opportunity.metadata.get("depth_sizing_error") or "depth_cap"),
+                    depth_requested_notional=_audit_float(opportunity.metadata.get("depth_requested_notional"), 4),
+                    depth_max_notional=_audit_float(opportunity.metadata.get("depth_max_notional"), 4),
+                    depth_impact_bps=_audit_float(opportunity.metadata.get("depth_impact_bps"), 4),
                 )
                 cycle_excluded.add(opportunity.symbol)
                 continue

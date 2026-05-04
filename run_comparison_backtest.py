@@ -20,6 +20,9 @@ from backtest.data import HistoricalKlineProvider
 from backtest.engine import BacktestEngine
 
 
+MIN_CONFIDENCE_TRADES = 100
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -64,6 +67,19 @@ def _print_banner(title: str) -> None:
     print(f"\n{'='*60}")
     print(f"  {title}")
     print(f"{'='*60}")
+
+
+def _confidence(metrics: dict, *, minimum_trades: int = MIN_CONFIDENCE_TRADES) -> dict:
+    trades = int(metrics.get("trades", 0) or 0)
+    low_sample = trades < minimum_trades
+    return {
+        "minimum_recommended_trades": minimum_trades,
+        "observed_trades": trades,
+        "low_sample": low_sample,
+        "note": "Treat profitability metrics as directional until the sample reaches the recommended trade count."
+        if low_sample
+        else "Sample size meets the recommended minimum.",
+    }
 
 
 def run_backtest(config: BacktestConfig, label: str) -> tuple[list[dict], list[dict]]:
@@ -188,7 +204,7 @@ def main() -> None:
         grid_budget_pct=0.45,
     )
 
-    # NEW config (score-based 10-20%, max 5 positions)
+    # NEW config (score-based 10-25%, max 5 positions)
     cfg_new = BacktestConfig(
         **common_kwargs,
         max_open_positions=5,
@@ -211,7 +227,7 @@ def main() -> None:
 
     # Run NEW (score-based allocation, 5 positions)
     _Engine._allocation_usdt_for_candidate = _new_alloc
-    _eq_new, _trades_new = run_backtest(cfg_new, "NEW (score-based 10-20%, max 5 positions)")
+    _eq_new, _trades_new = run_backtest(cfg_new, "NEW (score-based 10-25%, max 5 positions)")
     m_new = _metrics(_trades_new, initial_balance)
 
     # Restore new method permanently
@@ -236,6 +252,15 @@ def main() -> None:
     row("Avg P&L / trade",   f"${m_prod['avg_pnl_per_trade']:+.4f}", f"${m_new['avg_pnl_per_trade']:+.4f}")
     print("-" * 58)
 
+    prod_confidence = _confidence(m_prod)
+    new_confidence = _confidence(m_new)
+    if prod_confidence["low_sample"] or new_confidence["low_sample"]:
+        print(
+            f"\n  Confidence: low sample "
+            f"(production {prod_confidence['observed_trades']}/{MIN_CONFIDENCE_TRADES}, "
+            f"new {new_confidence['observed_trades']}/{MIN_CONFIDENCE_TRADES})."
+        )
+
     delta_pnl = m_new["total_pnl"] - m_prod["total_pnl"]
     more_profitable = m_new["total_pnl"] > m_prod["total_pnl"]
     verdict = "✅ NEW IS MORE PROFITABLE" if more_profitable else "❌ PRODUCTION IS MORE PROFITABLE"
@@ -249,6 +274,10 @@ def main() -> None:
         "window_end": end.isoformat(),
         "production": m_prod,
         "new": m_new,
+        "confidence": {
+            "production": prod_confidence,
+            "new": new_confidence,
+        },
         "verdict": "new" if more_profitable else "production",
         "pnl_delta": round(delta_pnl, 4),
     }

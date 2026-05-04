@@ -10,6 +10,7 @@ from backtest.data import HistoricalKlineProvider
 from backtest.moonshot_proxy import score_backtest_moonshot_candidates
 from backtest.exchange_simulator import SyntheticExchangeSimulator
 from mexcbot.calibration import apply_opportunity_calibration
+from mexcbot.depth_sizing import BookLevel, size_against_book
 from mexcbot.exits import evaluate_trade_action, initialize_exit_state
 from mexcbot.models import Opportunity
 from mexcbot.runtime import compute_market_regime_multiplier
@@ -702,6 +703,95 @@ class BacktestEngine:
             return True
         return expected_net >= floor
 
+    def _synthetic_depth_levels(
+        self,
+        opportunity: Opportunity,
+        *,
+        data_key: str,
+        data: dict[str, pd.DataFrame],
+        timestamp: pd.Timestamp,
+        side: str = "BUY",
+    ) -> list[BookLevel]:
+        frame = data.get(data_key)
+        if frame is None:
+            return []
+        bar = self._latest_bar_until(frame, timestamp)
+        if bar is None:
+            return []
+        try:
+            volume_base = float(bar.get("volume", 0.0) or 0.0)
+            reference_price = float(opportunity.price or bar.get("close", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return []
+        if volume_base <= 0 or reference_price <= 0:
+            return []
+        participation = max(0.0, float(self.config.backtest_depth_bar_participation or 0.0))
+        synthetic_qty = volume_base * participation
+        if synthetic_qty <= 0:
+            return []
+        level_count = max(1, min(50, int(self.config.depth_sizing_orderbook_limit or 1)))
+        qty_per_level = synthetic_qty / level_count
+        step_bps = max(0.5, float(self.config.depth_sizing_impact_budget_bps or 5.0) / 4.0)
+        buy_side = str(side or "").strip().upper() in {"BUY", "LONG"}
+        levels: list[BookLevel] = []
+        for idx in range(level_count):
+            price_offset = (idx * step_bps) / 10_000.0
+            price = reference_price * (1.0 + price_offset if buy_side else 1.0 - price_offset)
+            if price > 0:
+                levels.append(BookLevel(price=price, qty=qty_per_level))
+        return levels
+
+    def _apply_depth_sizing_cap(
+        self,
+        opportunity: Opportunity,
+        allocation_usdt: float,
+        *,
+        data_key: str,
+        data: dict[str, pd.DataFrame],
+        timestamp: pd.Timestamp,
+    ) -> float:
+        opportunity.metadata["depth_sizing_enabled"] = bool(self.config.depth_sizing_enabled)
+        if allocation_usdt <= 0 or not self.config.depth_sizing_enabled:
+            return max(0.0, float(allocation_usdt))
+        levels = self._synthetic_depth_levels(
+            opportunity,
+            data_key=data_key,
+            data=data,
+            timestamp=timestamp,
+            side="BUY",
+        )
+        if not levels:
+            opportunity.metadata["depth_sizing_error"] = "synthetic_depth_unavailable"
+            return max(0.0, float(allocation_usdt))
+        reference_price = float(levels[0].price or opportunity.price)
+        sizing = size_against_book(
+            side="BUY",
+            reference_price=reference_price,
+            target_notional=float(allocation_usdt),
+            levels=levels,
+            impact_budget_bps=float(self.config.depth_sizing_impact_budget_bps),
+            depth_factor=float(self.config.depth_sizing_depth_factor),
+        )
+        capped_allocation = min(float(allocation_usdt), max(0.0, float(sizing.max_notional)))
+        opportunity.metadata.update(
+            {
+                "depth_sizing_applied": True,
+                "depth_requested_notional": round(float(allocation_usdt), 8),
+                "depth_max_notional": round(float(sizing.max_notional), 8),
+                "depth_capped_notional": round(capped_allocation, 8),
+                "depth_reference_price": round(reference_price, 12),
+                "depth_vwap": round(float(sizing.vwap), 12),
+                "depth_impact_bps": round(float(sizing.impact_bps), 6),
+                "depth_binding_constraint": sizing.binding_constraint,
+                "depth_book_levels": len(levels),
+            }
+        )
+        min_notional = max(0.0, float(self.config.depth_sizing_min_notional_usdt or 0.0))
+        if capped_allocation < min_notional:
+            opportunity.metadata["depth_sizing_block_reason"] = "cap_below_min_notional"
+            return 0.0
+        return capped_allocation
+
     def _fng_label(self) -> str:
         fng = self._synthetic_fng
         if fng <= 20:
@@ -1243,6 +1333,15 @@ class BacktestEngine:
                 )
                 if allocation <= 0:
                     break
+                allocation = self._apply_depth_sizing_cap(
+                    best,
+                    allocation,
+                    data_key=data_key,
+                    data=data,
+                    timestamp=timestamp,
+                )
+                if allocation <= 0:
+                    continue
                 if not self._passes_expected_profit_gate(best, allocation):
                     continue
                 tp_pct = best.tp_pct if best.tp_pct is not None else self.config.take_profit_pct

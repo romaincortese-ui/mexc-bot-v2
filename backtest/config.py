@@ -145,6 +145,12 @@ class BacktestConfig:
     signal_perf_gate_lookback_trades: int = 30
     signal_perf_gate_pause_bars: int = 288
     min_expected_net_profit_usdt: float = 0.20
+    depth_sizing_enabled: bool = True
+    depth_sizing_impact_budget_bps: float = 5.0
+    depth_sizing_depth_factor: float = 0.40
+    depth_sizing_orderbook_limit: int = 20
+    depth_sizing_min_notional_usdt: float = 5.0
+    backtest_depth_bar_participation: float = 0.10
     market_context_enabled: bool = True
     market_context_bull_budget_mult: float = 1.10
     market_context_sideways_budget_mult: float = 1.00
@@ -263,6 +269,12 @@ class BacktestConfig:
             signal_perf_gate_lookback_trades=env_int("SIGNAL_PERF_GATE_LOOKBACK_TRADES", 30),
             signal_perf_gate_pause_bars=env_int("BACKTEST_SIGNAL_PERF_GATE_PAUSE_BARS", env_int("SIGNAL_PERF_GATE_PAUSE_BARS", 288)),
             min_expected_net_profit_usdt=env_float("BACKTEST_MIN_EXPECTED_NET_PROFIT_USDT", env_float("MIN_EXPECTED_NET_PROFIT_USDT", env_float("MEXCBOT_MIN_EXPECTED_NET_PROFIT_USDT", 0.20))),
+            depth_sizing_enabled=env_bool("BACKTEST_DEPTH_SIZING_ENABLED", env_bool("DEPTH_SIZING_ENABLED", True)),
+            depth_sizing_impact_budget_bps=env_float("BACKTEST_DEPTH_SIZING_IMPACT_BPS", env_float("DEPTH_SIZING_IMPACT_BPS", 5.0)),
+            depth_sizing_depth_factor=env_float("BACKTEST_DEPTH_SIZING_DEPTH_FACTOR", env_float("DEPTH_SIZING_DEPTH_FACTOR", 0.40)),
+            depth_sizing_orderbook_limit=env_int("BACKTEST_DEPTH_SIZING_ORDERBOOK_LIMIT", env_int("DEPTH_SIZING_ORDERBOOK_LIMIT", 20)),
+            depth_sizing_min_notional_usdt=env_float("BACKTEST_DEPTH_SIZING_MIN_NOTIONAL_USDT", env_float("DEPTH_SIZING_MIN_NOTIONAL_USDT", 5.0)),
+            backtest_depth_bar_participation=env_float("BACKTEST_DEPTH_BAR_PARTICIPATION", 0.10),
             market_context_enabled=env_bool("MARKET_CONTEXT_ENABLED", True),
             market_context_bull_budget_mult=env_float("MARKET_CONTEXT_BULL_BUDGET_MULT", 1.10),
             market_context_sideways_budget_mult=env_float("MARKET_CONTEXT_SIDEWAYS_BUDGET_MULT", 1.00),

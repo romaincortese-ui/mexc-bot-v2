@@ -17,6 +17,7 @@ import pandas as pd
 import requests
 
 from mexcbot.config import LiveConfig, env_bool, env_float, env_int
+from mexcbot.depth_sizing import BookLevel
 from mexcbot.marketdata import build_kline_frame
 
 
@@ -456,6 +457,21 @@ class MexcClient:
         if mid <= 0:
             return None
         return (best_ask - best_bid) / mid
+
+    def get_orderbook_levels(self, symbol: str, *, side: str = "BUY", limit: int = 20) -> list[BookLevel]:
+        data = self.public_get("/api/v3/depth", {"symbol": symbol, "limit": max(1, int(limit or 1))})
+        side_key = "asks" if str(side or "").strip().upper() in {"BUY", "LONG"} else "bids"
+        raw_levels = data.get(side_key, []) if isinstance(data, dict) else []
+        levels: list[BookLevel] = []
+        for raw in raw_levels:
+            try:
+                price = float(raw[0])
+                qty = float(raw[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if price > 0 and qty > 0:
+                levels.append(BookLevel(price=price, qty=qty))
+        return levels
 
     def get_lot_size(self, symbol: str) -> dict[str, Any]:
         return self._effective_lot_size(symbol, "LOT_SIZE")

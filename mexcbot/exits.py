@@ -31,14 +31,14 @@ SCALPER_PROG_TIGHTEN = env_float("SCALPER_PROG_TIGHTEN", 0.30)
 SCALPER_PARTIAL_TP_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_MIN_SCORE", 45.0)
 SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE = env_float("SCALPER_PARTIAL_TP_OVERSOLD_MIN_SCORE", 55.0)
 SCALPER_PARTIAL_TP_RATIO_CAP = env_float("SCALPER_PARTIAL_TP_RATIO_CAP", 0.30)
-SCALPER_PARTIAL_TP_PCT = env_float("SCALPER_PARTIAL_TP_PCT", 0.018)
-SCALPER_PEAK_DROP_PCT = env_float("SCALPER_PEAK_DROP_PCT", 0.015)            # 1.5% drop from peak after breakeven
+SCALPER_PARTIAL_TP_PCT = env_float("SCALPER_PARTIAL_TP_PCT", 0.014)
+SCALPER_PEAK_DROP_PCT = env_float("SCALPER_PEAK_DROP_PCT", 0.004)            # 0.4% drop from peak after breakeven
 SCALPER_PEAK_DROP_ATR_MULT = env_float("SCALPER_PEAK_DROP_ATR_MULT", 0.0)    # disabled for scalper; keep fixed drop
 MOONSHOT_PEAK_DROP_PCT = env_float("MOONSHOT_PEAK_DROP_PCT", 0.015)          # 1.5% drop from peak after breakeven
 MOONSHOT_PEAK_DROP_ATR_MULT = env_float("MOONSHOT_PEAK_DROP_ATR_MULT", 2.0)  # scale with ATR for volatile coins
-REVERSAL_PEAK_DROP_PCT = env_float("REVERSAL_PEAK_DROP_PCT", 0.012)          # 1.2% drop from peak after breakeven
+REVERSAL_PEAK_DROP_PCT = env_float("REVERSAL_PEAK_DROP_PCT", 0.009)          # 0.9% drop from peak after breakeven
 REVERSAL_PEAK_DROP_ATR_MULT = env_float("REVERSAL_PEAK_DROP_ATR_MULT", 1.5)
-GENERIC_PEAK_DROP_PCT = env_float("GENERIC_PEAK_DROP_PCT", 0.015)            # fallback for GRID/TRINITY/PRE_BREAKOUT
+GENERIC_PEAK_DROP_PCT = env_float("GENERIC_PEAK_DROP_PCT", 0.005)            # fallback for GRID/TRINITY/PRE_BREAKOUT
 GENERIC_PEAK_DROP_ATR_MULT = env_float("GENERIC_PEAK_DROP_ATR_MULT", 1.5)
 STOP_CONFIRM_SECS = env_int("STOP_CONFIRM_SECS", 20)
 STOP_CONFIRM_MIN_BUFFER = env_float("STOP_CONFIRM_MIN_BUFFER", 0.0010)
@@ -132,12 +132,13 @@ DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
         "flat_min_profit_pct": 0.005,
     },
     "GRID": {
-        "breakeven_activation_pct": env_float("GRID_BREAKEVEN_ACT", 0.010),
-        "trail_activation_pct": 0.012,
-        "trail_pct": 0.007,
-        "partial_tp_trigger_pct": 0.0,
-        "partial_tp_ratio": 0.0,
-        "floor_chase": 0,
+        "breakeven_activation_pct": env_float("GRID_BREAKEVEN_ACT", 0.008),
+        "trail_activation_pct": env_float("GRID_TRAIL_ACT", 0.010),
+        "trail_pct": env_float("GRID_TRAIL_PCT", 0.006),
+        "partial_tp_trigger_pct": env_float("GRID_PARTIAL_TP_PCT", 0.008),
+        "partial_tp_ratio": env_float("GRID_PARTIAL_TP_RATIO", 0.30),
+        "floor_chase": 1,
+        "floor_buffer_pct": env_float("GRID_FLOOR_BUFFER_PCT", 0.002),
         "flat_max_minutes": env_int("GRID_FLAT_MINS", 50),
         "flat_range_pct": env_float("GRID_FLAT_RANGE", 0.004),
         "flat_min_profit_pct": 0.0015,

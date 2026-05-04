@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from mexcbot.exits import evaluate_exit, evaluate_trade_action, initialize_exit_state
+from mexcbot.exits import _validate_exit_profile_invariants, evaluate_exit, evaluate_trade_action, initialize_exit_state
 
 
 def _base_trade(strategy: str = "SCALPER") -> dict:
@@ -129,6 +129,31 @@ def test_partial_tp_activates_floor_chase_for_moonshot():
     assert trade["trail_active"] is True
 
 
+def test_default_exit_profiles_satisfy_peak_drop_invariants():
+    assert _validate_exit_profile_invariants() == []
+
+
+def test_grid_partial_tp_activates_floor_chase_early():
+    trade = _base_trade("GRID")
+    trade["tp_price"] = 103.0
+
+    action = evaluate_trade_action(
+        trade,
+        current_price=100.85,
+        current_time=trade["opened_at"] + timedelta(minutes=8),
+        bar_high=100.85,
+        bar_low=100.2,
+    )
+
+    assert action["action"] == "partial_exit"
+    assert action["reason"] == "PARTIAL_TP"
+    assert trade["partial_tp_done"] is True
+    assert trade["partial_tp_ratio"] == 0.30
+    assert trade["hard_floor_price"] is not None
+    assert float(trade["hard_floor_price"]) > 100.0
+    assert trade["trail_active"] is True
+
+
 def test_floor_chase_exits_after_partial_tp_giveback():
     trade = _base_trade("TRINITY")
     trade["tp_price"] = 104.0
@@ -163,13 +188,13 @@ def test_exit_profile_override_updates_trade_management_behavior():
     initialize_exit_state(trade, strategy="SCALPER", opened_at=trade["opened_at"])
 
     assert trade["partial_tp_ratio"] == 0.3
-    assert trade["partial_tp_price"] == 101.8
+    assert trade["partial_tp_price"] == 101.4
 
     action = evaluate_trade_action(
         trade,
-        current_price=101.7,
+        current_price=101.3,
         current_time=trade["opened_at"] + timedelta(minutes=10),
-        bar_high=101.7,
+        bar_high=101.3,
         bar_low=101.2,
     )
 
@@ -341,7 +366,7 @@ def test_scalper_protect_stop_exits_after_stalled_giveback():
 
     first_action = evaluate_trade_action(
         trade,
-        current_price=102.0,
+        current_price=102.2,
         current_time=trade["opened_at"] + timedelta(minutes=1),
         bar_high=102.5,
         bar_low=101.5,
