@@ -3522,6 +3522,8 @@ class LiveBotRuntime:
 
         opportunity.metadata.pop("pretrade_block_reason", None)
         opportunity.metadata.pop("symbol_gate_detail", None)
+        if self._entry_quality_rejects(opportunity):
+            return False
         if self._signal_lane_rejects(opportunity):
             return False
         if self._signal_performance_rejects(opportunity):
@@ -3532,6 +3534,25 @@ class LiveBotRuntime:
             opportunity.metadata["pretrade_block_reason"] = "moonshot_symbol_gate"
             return False
         return True
+
+    def _entry_quality_rejects(self, opportunity: Opportunity) -> bool:
+        strategy = str(opportunity.strategy or "").upper()
+        symbol = str(opportunity.symbol or "").upper()
+        score = float(opportunity.score or 0.0)
+        ema50_gap_pct = float(opportunity.metadata.get("ema50_gap_pct", 0.0) or 0.0)
+        ema_gap_pct = float(opportunity.metadata.get("ema_gap_pct", 0.0) or 0.0)
+
+        if strategy == "SCALPER" and symbol == "BTCUSDT" and ema50_gap_pct > 1.5:
+            opportunity.metadata["pretrade_block_reason"] = "btc_scalper_overextended"
+            opportunity.metadata["symbol_gate_detail"] = f"ema50_gap_pct={ema50_gap_pct:.3f}>1.5"
+            return True
+
+        if strategy == "MOONSHOT" and ema_gap_pct < 0 and score < 55.0:
+            opportunity.metadata["pretrade_block_reason"] = "moonshot_below_ema_low_score"
+            opportunity.metadata["symbol_gate_detail"] = f"ema_gap_pct={ema_gap_pct:.3f},score={score:.2f}"
+            return True
+
+        return False
 
     def _signal_lane_rejects(self, opportunity: Opportunity) -> bool:
         blocked = {_normalise_signal_lane(item) for item in getattr(self.config, "blocked_signal_lanes", [])}
@@ -3613,17 +3634,25 @@ class LiveBotRuntime:
         )
 
     def _allocation_usdt_for_opportunity_with_equity(self, opportunity: Opportunity, *, available_balance: float, total_equity: float) -> float:
-        # Simplified confidence-based allocation:
-        # minimum 10% of available balance, up to 20% scaled by score (0-100).
         if available_balance <= 0:
             return 0.0
         score = float(opportunity.score or 0.0)
-        score_fraction = min(1.0, max(0.0, score / 100.0))
-        # 10% base + up to 10% extra based on confidence
-        alloc_pct = 0.10 + score_fraction * 0.10  # range: [0.10, 0.20]
+        strategy_threshold = float(self._strategy_base_threshold(opportunity.strategy))
+        score_gap = score - strategy_threshold
+        gap_fraction = min(1.0, max(0.0, score_gap / 30.0))
+        base_alloc_pct = 0.10
+        max_alloc_pct = 0.25
+        alloc_pct = base_alloc_pct + gap_fraction * (max_alloc_pct - base_alloc_pct)
+
+        kelly_mult = self._kelly_multiplier(opportunity)
+        if opportunity.strategy.upper() == "SCALPER":
+            alloc_pct *= kelly_mult
+
+        opportunity.metadata["strategy_threshold"] = round(strategy_threshold, 4)
+        opportunity.metadata["score_gap"] = round(score_gap, 4)
+        opportunity.metadata["gap_fraction"] = round(gap_fraction, 4)
+        opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
         opportunity.metadata["strategy_budget_pct"] = round(alloc_pct, 4)
-        opportunity.metadata["score_fraction"] = round(score_fraction, 4)
-        opportunity.metadata.pop("kelly_mult", None)
         opportunity.metadata.pop("risk_budget_usdt", None)
         # Sprint memo composite multiplier handles market-context / event overlays.
         sprint_mult = self._sprint_sizing_multiplier(opportunity, total_equity=total_equity)

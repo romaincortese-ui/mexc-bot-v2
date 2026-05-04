@@ -526,21 +526,60 @@ class BacktestEngine:
         total_equity: float,
         open_trades: list[dict],
     ) -> float:
-        # Simplified confidence-based allocation:
-        # minimum 10% of cash balance, up to 20% scaled by score (0-100).
         if cash_balance <= 0:
             return 0.0
         score = float(opportunity.score or 0.0)
-        score_fraction = min(1.0, max(0.0, score / 100.0))
-        # 10% base + up to 10% extra based on confidence
-        alloc_pct = 0.10 + score_fraction * 0.10  # range: [0.10, 0.20]
+        strategy_threshold = float(self._base_threshold(opportunity.strategy))
+        score_gap = score - strategy_threshold
+        gap_fraction = min(1.0, max(0.0, score_gap / 30.0))
+        base_alloc_pct = 0.10
+        max_alloc_pct = 0.25
+        alloc_pct = base_alloc_pct + gap_fraction * (max_alloc_pct - base_alloc_pct)
+
+        # Keep SCALPER sizing responsive to conviction depth above threshold.
+        kelly_mult = 1.0
+        if opportunity.strategy.upper() == "SCALPER":
+            if score_gap < 15.0:
+                kelly_mult = 0.50
+            elif score_gap < 30.0:
+                kelly_mult = 0.80
+            elif score_gap < 45.0:
+                kelly_mult = 1.00
+            else:
+                kelly_mult = 1.50
+            alloc_pct *= kelly_mult
+
+        opportunity.metadata["strategy_threshold"] = round(strategy_threshold, 4)
+        opportunity.metadata["score_gap"] = round(score_gap, 4)
+        opportunity.metadata["gap_fraction"] = round(gap_fraction, 4)
+        opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
         opportunity.metadata["strategy_budget_pct"] = round(alloc_pct, 4)
-        opportunity.metadata["score_fraction"] = round(score_fraction, 4)
         context = self._market_context()
         opportunity.metadata["market_context"] = str(context["label"])
         opportunity.metadata["market_context_budget_mult"] = round(float(context["budget_mult"]), 4)
         allocation = cash_balance * alloc_pct * float(context["budget_mult"])
         return max(0.0, allocation)
+
+    def _passes_entry_quality_filter(self, opportunity: Opportunity) -> bool:
+        strategy = str(opportunity.strategy or "").upper()
+        symbol = str(opportunity.symbol or "").upper()
+        score = float(opportunity.score or 0.0)
+        ema50_gap_pct = float(opportunity.metadata.get("ema50_gap_pct", 0.0) or 0.0)
+        ema_gap_pct = float(opportunity.metadata.get("ema_gap_pct", 0.0) or 0.0)
+
+        # Block overextended BTC scalper breakouts that have already run far from EMA50.
+        if strategy == "SCALPER" and symbol == "BTCUSDT" and ema50_gap_pct > 1.5:
+            opportunity.metadata["entry_quality_block_reason"] = "btc_scalper_overextended"
+            opportunity.metadata["entry_quality_block_detail"] = f"ema50_gap_pct={ema50_gap_pct:.3f}>1.5"
+            return False
+
+        # Block weak moonshot continuation setups below EMA with sub-55 score.
+        if strategy == "MOONSHOT" and ema_gap_pct < 0 and score < 55.0:
+            opportunity.metadata["entry_quality_block_reason"] = "moonshot_below_ema_low_score"
+            opportunity.metadata["entry_quality_block_detail"] = f"ema_gap_pct={ema_gap_pct:.3f},score={score:.2f}"
+            return False
+
+        return True
 
     def _update_market_regime(self, timestamp: pd.Timestamp, btc_frame: pd.DataFrame | None) -> None:
         if btc_frame is None or btc_frame.empty:
@@ -1193,6 +1232,8 @@ class BacktestEngine:
             for best, data_key in scored_candidates:
                 if len(open_trades) >= self.config.max_open_positions or cash_balance <= 0:
                     break
+                if not self._passes_entry_quality_filter(best):
+                    continue
                 total_equity = self._mark_to_market_equity(cash_balance, pending_dust_credits, open_trades, data, timestamp)
                 allocation = self._allocation_usdt_for_candidate(
                     best,
