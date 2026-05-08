@@ -390,6 +390,46 @@ def test_open_and_close_emit_structured_trade_audit_lines(caplog):
     assert closed["net_exit_price"] == 9.4905
 
 
+def test_full_close_blocks_same_symbol_reentry_but_allows_other_symbols():
+    runtime = LiveBotRuntime(_config(same_symbol_reentry_cooldown_seconds=3600), StubClient())
+    trade = runtime.open_position(_opportunity(symbol="DOGEUSDT"), allocation_usdt=100.0)
+    assert trade is not None
+
+    closed = runtime.close_position(trade, "TRAILING_STOP")
+
+    assert closed is not None
+    assert runtime.recently_closed["DOGEUSDT"] > time.time() + 3500
+
+    same_symbol = _opportunity(symbol="DOGEUSDT")
+    other_symbol = _opportunity(symbol="BTCUSDT")
+
+    assert runtime._passes_sprint_pretrade_gates(same_symbol) is False
+    assert same_symbol.metadata["pretrade_block_reason"] == "same_symbol_reentry_cooldown"
+    assert "cooldown active" in same_symbol.metadata["symbol_gate_detail"]
+    assert runtime._passes_sprint_pretrade_gates(other_symbol) is True
+
+
+def test_expired_same_symbol_reentry_cooldown_allows_entry():
+    runtime = LiveBotRuntime(_config(same_symbol_reentry_cooldown_seconds=3600), StubClient())
+    runtime.recently_closed["DOGEUSDT"] = time.time() - 1
+    opportunity = _opportunity(symbol="DOGEUSDT")
+
+    assert runtime._passes_sprint_pretrade_gates(opportunity) is True
+    assert "DOGEUSDT" not in runtime.recently_closed
+
+
+def test_partial_close_does_not_start_same_symbol_reentry_cooldown():
+    runtime = LiveBotRuntime(_config(same_symbol_reentry_cooldown_seconds=3600), StubClient())
+    trade = runtime.open_position(_opportunity(symbol="DOGEUSDT"), allocation_usdt=100.0)
+    assert trade is not None
+
+    closed = runtime.partial_close_position(trade, "PARTIAL_TP", price=10.5, qty_ratio=0.5)
+
+    assert closed is not None
+    assert closed["is_partial"] is True
+    assert "DOGEUSDT" not in runtime.recently_closed
+
+
 def test_open_position_caps_allocation_to_orderbook_depth():
     client = StubClient()
     client.orderbook_levels_by_symbol["DOGEUSDT"] = [BookLevel(price=10.0, qty=2.0)]

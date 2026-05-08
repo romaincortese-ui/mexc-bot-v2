@@ -169,6 +169,7 @@ class LiveConfig:
     grid_btc_1h_floor: float
     grid_btc_24h_floor: float
     state_file: str
+    same_symbol_reentry_cooldown_seconds: int = 3600
     blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"])
     base_url: str = "https://api.mexc.com"
 
@@ -295,6 +296,10 @@ class LiveConfig:
             grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
             grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
             state_file=env_str("MEXCBOT_STATE_FILE", default_state_file()),
+            same_symbol_reentry_cooldown_seconds=env_int(
+                "SAME_SYMBOL_REENTRY_COOLDOWN_SECONDS",
+                env_int("MEXCBOT_SYMBOL_REENTRY_COOLDOWN_SECONDS", 3600),
+            ),
             blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND"),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
         )

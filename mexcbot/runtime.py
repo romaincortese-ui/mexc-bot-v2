@@ -1501,6 +1501,7 @@ class LiveBotRuntime:
                 "min_profit_factor": self.config.symbol_perf_gate_min_profit_factor,
                 "pause_hours": self.config.symbol_perf_gate_pause_hours,
             },
+            "same_symbol_reentry_cooldown_seconds": self._recent_close_cooldown_seconds(),
             "signal_performance_gate": {
                 "enabled": self.config.signal_perf_gate_enabled,
                 "min_trades": self.config.signal_perf_gate_min_trades,
@@ -1612,6 +1613,7 @@ class LiveBotRuntime:
             fee=float(fee_quote_qty or 0.0),
             at=trade.closed_at or datetime.now(timezone.utc),
         )
+        self._record_recent_symbol_close(trade.symbol, reason=reason)
         self._record_symbol_cooldown(trade, reason)
         self._update_strategy_guards(closed)
         self._send_close_alert(closed)
@@ -2206,7 +2208,7 @@ class LiveBotRuntime:
             f"Thresholds: S {self._strategy_base_threshold('SCALPER'):.1f} | M {self._strategy_base_threshold('MOONSHOT'):.1f} | T {self._strategy_base_threshold('TRINITY'):.1f} | R {self._strategy_base_threshold('REVERSAL'):.1f}\n"
             f"Pools S/M/T/G {self.config.scalper_allocation_pct * 100:.0f}/{self.config.moonshot_allocation_pct * 100:.0f}/{self.config.trinity_allocation_pct * 100:.0f}/{self.config.grid_allocation_pct * 100:.0f}\n"
             f"Trade caps S/M/R/T/G {self.config.scalper_budget_pct * 100:.1f}/{self.config.moonshot_budget_pct * 100:.1f}/{self.config.reversal_budget_pct * 100:.1f}/{self.config.trinity_budget_pct * 100:.1f}/{self.config.grid_budget_pct * 100:.1f} | Max positions {self.config.max_open_positions}\n"
-            f"Cooldowns: scalper {self.config.scalper_symbol_cooldown_seconds}s | rotation {self.config.scalper_rotation_cooldown_seconds}s\n"
+            f"Cooldowns: re-entry {self._recent_close_cooldown_seconds()}s | scalper {self.config.scalper_symbol_cooldown_seconds}s | rotation {self.config.scalper_rotation_cooldown_seconds}s\n"
             f"Circuit breaker: WR<{self.config.win_rate_cb_threshold * 100:.0f}% over {self.config.win_rate_cb_window} trades | {self.config.win_rate_cb_pause_mins}min\n"
             f"Moon gate: {self.config.moonshot_btc_ema_gate:+.3f} reopen {self.config.moonshot_btc_gate_reopen:+.3f}\n"
             f"Adaptive: window {self.config.adaptive_window} | tighten {self.config.adaptive_tighten_step:.1f} | relax {self.config.adaptive_relax_step:.1f}\n"
@@ -3021,6 +3023,40 @@ class LiveBotRuntime:
         self._purge_cooldowns()
         return set(self.recently_closed) | set(self.symbol_cooldowns) | set(self.symbol_performance_paused_until) | set(self.liquidity_blacklist)
 
+    def _recent_close_cooldown_seconds(self) -> int:
+        configured = int(getattr(self.config, "same_symbol_reentry_cooldown_seconds", 0) or 0)
+        return max(configured, int(max(self.config.scan_interval, 60)))
+
+    def _record_recent_symbol_close(self, symbol: str, *, reason: str = "") -> None:
+        resolved = str(symbol or "").upper()
+        cooldown_seconds = self._recent_close_cooldown_seconds()
+        if not resolved or cooldown_seconds <= 0:
+            return
+        expires_at = time.time() + cooldown_seconds
+        existing = float(self.recently_closed.get(resolved, 0.0) or 0.0)
+        if existing >= expires_at - 1.0:
+            return
+        self.recently_closed[resolved] = expires_at
+        minutes = max(1, math.ceil(cooldown_seconds / 60.0))
+        close_reason = str(reason or "close").upper()
+        log.info("[SYMBOL_COOLDOWN] %s re-entry blocked for %dm after %s", resolved, minutes, close_reason)
+        self._record_activity(f"Cooldown {resolved} after {close_reason} {minutes}m")
+
+    def _recent_close_reentry_rejects(self, opportunity: Opportunity) -> bool:
+        self._purge_cooldowns()
+        symbol = opportunity.symbol.upper()
+        expires_at = float(self.recently_closed.get(symbol, 0.0) or 0.0)
+        now_ts = time.time()
+        if expires_at <= now_ts:
+            return False
+        seconds_left = max(1, math.ceil(expires_at - now_ts))
+        minutes_left = max(1, math.ceil(seconds_left / 60.0))
+        opportunity.metadata["pretrade_block_reason"] = "same_symbol_reentry_cooldown"
+        opportunity.metadata["symbol_gate_detail"] = f"recent full close cooldown active {minutes_left}m"
+        opportunity.metadata["reentry_cooldown_remaining_seconds"] = seconds_left
+        opportunity.metadata["reentry_cooldown_expires_at"] = datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
+        return True
+
     def _entries_paused(self) -> bool:
         self._maybe_auto_reset_streak_guard()
         self._refresh_session_pause()
@@ -3523,6 +3559,10 @@ class LiveBotRuntime:
 
         opportunity.metadata.pop("pretrade_block_reason", None)
         opportunity.metadata.pop("symbol_gate_detail", None)
+        opportunity.metadata.pop("reentry_cooldown_remaining_seconds", None)
+        opportunity.metadata.pop("reentry_cooldown_expires_at", None)
+        if self._recent_close_reentry_rejects(opportunity):
+            return False
         if self._entry_quality_rejects(opportunity):
             return False
         if self._signal_lane_rejects(opportunity):
@@ -4245,6 +4285,8 @@ class LiveBotRuntime:
                     detail=str(opportunity.metadata.get("symbol_gate_detail") or ""),
                     symbol_gate_trades=opportunity.metadata.get("symbol_gate_trades", ""),
                     symbol_gate_pf=opportunity.metadata.get("symbol_gate_pf", ""),
+                    cooldown_remaining_seconds=opportunity.metadata.get("reentry_cooldown_remaining_seconds", ""),
+                    cooldown_expires_at=opportunity.metadata.get("reentry_cooldown_expires_at", ""),
                 )
                 cycle_excluded.add(opportunity.symbol)
                 continue
@@ -4669,7 +4711,7 @@ class LiveBotRuntime:
                         continue
                     if action["action"] == "exchange_closed":
                         self.open_trades.remove(trade)
-                        self.recently_closed[trade.symbol] = time.time() + max(self.config.scan_interval, 60)
+                        self._record_recent_symbol_close(trade.symbol, reason=str(action.get("reason") or "EXCHANGE_CLOSED"))
                         closed_any = True
                         self._save_state()
                         continue
@@ -4683,13 +4725,13 @@ class LiveBotRuntime:
                         closed_any = True
                         if trade.qty <= 0:
                             self.open_trades.remove(trade)
-                            self.recently_closed[trade.symbol] = time.time() + max(self.config.scan_interval, 60)
+                            self._record_recent_symbol_close(trade.symbol, reason=str(action.get("reason") or "PARTIAL_EXIT"))
                         self._save_state()
                         continue
                     closed_trade = self.close_position(trade, str(action["reason"]))
                     if closed_trade is not None:
                         self.open_trades.remove(trade)
-                        self.recently_closed[trade.symbol] = time.time() + max(self.config.scan_interval, 60)
+                        self._record_recent_symbol_close(trade.symbol, reason=str(action.get("reason") or "CLOSE"))
                         closed_any = True
                         self._save_state()
 
