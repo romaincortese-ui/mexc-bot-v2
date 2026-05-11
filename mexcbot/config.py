@@ -221,7 +221,7 @@ class LiveConfig:
             anthropic_api_key=env_str("ANTHROPIC_API_KEY", ""),
             telegram_token=env_str("TELEGRAM_TOKEN", ""),
             telegram_chat_id=env_str("TELEGRAM_CHAT_ID", ""),
-            heartbeat_seconds=env_int("HEARTBEAT_SECONDS", 3600),
+            heartbeat_seconds=env_int("HEARTBEAT_SECONDS", 21600),
             scalper_symbol_cooldown_seconds=env_int("SCALPER_SYMBOL_COOLDOWN", 1200),
             scalper_rotation_cooldown_seconds=env_int("SCALPER_ROTATION_SYMBOL_COOLDOWN", 900),
             max_consecutive_losses=env_int("MAX_CONSECUTIVE_LOSSES", 3),
