@@ -709,6 +709,34 @@ def test_signal_lane_gate_blocks_configured_lane(caplog):
     assert "[SIGNAL_GATE] Blocked CHIPUSDT REVERSAL:DIVERGENCE_HAMMER" in caplog.text
 
 
+def test_default_signal_lane_gate_blocks_moonshot_new_listing(caplog):
+    runtime = LiveBotRuntime(_config(), StubClient())
+    opportunity = _opportunity(strategy="MOONSHOT", symbol="BILLUSDT")
+    opportunity.entry_signal = "NEW_LISTING"
+
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        allowed = runtime._passes_sprint_pretrade_gates(opportunity)
+
+    assert allowed is False
+    assert opportunity.metadata["pretrade_block_reason"] == "blocked_signal_lane"
+    assert opportunity.metadata["symbol_gate_detail"] == "MOONSHOT:NEW_LISTING"
+    assert "[SIGNAL_GATE] Blocked BILLUSDT MOONSHOT:NEW_LISTING" in caplog.text
+
+
+def test_default_signal_lane_gate_blocks_moonshot_trend_continuation(caplog):
+    runtime = LiveBotRuntime(_config(), StubClient())
+    opportunity = _opportunity(strategy="MOONSHOT", symbol="ZECUSDT")
+    opportunity.entry_signal = "TREND_CONTINUATION"
+
+    with caplog.at_level(logging.INFO, logger="mexcbot"):
+        allowed = runtime._passes_sprint_pretrade_gates(opportunity)
+
+    assert allowed is False
+    assert opportunity.metadata["pretrade_block_reason"] == "blocked_signal_lane"
+    assert opportunity.metadata["symbol_gate_detail"] == "MOONSHOT:TREND_CONTINUATION"
+    assert "[SIGNAL_GATE] Blocked ZECUSDT MOONSHOT:TREND_CONTINUATION" in caplog.text
+
+
 def test_signal_performance_gate_blocks_weak_lane(caplog):
     runtime = LiveBotRuntime(
         _config(
@@ -1168,7 +1196,7 @@ def test_rebalance_budgets_shifts_allocation_toward_better_strategy():
     assert runtime._strategy_budget_multiplier("MOONSHOT") < 1.0
 
 
-def test_scalper_kelly_sizing_reduces_low_conviction_score_allocation():
+def test_simple_sizing_uses_lower_percent_for_low_confidence_entry():
     runtime = LiveBotRuntime(_config(trade_budget=500.0), StubClient())
     opportunity = _opportunity(strategy="SCALPER")
     opportunity.score = 30.0
@@ -1176,11 +1204,13 @@ def test_scalper_kelly_sizing_reduces_low_conviction_score_allocation():
 
     allocation = runtime._allocation_usdt_for_opportunity(opportunity, available_balance=1000.0)
 
-    assert allocation == 75.0
-    assert opportunity.metadata["kelly_mult"] == 0.5
+    assert allocation == 112.5
+    assert opportunity.metadata["allocation_pct"] == 0.1125
+    assert opportunity.metadata["allocation_confidence"] == 0.125
+    assert "kelly_mult" not in opportunity.metadata
 
 
-def test_scalper_kelly_sizing_expands_high_conviction_score_allocation():
+def test_simple_sizing_scales_toward_upper_percent_for_high_confidence_entry():
     runtime = LiveBotRuntime(_config(trade_budget=500.0), StubClient())
     opportunity = _opportunity(strategy="SCALPER")
     opportunity.score = 70.0
@@ -1192,8 +1222,10 @@ def test_scalper_kelly_sizing_expands_high_conviction_score_allocation():
         total_equity=5000.0,
     )
 
-    assert allocation == 375.0
-    assert opportunity.metadata["kelly_mult"] == 1.5
+    assert allocation == 162.5
+    assert opportunity.metadata["allocation_pct"] == 0.1625
+    assert opportunity.metadata["allocation_confidence"] == 0.625
+    assert "kelly_mult" not in opportunity.metadata
 
 
 def test_strategy_available_capital_uses_shared_moonshot_pool():
@@ -1234,39 +1266,39 @@ def test_strategy_available_capital_uses_shared_moonshot_pool():
     assert available == 10.0
 
 
-def test_reversal_and_moonshot_use_score_based_allocation_metadata():
+def test_simple_allocation_is_strategy_neutral_and_score_based():
     runtime = LiveBotRuntime(_config(), StubClient())
-    reversal = _opportunity(strategy="REVERSAL")
-    moonshot = _opportunity(strategy="MOONSHOT")
+    scalper = _opportunity(strategy="SCALPER")
+    grid = _opportunity(strategy="GRID")
+    high_confidence = _opportunity(strategy="SCALPER")
+    high_confidence.score = 100.0
 
-    reversal_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
-        reversal,
+    scalper_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
+        scalper,
         available_balance=100.0,
         total_equity=227.0,
     )
-    moonshot_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
-        moonshot,
+    grid_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
+        grid,
+        available_balance=100.0,
+        total_equity=227.0,
+    )
+    high_allocation = runtime._allocation_usdt_for_opportunity_with_equity(
+        high_confidence,
         available_balance=100.0,
         total_equity=227.0,
     )
 
-    assert round(reversal_allocation, 3) == 10.0
-    assert round(moonshot_allocation, 3) == 16.0
-    assert reversal.metadata["strategy_budget_pct"] == 0.1
-    assert moonshot.metadata["strategy_budget_pct"] == 0.16
+    assert scalper_allocation == grid_allocation == 12.5
+    assert high_allocation == 20.0
+    assert scalper.metadata["allocation_model"] == "simple_available_balance_confidence"
+    assert scalper.metadata["strategy_budget_pct"] == 0.125
+    assert high_confidence.metadata["strategy_budget_pct"] == 0.20
 
 
-def test_trinity_allocation_uses_score_floor_when_below_threshold():
-    runtime = LiveBotRuntime(_config(), StubClient())
-    opportunity = _opportunity(strategy="TRINITY")
-
-    allocation = runtime._allocation_usdt_for_opportunity_with_equity(opportunity, available_balance=100.0, total_equity=100.0)
-
-    assert allocation == 10.0
-
-
-def test_fill_open_slots_can_use_score_allocation_when_legacy_pool_is_exhausted(monkeypatch, caplog):
+def test_fill_open_slots_skips_candidate_when_cash_is_exhausted(monkeypatch, caplog):
     runtime = LiveBotRuntime(_config(strategies=["TRINITY"]), StubClient())
+    runtime.client.account_snapshot = {"free_usdt": 0.0, "total_equity": 19.5}
     existing = Trade(
         symbol="BTCUSDT",
         entry_price=10.0,
@@ -1300,9 +1332,10 @@ def test_fill_open_slots_can_use_score_allocation_when_legacy_pool_is_exhausted(
     with caplog.at_level(logging.INFO, logger="mexcbot"):
         runtime._fill_open_slots()
 
-    assert len(runtime.open_trades) == 2
+    assert len(runtime.open_trades) == 1
     assert captured["calls"] >= 2
-    assert "[ENTRY]" in caplog.text
+    assert "[ENTRY_BLOCK]" in caplog.text
+    assert "strategy_pool_or_cash_exhausted" in caplog.text
 
 
 def test_dead_coin_blacklist_trips_after_repeated_liquidity_failures():

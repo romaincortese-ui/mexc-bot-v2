@@ -1481,6 +1481,12 @@ class LiveBotRuntime:
             "state_file": self.config.state_file,
             "strategies": list(self.config.strategies),
             "max_open_positions": self.config.max_open_positions,
+            "simple_allocation": {
+                "min_pct": self.config.simple_allocation_min_pct,
+                "max_pct": self.config.simple_allocation_max_pct,
+                "basis": "available_balance",
+                "confidence": "score_vs_strategy_threshold",
+            },
             "strategy_allocations": {
                 "SCALPER": self.config.scalper_allocation_pct,
                 "MOONSHOT_POOL": self.config.moonshot_allocation_pct,
@@ -3374,7 +3380,7 @@ class LiveBotRuntime:
         mult *= self._weekend_flatten_multiplier()
         mult *= self._market_context_budget_multiplier(opportunity)
         mult *= self._crypto_event_overlay_multiplier(opportunity)
-        return max(0.0, mult)
+        return max(0.0, min(1.0, mult))
 
     def _refresh_crypto_event_state(self) -> None:
         if not USE_CRYPTO_EVENT_OVERLAY:
@@ -3674,31 +3680,32 @@ class LiveBotRuntime:
             total_equity=available_balance,
         )
 
+    def _simple_allocation_pct(self, opportunity: Opportunity) -> float:
+        min_pct = max(0.0, min(1.0, float(self.config.simple_allocation_min_pct)))
+        max_pct = max(min_pct, min(1.0, float(self.config.simple_allocation_max_pct)))
+        threshold = max(0.0, min(100.0, self._strategy_base_threshold(opportunity.strategy)))
+        score = max(threshold, min(100.0, float(opportunity.score or 0.0)))
+        span = max(1.0, 100.0 - threshold)
+        confidence = max(0.0, min(1.0, (score - threshold) / span))
+        pct = min_pct + (max_pct - min_pct) * confidence
+        opportunity.metadata["allocation_model"] = "simple_available_balance_confidence"
+        opportunity.metadata["allocation_pct"] = round(pct, 6)
+        opportunity.metadata["allocation_confidence"] = round(confidence, 6)
+        opportunity.metadata["allocation_threshold"] = round(threshold, 4)
+        return pct
+
     def _allocation_usdt_for_opportunity_with_equity(self, opportunity: Opportunity, *, available_balance: float, total_equity: float) -> float:
-        if available_balance <= 0:
+        allocation_pct = self._simple_allocation_pct(opportunity)
+        capped_budget = max(0.0, available_balance) * allocation_pct
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)
+        opportunity.metadata["strategy_budget_pct"] = round(allocation_pct, 6)
+        opportunity.metadata["strategy_available_cap_usdt"] = round(max(0.0, available_balance), 4)
+        if capped_budget <= 0:
             return 0.0
-        score = float(opportunity.score or 0.0)
-        strategy_threshold = float(self._strategy_base_threshold(opportunity.strategy))
-        score_gap = score - strategy_threshold
-        gap_fraction = min(1.0, max(0.0, score_gap / 30.0))
-        base_alloc_pct = 0.10
-        max_alloc_pct = 0.25
-        alloc_pct = base_alloc_pct + gap_fraction * (max_alloc_pct - base_alloc_pct)
-
-        kelly_mult = self._kelly_multiplier(opportunity)
-        if opportunity.strategy.upper() == "SCALPER":
-            alloc_pct *= kelly_mult
-
-        opportunity.metadata["strategy_threshold"] = round(strategy_threshold, 4)
-        opportunity.metadata["score_gap"] = round(score_gap, 4)
-        opportunity.metadata["gap_fraction"] = round(gap_fraction, 4)
-        opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
-        opportunity.metadata["strategy_budget_pct"] = round(alloc_pct, 4)
-        opportunity.metadata.pop("risk_budget_usdt", None)
-        # Sprint memo composite multiplier handles market-context / event overlays.
         sprint_mult = self._sprint_sizing_multiplier(opportunity, total_equity=total_equity)
-        allocation = available_balance * alloc_pct * sprint_mult
-        return max(0.0, allocation)
+        opportunity.metadata.pop("kelly_mult", None)
+        opportunity.metadata.pop("risk_budget_usdt", None)
+        return min(max(0.0, available_balance), capped_budget * sprint_mult)
 
     def _expected_profit_fields(self, opportunity: Opportunity, allocation_usdt: float) -> dict[str, float]:
         tp_pct = float(opportunity.tp_pct if opportunity.tp_pct is not None else self.config.take_profit_pct)

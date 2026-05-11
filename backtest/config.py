@@ -107,6 +107,8 @@ class BacktestConfig:
     moonshot_allocation_pct: float = 0.65
     trinity_allocation_pct: float = 0.00
     grid_allocation_pct: float = 0.10
+    simple_allocation_min_pct: float = 0.10
+    simple_allocation_max_pct: float = 0.20
     scalper_budget_pct: float = 0.50
     moonshot_budget_pct: float = 0.03
     reversal_budget_pct: float = 0.85
@@ -158,7 +160,14 @@ class BacktestConfig:
     market_context_crash_budget_mult: float = 0.35
     market_context_bear_block_strategies: list[str] = field(default_factory=list)
     market_context_crash_block_strategies: list[str] = field(default_factory=lambda: ["MOONSHOT", "REVERSAL", "GRID"])
-    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"])
+    blocked_signal_lanes: list[str] = field(
+        default_factory=lambda: [
+            "REVERSAL:DIVERGENCE_HAMMER",
+            "SCALPER:TREND",
+            "MOONSHOT:NEW_LISTING",
+            "MOONSHOT:TREND_CONTINUATION",
+        ]
+    )
 
     def symbols_for_strategy(self, strategy: str) -> list[str]:
         resolved = strategy.upper()
@@ -231,6 +240,8 @@ class BacktestConfig:
             moonshot_allocation_pct=env_float("MOONSHOT_ALLOCATION_PCT", 0.65),
             trinity_allocation_pct=env_float("TRINITY_ALLOCATION_PCT", 0.00),
             grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.10),
+            simple_allocation_min_pct=env_float("SIMPLE_ALLOCATION_MIN_PCT", 0.10),
+            simple_allocation_max_pct=env_float("SIMPLE_ALLOCATION_MAX_PCT", 0.20),
             scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.50),
             moonshot_budget_pct=env_float("MOONSHOT_BUDGET_PCT", 0.03),
             reversal_budget_pct=env_float("REVERSAL_BUDGET_PCT", 0.85),
@@ -282,5 +293,8 @@ class BacktestConfig:
             market_context_crash_budget_mult=env_float("MARKET_CONTEXT_CRASH_BUDGET_MULT", 0.35),
             market_context_bear_block_strategies=env_csv("MARKET_CONTEXT_BEAR_BLOCK_STRATEGIES", ""),
             market_context_crash_block_strategies=env_csv("MARKET_CONTEXT_CRASH_BLOCK_STRATEGIES", "MOONSHOT,REVERSAL,GRID"),
-            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND"),
+            blocked_signal_lanes=env_csv(
+                "MEXCBOT_BLOCKED_SIGNAL_LANES",
+                "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION",
+            ),
         )

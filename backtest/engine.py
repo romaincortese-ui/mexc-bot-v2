@@ -519,6 +519,20 @@ class BacktestEngine:
         cap = total_equity * self._strategy_capital_pct(strategy)
         return max(0.0, cap - self._used_strategy_capital(strategy, open_trades))
 
+    def _simple_allocation_pct(self, opportunity: Opportunity) -> float:
+        min_pct = max(0.0, min(1.0, float(self.config.simple_allocation_min_pct)))
+        max_pct = max(min_pct, min(1.0, float(self.config.simple_allocation_max_pct)))
+        threshold = max(0.0, min(100.0, self._base_threshold(opportunity.strategy)))
+        score = max(threshold, min(100.0, float(opportunity.score or 0.0)))
+        span = max(1.0, 100.0 - threshold)
+        confidence = max(0.0, min(1.0, (score - threshold) / span))
+        pct = min_pct + (max_pct - min_pct) * confidence
+        opportunity.metadata["allocation_model"] = "simple_available_balance_confidence"
+        opportunity.metadata["allocation_pct"] = round(pct, 6)
+        opportunity.metadata["allocation_confidence"] = round(confidence, 6)
+        opportunity.metadata["allocation_threshold"] = round(threshold, 4)
+        return pct
+
     def _allocation_usdt_for_candidate(
         self,
         opportunity: Opportunity,
@@ -527,39 +541,18 @@ class BacktestEngine:
         total_equity: float,
         open_trades: list[dict],
     ) -> float:
-        if cash_balance <= 0:
-            return 0.0
-        score = float(opportunity.score or 0.0)
-        strategy_threshold = float(self._base_threshold(opportunity.strategy))
-        score_gap = score - strategy_threshold
-        gap_fraction = min(1.0, max(0.0, score_gap / 30.0))
-        base_alloc_pct = 0.10
-        max_alloc_pct = 0.25
-        alloc_pct = base_alloc_pct + gap_fraction * (max_alloc_pct - base_alloc_pct)
-
-        # Keep SCALPER sizing responsive to conviction depth above threshold.
-        kelly_mult = 1.0
-        if opportunity.strategy.upper() == "SCALPER":
-            if score_gap < 15.0:
-                kelly_mult = 0.50
-            elif score_gap < 30.0:
-                kelly_mult = 0.80
-            elif score_gap < 45.0:
-                kelly_mult = 1.00
-            else:
-                kelly_mult = 1.50
-            alloc_pct *= kelly_mult
-
-        opportunity.metadata["strategy_threshold"] = round(strategy_threshold, 4)
-        opportunity.metadata["score_gap"] = round(score_gap, 4)
-        opportunity.metadata["gap_fraction"] = round(gap_fraction, 4)
-        opportunity.metadata["kelly_mult"] = round(kelly_mult, 4)
-        opportunity.metadata["strategy_budget_pct"] = round(alloc_pct, 4)
+        allocation_pct = self._simple_allocation_pct(opportunity)
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)
+        opportunity.metadata["strategy_budget_pct"] = round(allocation_pct, 6)
+        opportunity.metadata["strategy_available_cap_usdt"] = round(max(0.0, cash_balance), 4)
         context = self._market_context()
         opportunity.metadata["market_context"] = str(context["label"])
-        opportunity.metadata["market_context_budget_mult"] = round(float(context["budget_mult"]), 4)
-        allocation = cash_balance * alloc_pct * float(context["budget_mult"])
-        return max(0.0, allocation)
+        context_budget_mult = max(0.0, min(1.0, float(context["budget_mult"])))
+        opportunity.metadata["market_context_budget_mult"] = round(context_budget_mult, 4)
+        allocation = max(0.0, cash_balance) * allocation_pct * context_budget_mult
+        if allocation <= 0:
+            return 0.0
+        return min(max(0.0, cash_balance), allocation)
 
     def _passes_entry_quality_filter(self, opportunity: Opportunity) -> bool:
         strategy = str(opportunity.strategy or "").upper()

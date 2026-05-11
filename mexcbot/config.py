@@ -170,8 +170,17 @@ class LiveConfig:
     grid_btc_24h_floor: float
     state_file: str
     same_symbol_reentry_cooldown_seconds: int = 3600
-    blocked_signal_lanes: list[str] = field(default_factory=lambda: ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"])
+    blocked_signal_lanes: list[str] = field(
+        default_factory=lambda: [
+            "REVERSAL:DIVERGENCE_HAMMER",
+            "SCALPER:TREND",
+            "MOONSHOT:NEW_LISTING",
+            "MOONSHOT:TREND_CONTINUATION",
+        ]
+    )
     base_url: str = "https://api.mexc.com"
+    simple_allocation_min_pct: float = 0.10
+    simple_allocation_max_pct: float = 0.20
 
     @classmethod
     def from_env(cls) -> "LiveConfig":
@@ -300,6 +309,11 @@ class LiveConfig:
                 "SAME_SYMBOL_REENTRY_COOLDOWN_SECONDS",
                 env_int("MEXCBOT_SYMBOL_REENTRY_COOLDOWN_SECONDS", 3600),
             ),
-            blocked_signal_lanes=env_csv("MEXCBOT_BLOCKED_SIGNAL_LANES", "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND"),
+            blocked_signal_lanes=env_csv(
+                "MEXCBOT_BLOCKED_SIGNAL_LANES",
+                "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION",
+            ),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
+            simple_allocation_min_pct=env_float("SIMPLE_ALLOCATION_MIN_PCT", 0.10),
+            simple_allocation_max_pct=env_float("SIMPLE_ALLOCATION_MAX_PCT", 0.20),
         )

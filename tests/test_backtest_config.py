@@ -68,7 +68,15 @@ def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatc
 
     assert "TRINITY" not in config.strategies
     assert config.trinity_allocation_pct == 0.0
-    assert config.blocked_signal_lanes == ["REVERSAL:DIVERGENCE_HAMMER", "SCALPER:TREND"]
+    assert config.blocked_signal_lanes == [
+        "REVERSAL:DIVERGENCE_HAMMER",
+        "SCALPER:TREND",
+        "MOONSHOT:NEW_LISTING",
+        "MOONSHOT:TREND_CONTINUATION",
+    ]
+    assert config.max_open_positions == 5
+    assert config.simple_allocation_min_pct == 0.10
+    assert config.simple_allocation_max_pct == 0.20
     assert config.scalper_allocation_pct == 0.25
     assert config.moonshot_allocation_pct == 0.65
     assert config.grid_allocation_pct == 0.10

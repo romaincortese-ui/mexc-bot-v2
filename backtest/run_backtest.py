@@ -38,6 +38,12 @@ def build_run_summary(config: BacktestConfig) -> dict[str, object]:
         "initial_balance": config.initial_balance,
         "trade_budget": config.trade_budget,
         "max_open_positions": config.max_open_positions,
+        "simple_allocation": {
+            "min_pct": config.simple_allocation_min_pct,
+            "max_pct": config.simple_allocation_max_pct,
+            "basis": "available_cash",
+            "confidence": "score_vs_strategy_threshold",
+        },
         "strategy_allocations": {
             "SCALPER": config.scalper_allocation_pct,
             "MOONSHOT_POOL": config.moonshot_allocation_pct,

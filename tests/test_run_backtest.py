@@ -40,6 +40,12 @@ def test_build_run_summary_includes_effective_window_and_runtime_settings():
         "initial_balance": 750.0,
         "trade_budget": 75.0,
         "max_open_positions": 4,
+        "simple_allocation": {
+            "min_pct": 0.10,
+            "max_pct": 0.20,
+            "basis": "available_cash",
+            "confidence": "score_vs_strategy_threshold",
+        },
         "strategy_allocations": {
             "SCALPER": 0.25,
             "MOONSHOT_POOL": 0.65,
