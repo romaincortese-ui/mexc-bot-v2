@@ -41,8 +41,8 @@ def test_build_run_summary_includes_effective_window_and_runtime_settings():
         "trade_budget": 75.0,
         "max_open_positions": 4,
         "simple_allocation": {
-            "min_pct": 0.10,
-            "max_pct": 0.20,
+            "min_pct": 0.155,
+            "max_pct": 0.310,
             "basis": "available_cash",
             "confidence": "score_vs_strategy_threshold",
         },

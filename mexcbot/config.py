@@ -179,8 +179,8 @@ class LiveConfig:
         ]
     )
     base_url: str = "https://api.mexc.com"
-    simple_allocation_min_pct: float = 0.10
-    simple_allocation_max_pct: float = 0.20
+    simple_allocation_min_pct: float = 0.155
+    simple_allocation_max_pct: float = 0.310
 
     @classmethod
     def from_env(cls) -> "LiveConfig":
@@ -314,6 +314,6 @@ class LiveConfig:
                 "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION",
             ),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
-            simple_allocation_min_pct=env_float("SIMPLE_ALLOCATION_MIN_PCT", 0.10),
-            simple_allocation_max_pct=env_float("SIMPLE_ALLOCATION_MAX_PCT", 0.20),
+            simple_allocation_min_pct=env_float("SIMPLE_ALLOCATION_MIN_PCT", 0.155),
+            simple_allocation_max_pct=env_float("SIMPLE_ALLOCATION_MAX_PCT", 0.310),
         )

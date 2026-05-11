@@ -75,8 +75,8 @@ def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatc
         "MOONSHOT:TREND_CONTINUATION",
     ]
     assert config.max_open_positions == 5
-    assert config.simple_allocation_min_pct == 0.10
-    assert config.simple_allocation_max_pct == 0.20
+    assert config.simple_allocation_min_pct == 0.155
+    assert config.simple_allocation_max_pct == 0.310
     assert config.scalper_allocation_pct == 0.25
     assert config.moonshot_allocation_pct == 0.65
     assert config.grid_allocation_pct == 0.10

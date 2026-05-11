@@ -1204,8 +1204,8 @@ def test_simple_sizing_uses_lower_percent_for_low_confidence_entry():
 
     allocation = runtime._allocation_usdt_for_opportunity(opportunity, available_balance=1000.0)
 
-    assert allocation == 112.5
-    assert opportunity.metadata["allocation_pct"] == 0.1125
+    assert allocation == 174.375
+    assert opportunity.metadata["allocation_pct"] == 0.174375
     assert opportunity.metadata["allocation_confidence"] == 0.125
     assert "kelly_mult" not in opportunity.metadata
 
@@ -1222,8 +1222,8 @@ def test_simple_sizing_scales_toward_upper_percent_for_high_confidence_entry():
         total_equity=5000.0,
     )
 
-    assert allocation == 162.5
-    assert opportunity.metadata["allocation_pct"] == 0.1625
+    assert allocation == 251.87500000000003
+    assert opportunity.metadata["allocation_pct"] == 0.251875
     assert opportunity.metadata["allocation_confidence"] == 0.625
     assert "kelly_mult" not in opportunity.metadata
 
@@ -1289,11 +1289,11 @@ def test_simple_allocation_is_strategy_neutral_and_score_based():
         total_equity=227.0,
     )
 
-    assert scalper_allocation == grid_allocation == 12.5
-    assert high_allocation == 20.0
+    assert scalper_allocation == grid_allocation == 19.375
+    assert high_allocation == 31.0
     assert scalper.metadata["allocation_model"] == "simple_available_balance_confidence"
-    assert scalper.metadata["strategy_budget_pct"] == 0.125
-    assert high_confidence.metadata["strategy_budget_pct"] == 0.20
+    assert scalper.metadata["strategy_budget_pct"] == 0.19375
+    assert high_confidence.metadata["strategy_budget_pct"] == 0.31
 
 
 def test_fill_open_slots_skips_candidate_when_cash_is_exhausted(monkeypatch, caplog):
