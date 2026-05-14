@@ -57,6 +57,23 @@ DUST_THRESHOLD = env_float("DUST_THRESHOLD", 3.0)
 CLOSE_RETRY_ATTEMPTS = env_int("CLOSE_RETRY_ATTEMPTS", 5)
 CLOSE_RETRY_DELAY_SECONDS = env_float("CLOSE_RETRY_DELAY_SECONDS", 1.0)
 CLOSE_VERIFY_RATIO = env_float("CLOSE_VERIFY_RATIO", 0.01)
+# Optional: minimum notional-USDT threshold for close verification. When > 0,
+# a close is considered verified if the remaining notional is at or below
+# this floor, even if the ratio-based check has not yet caught up (this fixes
+# the MEXC balance-API lag race observed on PEPEUSDT 2026-05-13).
+CLOSE_VERIFY_MIN_NOTIONAL_USDT = env_float("CLOSE_VERIFY_MIN_NOTIONAL_USDT", 0.0)
+
+
+def _close_verified(remaining_qty: float, remaining_notional: float, qty_before: float) -> bool:
+    """Centralised close-verification predicate (see CLOSE_VERIFY_MIN_NOTIONAL_USDT)."""
+    if remaining_notional < DUST_THRESHOLD:
+        return True
+    if qty_before > 0 and remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+        return True
+    if CLOSE_VERIFY_MIN_NOTIONAL_USDT > 0.0 and remaining_notional <= CLOSE_VERIFY_MIN_NOTIONAL_USDT:
+        return True
+    return False
+
 MAJOR_FILL_THRESHOLD = env_float("MAJOR_FILL_THRESHOLD", 0.85)
 SCALPER_RISK_PER_TRADE = env_float("SCALPER_RISK_PER_TRADE", 0.01)
 KELLY_RISK_CAP = env_float("KELLY_RISK_CAP", 0.028)
@@ -3110,6 +3127,24 @@ class LiveBotRuntime:
                     self._last_grid_block_reason = block_grid_reason
             else:
                 self._last_grid_block_reason = None
+        # Optional: apply the same BTC macro gate to REVERSAL longs.
+        if (
+            getattr(self.config, "reversal_btc_macro_gate_enabled", False)
+            and "REVERSAL" in {strategy.upper() for strategy in eligible}
+        ):
+            change_1h, change_24h = self._btc_trend_changes()
+            block_reversal_reason: str | None = None
+            if change_1h < self.config.grid_btc_1h_floor:
+                block_reversal_reason = f"BTC 1h {change_1h:+.2%} < {self.config.grid_btc_1h_floor:+.2%}"
+            elif change_24h < self.config.grid_btc_24h_floor:
+                block_reversal_reason = f"BTC 24h {change_24h:+.2%} < {self.config.grid_btc_24h_floor:+.2%}"
+            if block_reversal_reason is not None:
+                eligible = [strategy for strategy in eligible if strategy.upper() != "REVERSAL"]
+                if getattr(self, "_last_reversal_block_reason", None) != block_reversal_reason:
+                    log.info("[REVERSAL] Macro gate blocking entries: %s", block_reversal_reason)
+                    self._last_reversal_block_reason = block_reversal_reason
+            else:
+                self._last_reversal_block_reason = None
         context = self._market_context()
         blocked_by_context = {str(strategy).upper() for strategy in context.get("blocked_strategies", [])}
         if blocked_by_context:
@@ -3577,9 +3612,32 @@ class LiveBotRuntime:
             return False
         if self._symbol_performance_rejects(opportunity):
             return False
+        if self._strategy_concurrency_rejects(opportunity):
+            return False
         if self._moonshot_per_symbol_rejects(opportunity):
             opportunity.metadata["pretrade_block_reason"] = "moonshot_symbol_gate"
             return False
+        return True
+
+    def _strategy_concurrency_rejects(self, opportunity: Opportunity) -> bool:
+        strategy = str(opportunity.strategy or "").upper()
+        cap = 0
+        if strategy == "REVERSAL":
+            cap = int(getattr(self.config, "reversal_max_concurrent", 0) or 0)
+        if cap <= 0:
+            return False
+        open_count = sum(
+            1 for trade in self.open_trades
+            if str(trade.strategy or "").upper() == strategy and not getattr(trade, "is_partial", False)
+        )
+        if open_count < cap:
+            return False
+        opportunity.metadata["pretrade_block_reason"] = "strategy_concurrency_cap"
+        opportunity.metadata["symbol_gate_detail"] = f"{strategy}:open={open_count}>=cap={cap}"
+        log.info(
+            "[CONCURRENCY_GATE] %s blocked %s (open=%s cap=%s)",
+            strategy, opportunity.symbol, open_count, cap,
+        )
         return True
 
     def _entry_quality_rejects(self, opportunity: Opportunity) -> bool:
@@ -4436,7 +4494,7 @@ class LiveBotRuntime:
             sell_qty = self._sellable_qty(trade)
             if sell_qty <= 0:
                 remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
-                if remaining_notional < DUST_THRESHOLD or remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+                if _close_verified(remaining_qty, remaining_notional, qty_before):
                     self._record_activity(f"Verified close {trade.symbol} without sellable qty")
                     return self._mark_trade_closed(
                         trade,
@@ -4529,7 +4587,7 @@ class LiveBotRuntime:
                             f"🚨 <b>Sell retry</b> {trade.strategy} {trade.symbol} | market fallback failed | {str(exc)[:120]}",
                         )
 
-            if remaining_notional < DUST_THRESHOLD or remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+            if _close_verified(remaining_qty, remaining_notional, qty_before):
                 total_proceeds = net_proceeds + max(0.0, remaining_notional)
                 self._record_activity(f"Verified close {trade.symbol} on attempt {attempt + 1}")
                 return self._mark_trade_closed(
@@ -4551,7 +4609,7 @@ class LiveBotRuntime:
                 time.sleep(CLOSE_RETRY_DELAY_SECONDS * (attempt + 1))
 
         remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
-        if remaining_notional < DUST_THRESHOLD or remaining_qty <= qty_before * CLOSE_VERIFY_RATIO:
+        if _close_verified(remaining_qty, remaining_notional, qty_before):
             exit_price = float(getattr(last_execution, "avg_price", price_hint) or price_hint)
             fee_quote_qty = float(getattr(last_execution, "fee_quote_qty", 0.0) or 0.0)
             return self._mark_trade_closed(

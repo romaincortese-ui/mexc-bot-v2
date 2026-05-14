@@ -170,6 +170,12 @@ class LiveConfig:
     grid_btc_24h_floor: float
     state_file: str
     same_symbol_reentry_cooldown_seconds: int = 3600
+    # Apply BTC macro gate to REVERSAL strategy as well (default False = current behaviour).
+    reversal_btc_macro_gate_enabled: bool = False
+    # Max concurrent open REVERSAL positions (0 = unlimited / current behaviour).
+    reversal_max_concurrent: int = 0
+    # Notional ($) threshold for close-verification "remaining" check. 0 = use ratio-based current behaviour.
+    close_verify_min_notional_usdt: float = 0.0
     blocked_signal_lanes: list[str] = field(
         default_factory=lambda: [
             "REVERSAL:DIVERGENCE_HAMMER",
@@ -304,6 +310,9 @@ class LiveConfig:
             fear_greed_bear_block_grid=env_bool("FG_BEAR_BLOCK_GRID", True),
             grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
             grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
+            reversal_btc_macro_gate_enabled=env_bool("REVERSAL_BTC_MACRO_GATE_ENABLED", False),
+            reversal_max_concurrent=env_int("REVERSAL_MAX_CONCURRENT", 0),
+            close_verify_min_notional_usdt=env_float("CLOSE_VERIFY_MIN_NOTIONAL_USDT", 0.0),
             state_file=env_str("MEXCBOT_STATE_FILE", default_state_file()),
             same_symbol_reentry_cooldown_seconds=env_int(
                 "SAME_SYMBOL_REENTRY_COOLDOWN_SECONDS",

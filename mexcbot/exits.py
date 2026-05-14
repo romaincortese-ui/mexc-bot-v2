@@ -11,6 +11,12 @@ _log = logging.getLogger(__name__)
 
 FEE_RATE_TAKER = env_float("FEE_RATE_TAKER", 0.001)
 FEE_SLIPPAGE_BUFFER = env_float("FEE_SLIPPAGE_BUFFER", 0.002)
+
+# Minimum hold time (minutes) before breakeven trail can arm. 0 = current behaviour.
+# When > 0, prevents the "6-minute breakeven stop" pattern observed on TONUSDT.
+BREAKEVEN_MIN_HOLD_MINUTES = env_float("BREAKEVEN_MIN_HOLD_MINUTES", 0.0)
+# Optional uplift to breakeven_activation_pct (added to profile value). 0 = current behaviour.
+BREAKEVEN_ACTIVATION_UPLIFT = env_float("BREAKEVEN_ACTIVATION_UPLIFT", 0.0)
 SCALPER_TRAIL_ATR_ACTIVATE = env_float("SCALPER_TRAIL_ATR_ACTIVATE", 2.5)
 SCALPER_TRAIL_MIN = env_float("SCALPER_TRAIL_MIN", 0.015)
 SCALPER_TRAIL_MAX = env_float("SCALPER_TRAIL_MAX", 0.050)
@@ -653,8 +659,13 @@ def evaluate_trade_action(
     if highest_price > prior_highest:
         trade["last_new_high_at"] = current_dt
 
-    breakeven_activation = float(profile["breakeven_activation_pct"])
-    if not bool(trade.get("breakeven_done")) and peak_gain >= breakeven_activation:
+    breakeven_activation = float(profile["breakeven_activation_pct"]) + BREAKEVEN_ACTIVATION_UPLIFT
+    breakeven_min_hold = BREAKEVEN_MIN_HOLD_MINUTES
+    if (
+        not bool(trade.get("breakeven_done"))
+        and peak_gain >= breakeven_activation
+        and held_minutes >= breakeven_min_hold
+    ):
         trade["sl_price"] = max(sl_price, entry_price)
         trade["breakeven_done"] = True
         sl_price = float(trade["sl_price"])
