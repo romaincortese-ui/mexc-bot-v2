@@ -87,6 +87,16 @@ _SOCIAL_BOOST_CACHE: dict[str, tuple[float, str, float]] = {}
 
 
 def _moonshot_params() -> dict[str, float]:
+    # R2 - Momentum continuation mode amplifies the MOMENTUM_BREAKOUT lane:
+    # the default 1.2-2.0% return window is too narrow to admit the +5/+20%
+    # continuation runners that drove the May 11-14 missed-opportunities.
+    momentum_continuation = env_bool("MOMENTUM_CONTINUATION_ENABLED", False)
+    if momentum_continuation:
+        momentum_max_default = env_float("MOMENTUM_CONTINUATION_MAX_RETURN_PCT", 25.0)
+        momentum_enabled_default = True
+    else:
+        momentum_max_default = MOONSHOT_MOMENTUM_MAX_RETURN_PCT
+        momentum_enabled_default = MOONSHOT_ENABLE_MOMENTUM
     return {
         "min_vol_usdt": env_float("MOONSHOT_MIN_VOL", MOONSHOT_MIN_VOL_USDT),
         "max_vol_ratio": env_float("MOONSHOT_MAX_VOL_RATIO", MOONSHOT_MAX_VOL_RATIO),
@@ -100,10 +110,10 @@ def _moonshot_params() -> dict[str, float]:
         "min_vol_ratio": env_float("MOONSHOT_MIN_VOL_RATIO", MOONSHOT_MIN_VOL_RATIO),
         "min_score": env_float("MOONSHOT_MIN_SCORE", MOONSHOT_MIN_SCORE),
         "max_recent_return_pct": env_float("MOONSHOT_MAX_RECENT_RETURN_PCT", MOONSHOT_MAX_RECENT_RETURN_PCT),
-        "momentum_enabled": env_bool("MOONSHOT_ENABLE_MOMENTUM", MOONSHOT_ENABLE_MOMENTUM),
+        "momentum_enabled": env_bool("MOONSHOT_ENABLE_MOMENTUM", momentum_enabled_default),
         "momentum_extra_score": env_float("MOONSHOT_MOMENTUM_EXTRA_SCORE", MOONSHOT_MOMENTUM_EXTRA_SCORE),
         "momentum_min_return_pct": env_float("MOONSHOT_MOMENTUM_MIN_RETURN_PCT", MOONSHOT_MOMENTUM_MIN_RETURN_PCT),
-        "momentum_max_return_pct": env_float("MOONSHOT_MOMENTUM_MAX_RETURN_PCT", MOONSHOT_MOMENTUM_MAX_RETURN_PCT),
+        "momentum_max_return_pct": env_float("MOONSHOT_MOMENTUM_MAX_RETURN_PCT", momentum_max_default),
         "trend_continuation_extra_score": env_float("MOONSHOT_TREND_CONTINUATION_EXTRA_SCORE", MOONSHOT_TREND_CONTINUATION_EXTRA_SCORE),
         "trend_continuation_max_maturity": env_float("MOONSHOT_TREND_CONTINUATION_MAX_MATURITY", MOONSHOT_TREND_CONTINUATION_MAX_MATURITY),
         "tp_min": env_float("MOONSHOT_TP_INITIAL", MOONSHOT_TP_MIN),
@@ -150,6 +160,14 @@ def _moonshot_overextension(
     atr_mult -= max(0.0, rsi - params["overext_rsi_start"]) * params["overext_rsi_tighten"]
     atr_mult = _clamp(atr_mult, params["overext_atr_floor"], params["overext_atr_ceil"])
     max_recent_return_pct = max(atr_pct * atr_mult * 100.0, avg_candle_pct * params["overext_candle_mult"] * 100.0)
+    # R2 - Momentum continuation mode: when enabled, expand the recent-return
+    # ceiling so coins doing +5/+20% can still pass the overextension filter.
+    # The default ceiling tops out near ~4% which rejects every legit
+    # continuation pattern by design.
+    if env_bool("MOMENTUM_CONTINUATION_ENABLED", False):
+        cont_mult = env_float("MOMENTUM_CONTINUATION_RETURN_MULT", 4.0)
+        cont_floor = env_float("MOMENTUM_CONTINUATION_RETURN_FLOOR_PCT", 8.0)
+        max_recent_return_pct = max(max_recent_return_pct * cont_mult, cont_floor)
     max_ema_gap_pct = max(atr_pct * params["overext_ema_gap_mult"] * 100.0, avg_candle_pct * 1.6 * 100.0)
     recent_return_ratio = recent_return_pct / max_recent_return_pct if max_recent_return_pct > 0 else 0.0
     ema_gap_ratio = (ema_gap_pct * 100.0) / max_ema_gap_pct if max_ema_gap_pct > 0 else 0.0
@@ -514,7 +532,17 @@ def find_moonshot_opportunity(
         return None
     universe = tickers.copy()
     params = _moonshot_params()
+    # R1 - Dynamic gainer universe boost. When enabled, the volume cap is
+    # lifted (to admit recently-pumped micro caps) and an additional batch
+    # of top 24h gainers is prepended to the candidate list.
+    gainer_boost = env_bool("MOONSHOT_GAINER_BOOST_ENABLED", False)
+    gainer_extra = env_int("MOONSHOT_GAINER_EXTRA_CANDIDATES", 30) if gainer_boost else 0
+    gainer_min_change_pct = env_float("MOONSHOT_GAINER_MIN_CHANGE_PCT", 5.0) if gainer_boost else 0.0
+    gainer_min_volume_usdt = env_float("MOONSHOT_GAINER_MIN_VOLUME_USDT", 250_000.0) if gainer_boost else 0.0
     max_vol_usdt = _moonshot_volume_cap_usdt(client, config, max_vol_ratio=params["max_vol_ratio"])
+    if gainer_boost:
+        # Effectively disable upper-volume cap so the +50/+500% movers can pass.
+        max_vol_usdt = float("inf")
     universe = universe[(universe["quoteVolume"] >= params["min_vol_usdt"]) & (universe["quoteVolume"] <= max_vol_usdt)]
     if config.moonshot_symbols:
         allowed = {symbol.upper() for symbol in config.moonshot_symbols}
@@ -535,6 +563,24 @@ def find_moonshot_opportunity(
     recent_listing_pool = universe.sort_values("quoteVolume", ascending=False).head(max(config.candidate_limit, 12))["symbol"].tolist()
     recent_listing_symbols = _recent_listing_symbols(client, recent_listing_pool)
     candidate_symbols = list(dict.fromkeys(list(recent_listing_symbols) + momentum_symbols))
+    if gainer_boost and gainer_extra > 0:
+        # Append additional top 24h gainers above the change/volume floor, deduped.
+        gainer_pool = universe[
+            (universe["priceChangePercent"] >= gainer_min_change_pct)
+            & (universe["quoteVolume"] >= gainer_min_volume_usdt)
+        ]
+        gainer_symbols = gainer_pool.sort_values(["priceChangePercent", "quoteVolume"], ascending=[False, False]).head(gainer_extra)["symbol"].tolist()
+        before = len(candidate_symbols)
+        candidate_symbols = list(dict.fromkeys(candidate_symbols + gainer_symbols))
+        added = len(candidate_symbols) - before
+        if added > 0:
+            log.info(
+                "[MOONSHOT][GAINER_BOOST] Added %d gainer candidates (min_change=%.1f%% min_vol=$%.0f): %s",
+                added,
+                gainer_min_change_pct,
+                gainer_min_volume_usdt,
+                ",".join(gainer_symbols[:10]) + ("..." if len(gainer_symbols) > 10 else ""),
+            )
     if not candidate_symbols:
         log.info("[MOONSHOT] No candidate symbols (universe size=%d, momentum=%d)", len(universe), len(momentum_symbols))
         return None

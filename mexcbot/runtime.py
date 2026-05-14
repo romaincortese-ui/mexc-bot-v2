@@ -3746,6 +3746,26 @@ class LiveBotRuntime:
         span = max(1.0, 100.0 - threshold)
         confidence = max(0.0, min(1.0, (score - threshold) / span))
         pct = min_pct + (max_pct - min_pct) * confidence
+        # R4 - Aggressive score-tiered sizing: when enabled, apply a multiplier
+        # based on the candidate's raw score so high-conviction trades get a
+        # larger slice and marginal ones get a smaller slice.
+        if env_bool("AGGRESSIVE_SIZING_ENABLED", False):
+            raw_score = float(opportunity.score or 0.0)
+            high_floor = env_float("AGGRESSIVE_SIZING_HIGH_SCORE", 80.0)
+            high_mult = env_float("AGGRESSIVE_SIZING_HIGH_MULT", 2.0)
+            mid_floor = env_float("AGGRESSIVE_SIZING_MID_SCORE", 60.0)
+            mid_mult = env_float("AGGRESSIVE_SIZING_MID_MULT", 1.0)
+            low_mult = env_float("AGGRESSIVE_SIZING_LOW_MULT", 0.5)
+            cap_pct = env_float("AGGRESSIVE_SIZING_CAP_PCT", 0.60)
+            if raw_score >= high_floor:
+                tier_mult = high_mult
+            elif raw_score >= mid_floor:
+                tier_mult = mid_mult
+            else:
+                tier_mult = low_mult
+            pct = min(max(0.0, pct * tier_mult), max(0.0, min(1.0, cap_pct)))
+            opportunity.metadata["aggressive_sizing_mult"] = round(tier_mult, 4)
+            opportunity.metadata["aggressive_sizing_raw_score"] = round(raw_score, 2)
         opportunity.metadata["allocation_model"] = "simple_available_balance_confidence"
         opportunity.metadata["allocation_pct"] = round(pct, 6)
         opportunity.metadata["allocation_confidence"] = round(confidence, 6)
@@ -4238,6 +4258,25 @@ class LiveBotRuntime:
             return None
         tp_pct = opportunity.tp_pct if opportunity.tp_pct is not None else self.config.take_profit_pct
         sl_pct = opportunity.sl_pct if opportunity.sl_pct is not None else self.config.stop_loss_pct
+        # R3 - High-conviction trail: when score is well above the strategy's
+        # threshold, override the TP with a wider target so the runner has room
+        # to extend, and tag the trade so exits.py uses a wider trail-drop.
+        high_conf_enabled = env_bool("HIGH_CONF_TRAIL_ENABLED", False)
+        high_conf_floor = env_float("HIGH_CONF_SCORE_FLOOR", 75.0)
+        high_conf_tp_pct = env_float("HIGH_CONF_TP_PCT", 0.15)
+        high_conf_mark = bool(high_conf_enabled and float(opportunity.score or 0.0) >= high_conf_floor)
+        if high_conf_mark:
+            tp_pct = max(tp_pct, high_conf_tp_pct)
+            opportunity.metadata["high_conf"] = True
+            opportunity.metadata["high_conf_tp_pct"] = round(tp_pct, 6)
+            log.info(
+                "[HIGH_CONF] %s %s score=%.1f >= %.1f | TP raised to %.2f%%",
+                opportunity.strategy,
+                opportunity.symbol,
+                float(opportunity.score or 0.0),
+                high_conf_floor,
+                tp_pct * 100.0,
+            )
         tp_price = round(entry_price * (1 + tp_pct), 8)
         tp_order_id: str | None = None
         tp_execution_mode = "internal"

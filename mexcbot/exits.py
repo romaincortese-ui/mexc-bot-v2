@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Mapping, MutableMapping
 
-from mexcbot.config import env_float, env_int
+from mexcbot.config import env_bool, env_float, env_int
 
 _log = logging.getLogger(__name__)
 
@@ -726,6 +726,13 @@ def evaluate_trade_action(
         else:
             base_drop = GENERIC_PEAK_DROP_PCT
             atr_mult = GENERIC_PEAK_DROP_ATR_MULT
+        # R3 - High-conviction trail: trades tagged high_conf at open() get a
+        # wider peak-drop band so winners can keep extending instead of
+        # exiting on the first 0.4-1.5% retrace.
+        if bool(trade.get("high_conf")) and env_bool("HIGH_CONF_TRAIL_ENABLED", False):
+            high_conf_drop = env_float("HIGH_CONF_TRAIL_DROP_PCT", 0.05)
+            base_drop = max(base_drop, high_conf_drop)
+            atr_mult = 0.0  # disable ATR tightening for high-conf runners
         peak_drop_pct = base_drop
         if atr_pct is not None and atr_mult > 0:
             peak_drop_pct = max(peak_drop_pct, atr_pct * atr_mult)
