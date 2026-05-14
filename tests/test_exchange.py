@@ -195,10 +195,12 @@ def test_get_live_account_snapshot_counts_locked_balances_and_marks_non_usdt_ass
     assert snapshot["total_equity"] == 130.0
 
 
-def test_get_sellable_qty_uses_total_asset_balance_and_rounds_down(monkeypatch):
+def test_get_sellable_qty_uses_free_asset_balance_and_rounds_down(monkeypatch):
     client = MexcClient(DummyConfig())
 
-    monkeypatch.setattr(client, "get_asset_balance", lambda symbol: 9.987)
+    # Sellable must use *free* balance only; previously used free+locked and caused
+    # MEXC `Oversold (30005)` rejections when locked dust was present.
+    monkeypatch.setattr(client, "get_asset_balance", lambda symbol, **kwargs: 9.987)
     monkeypatch.setattr(client, "get_lot_size", lambda symbol: {"stepSize": "0.01", "minQty": "0.1"})
 
     sellable = client.get_sellable_qty("DOGEUSDT")

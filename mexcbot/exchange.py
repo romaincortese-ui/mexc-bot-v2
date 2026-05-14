@@ -858,23 +858,32 @@ class MexcClient:
                 return cached
             return {"at": now, "free_usdt": 0.0, "total_equity": 0.0}
 
-    def get_asset_balance(self, symbol: str) -> float:
+    def invalidate_account_cache(self) -> None:
+        """Force the next get_account_data call to bypass the TTL cache."""
+        self._account_data_cache = {"at": 0.0, "data": {}}
+
+    def get_asset_balance(self, symbol: str, *, free_only: bool = False, force_refresh: bool = False) -> float:
         if self.config.paper_trade:
             return 0.0
         asset = symbol[:-4] if symbol.endswith("USDT") else symbol
         try:
-            data = self.get_account_data(force_refresh=False, allow_stale=False)
+            data = self.get_account_data(force_refresh=force_refresh, allow_stale=False)
         except Exception as exc:
             log.error("Failed to fetch balance for %s: %s", symbol, exc)
             return 0.0
         balances = data.get("balances", []) if isinstance(data, dict) else []
         for balance in balances:
             if str(balance.get("asset") or "") == asset:
-                return float(balance.get("free", 0.0) or 0.0) + float(balance.get("locked", 0.0) or 0.0)
+                free = float(balance.get("free", 0.0) or 0.0)
+                if free_only:
+                    return free
+                return free + float(balance.get("locked", 0.0) or 0.0)
         return 0.0
 
-    def get_sellable_qty(self, symbol: str, fallback_qty: float = 0.0, max_qty: float | None = None) -> float:
-        actual = self.get_asset_balance(symbol)
+    def get_sellable_qty(self, symbol: str, fallback_qty: float = 0.0, max_qty: float | None = None, *, force_refresh: bool = False) -> float:
+        # Sellable means *free* balance only: locked units (open orders, dust) can't be sold.
+        # Using free+locked previously caused MEXC `Oversold (30005)` retry storms on exits.
+        actual = self.get_asset_balance(symbol, free_only=True, force_refresh=force_refresh)
         target_qty = actual if actual > 0 else float(fallback_qty or 0.0)
         if max_qty is not None and max_qty > 0:
             target_qty = min(target_qty, max_qty)

@@ -4205,16 +4205,25 @@ class LiveBotRuntime:
             log.error("Balance fetch error: %s", exc)
             return 0.0
 
-    def _sellable_qty(self, trade: Trade, requested_qty: float | None = None) -> float:
+    def _sellable_qty(self, trade: Trade, requested_qty: float | None = None, *, force_refresh: bool = False) -> float:
         target_qty = float(requested_qty if requested_qty is not None else trade.qty)
         if self.config.paper_trade:
             return min(max(0.0, target_qty), float(trade.qty))
         try:
-            return self.client.get_sellable_qty(
-                trade.symbol,
-                fallback_qty=target_qty,
-                max_qty=target_qty,
-            )
+            try:
+                return self.client.get_sellable_qty(
+                    trade.symbol,
+                    fallback_qty=target_qty,
+                    max_qty=target_qty,
+                    force_refresh=force_refresh,
+                )
+            except TypeError:
+                # Older client stubs / test doubles may not accept force_refresh.
+                return self.client.get_sellable_qty(
+                    trade.symbol,
+                    fallback_qty=target_qty,
+                    max_qty=target_qty,
+                )
         except Exception as exc:
             log.error("Sellable qty fetch error for %s: %s", trade.symbol, exc)
             return 0.0
@@ -4529,8 +4538,11 @@ class LiveBotRuntime:
                 log.debug("Cancel-all failed for %s before close: %s", trade.symbol, exc)
 
         last_execution = None
+        oversold_retries = 0
         for attempt in range(CLOSE_RETRY_ATTEMPTS):
-            sell_qty = self._sellable_qty(trade)
+            # When a prior attempt hit MEXC `Oversold (30005)`, the cached balance was stale
+            # or included locked units. Force a refresh so the next attempt sells only free qty.
+            sell_qty = self._sellable_qty(trade, force_refresh=oversold_retries > 0)
             if sell_qty <= 0:
                 remaining_qty, remaining_notional = self._position_remaining(trade, price_hint=price_hint)
                 if _close_verified(remaining_qty, remaining_notional, qty_before):
@@ -4563,9 +4575,16 @@ class LiveBotRuntime:
                 )
                 last_execution = execution
             except Exception as exc:
+                exc_text = str(exc)
+                if "Oversold" in exc_text or "30005" in exc_text:
+                    oversold_retries += 1
+                    try:
+                        self.client.invalidate_account_cache()
+                    except Exception:
+                        pass
                 self._notify_once(
                     f"sell-retry:{trade.symbol}",
-                    f"🚨 <b>Sell retry</b> {trade.strategy} {trade.symbol} | {attempt + 1}/{CLOSE_RETRY_ATTEMPTS} | {str(exc)[:120]}",
+                    f"🚨 <b>Sell retry</b> {trade.strategy} {trade.symbol} | {attempt + 1}/{CLOSE_RETRY_ATTEMPTS} | {exc_text[:120]}",
                 )
                 if attempt < CLOSE_RETRY_ATTEMPTS - 1:
                     time.sleep(CLOSE_RETRY_DELAY_SECONDS * (attempt + 1))
