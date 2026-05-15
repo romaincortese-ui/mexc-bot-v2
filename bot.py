@@ -9,6 +9,10 @@ from __future__ import annotations
 import os
 
 _PROD_FLAG_DEFAULTS = {
+    "MEXCBOT_STRATEGIES": "SCALPER",       # 30d review: GRID/REVERSAL disabled until profitable again
+    "SCALPER_THRESHOLD": "75",             # 30d review: high-conviction crossover floor
+    "ADAPTIVE_MIN_OFFSET": "0",            # allow tightening, but do not relax below the validated floor
+    "MEXCBOT_CALIBRATION_MIN_TOTAL_TRADES": "10",
     "USE_ATR_STOPS_V2": "1",              # §2.1 ATR-anchored stop-loss geometry
     "USE_FEE_NET_SCORE": "1",             # §2.2 Fee/slippage-adjusted score threshold
     "USE_STRATEGY_DEDUP": "1",            # §2.3 Winner-takes-all per symbol per bar
