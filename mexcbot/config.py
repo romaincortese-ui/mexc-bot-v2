@@ -169,6 +169,8 @@ class LiveConfig:
     grid_btc_1h_floor: float
     grid_btc_24h_floor: float
     state_file: str
+    runtime_status_redis_key: str = "mexc_bot_runtime_status"
+    runtime_status_ttl_seconds: int = 1800
     same_symbol_reentry_cooldown_seconds: int = 3600
     # Apply BTC macro gate to REVERSAL strategy as well (default False = current behaviour).
     reversal_btc_macro_gate_enabled: bool = False
@@ -310,6 +312,8 @@ class LiveConfig:
             fear_greed_bear_block_grid=env_bool("FG_BEAR_BLOCK_GRID", True),
             grid_btc_1h_floor=env_float("GRID_BTC_1H_FLOOR", -0.005),
             grid_btc_24h_floor=env_float("GRID_BTC_24H_FLOOR", -0.015),
+            runtime_status_redis_key=env_str("MEXCBOT_RUNTIME_STATUS_REDIS_KEY", "mexc_bot_runtime_status"),
+            runtime_status_ttl_seconds=env_int("MEXCBOT_RUNTIME_STATUS_TTL_SECONDS", 1800),
             reversal_btc_macro_gate_enabled=env_bool("REVERSAL_BTC_MACRO_GATE_ENABLED", False),
             reversal_max_concurrent=env_int("REVERSAL_MAX_CONCURRENT", 0),
             close_verify_min_notional_usdt=env_float("CLOSE_VERIFY_MIN_NOTIONAL_USDT", 0.0),

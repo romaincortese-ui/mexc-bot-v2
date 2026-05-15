@@ -4765,6 +4765,60 @@ class LiveBotRuntime:
         total_pnl = sum(float(item.get("pnl_usdt", 0) or 0) for item in self.trade_history)
         log.info("Stats | Trades: %s | Win rate: %.0f%% | Total P&L: $%+.2f", total, win_rate, total_pnl)
 
+    def _profit_factor(self) -> float:
+        pnls = [float(item.get("pnl_usdt", 0.0) or 0.0) for item in self.trade_history]
+        gross_profit = sum(value for value in pnls if value > 0)
+        gross_loss = -sum(value for value in pnls if value < 0)
+        if gross_loss > 0:
+            return gross_profit / gross_loss
+        return 999.0 if gross_profit > 0 else 0.0
+
+    def _runtime_status_payload(self, state: str = "running") -> dict[str, object]:
+        snapshot = self._balance_snapshot(force_refresh=not self.config.paper_trade)
+        total_equity = float(snapshot.get("total_equity", 0.0) or 0.0)
+        free_usdt = float(snapshot.get("free_usdt", 0.0) or 0.0)
+        allocated = sum(
+            float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
+            for trade in self.open_trades
+        )
+        realized_pnl = sum(float(item.get("pnl_usdt", 0.0) or 0.0) for item in self.trade_history)
+        return {
+            "service": "mexc_spot",
+            "state": state,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "paper_trade": self.config.paper_trade,
+            "account_balance": total_equity,
+            "account_nav": total_equity,
+            "balance": total_equity,
+            "available_balance": free_usdt,
+            "allocated_balance": round(allocated, 4),
+            "unrealized_pl": round(float(snapshot.get("session_pnl", 0.0) or 0.0), 4),
+            "pnl_amount": round(realized_pnl + float(snapshot.get("session_pnl", 0.0) or 0.0), 4),
+            "daily_pnl": snapshot.get("daily_pnl"),
+            "open_trades": len(self.open_trades),
+            "total_trades": len(self.trade_history) + len(self.open_trades),
+            "profit_factor": self._profit_factor(),
+            "open_positions": [trade.to_dict() for trade in self.open_trades],
+            "recent_activity": list(self._recent_activity),
+        }
+
+    def _publish_runtime_status(self, state: str = "running") -> bool:
+        if not self.config.redis_url or not self.config.runtime_status_redis_key or self.config.runtime_status_ttl_seconds <= 0:
+            return False
+        try:
+            import redis
+
+            client = redis.from_url(self.config.redis_url, socket_connect_timeout=5, socket_timeout=5)
+            client.set(
+                self.config.runtime_status_redis_key,
+                json.dumps(self._runtime_status_payload(state), default=_json_default),
+                ex=self.config.runtime_status_ttl_seconds,
+            )
+            return True
+        except Exception as exc:
+            log.debug("Runtime status publish failed: %s", exc)
+            return False
+
     def run(self) -> None:
         mode = "PAPER TRADING" if self.config.paper_trade else "LIVE TRADING"
         self.refresh_trade_calibration(force=True)
@@ -4793,6 +4847,7 @@ class LiveBotRuntime:
                 self._handle_telegram_commands()
                 self.refresh_daily_review()
                 self._send_heartbeat()
+                self._publish_runtime_status("paused" if self._paused else "running")
                 self._maybe_convert_dust()
                 self._send_daily_summary()
                 self._send_weekly_summary()
