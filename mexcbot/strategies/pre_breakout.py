@@ -12,7 +12,6 @@ from mexcbot.config import env_str
 from mexcbot.exchange import MexcClient
 from mexcbot.indicators import calc_atr, calc_ema, calc_rsi
 from mexcbot.models import Opportunity
-from mexcbot.strategies.common import compute_dynamic_sl
 
 
 log = logging.getLogger(__name__)
@@ -21,7 +20,9 @@ PRE_BREAKOUT_INTERVAL = env_str("PRE_BREAKOUT_INTERVAL", "5m")
 PRE_BREAKOUT_MIN_VOL = 100_000.0
 PRE_BREAKOUT_MIN_SCORE = 30.0
 PRE_BREAKOUT_TP = 0.08
-PRE_BREAKOUT_SL = 0.40
+PRE_BREAKOUT_SL = 0.04
+PRE_BREAKOUT_SL_FLOOR = 0.015
+PRE_BREAKOUT_SL_ATR_MULT = 3.0
 PRE_BREAKOUT_ACCUM_CANDLES = 5
 PRE_BREAKOUT_ACCUM_PRICE_RANGE = 0.01
 PRE_BREAKOUT_SQUEEZE_LOOKBACK = 20
@@ -34,11 +35,22 @@ def _pre_breakout_params() -> dict[str, float | int]:
         "min_score": env_float("PRE_BREAKOUT_MIN_SCORE", PRE_BREAKOUT_MIN_SCORE),
         "tp_pct": env_float("PRE_BREAKOUT_TP", PRE_BREAKOUT_TP),
         "sl_pct": env_float("PRE_BREAKOUT_SL", PRE_BREAKOUT_SL),
+        "sl_floor": env_float("PRE_BREAKOUT_SL_FLOOR", PRE_BREAKOUT_SL_FLOOR),
+        "sl_atr_mult": env_float("PRE_BREAKOUT_SL_ATR_MULT", PRE_BREAKOUT_SL_ATR_MULT),
         "accum_candles": env_int("PRE_BREAKOUT_ACCUM_CANDLES", PRE_BREAKOUT_ACCUM_CANDLES),
         "accum_price_range": env_float("PRE_BREAKOUT_ACCUM_PRICE_RANGE", PRE_BREAKOUT_ACCUM_PRICE_RANGE),
         "squeeze_lookback": env_int("PRE_BREAKOUT_SQUEEZE_LOOKBACK", PRE_BREAKOUT_SQUEEZE_LOOKBACK),
         "base_tests": env_int("PRE_BREAKOUT_BASE_TESTS", PRE_BREAKOUT_BASE_TESTS),
     }
+
+
+def _pre_breakout_stop_loss_pct(atr_pct: float, params: dict[str, float | int]) -> float:
+    cap = max(0.0, float(params["sl_pct"]))
+    floor = max(0.0, min(cap, float(params["sl_floor"]))) if cap > 0 else 0.0
+    atr_stop = max(0.0, float(atr_pct)) * max(0.0, float(params["sl_atr_mult"]))
+    if cap <= 0:
+        return 0.0
+    return max(floor, min(cap, atr_stop))
 
 
 def score_pre_breakout_from_frame(symbol: str, frame: pd.DataFrame, score_threshold: float = PRE_BREAKOUT_MIN_SCORE) -> Opportunity | None:
@@ -171,11 +183,12 @@ def score_pre_breakout_from_frame(symbol: str, frame: pd.DataFrame, score_thresh
         entry_signal=pattern,
         strategy="PRE_BREAKOUT",
         tp_pct=round(float(params["tp_pct"]), 6),
-        sl_pct=round(compute_dynamic_sl(float(atr_pct)), 6),
+        sl_pct=round(_pre_breakout_stop_loss_pct(float(atr_pct), params), 6),
         atr_pct=round(float(atr_pct), 6),
         metadata={
             "rsi_delta": rsi_delta,
             "avg_candle_pct": round(avg_candle_pct, 6),
+            "pre_breakout_stop_model": "atr_floor_cap",
             "pattern": pattern,
             **pattern_meta,
         },

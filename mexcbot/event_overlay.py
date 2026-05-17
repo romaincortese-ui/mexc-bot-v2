@@ -90,6 +90,8 @@ def evaluate_unlock_gate(
 
 DEFAULT_STABLE_FLOW_THRESHOLD_24H: float = 0.01   # 1% absolute change
 DEFAULT_STABLE_RISKOFF_MULTIPLIER: float = 0.70
+DEFAULT_STABLE_DEPEG_THRESHOLD: float = 0.005     # 50 bps from peg
+DEFAULT_STABLE_DEPEG_RISKOFF_MULTIPLIER: float = 0.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +304,12 @@ def evaluate_event_state_overlay(
             reasons.append(inflow_decision.reason)
         break
 
+    stable_depeg = _safe_float(state.get("stablecoin_depeg_score"), 0.0)
+    if stable_depeg >= DEFAULT_STABLE_DEPEG_THRESHOLD:
+        multiplier *= DEFAULT_STABLE_DEPEG_RISKOFF_MULTIPLIER
+        depeg_symbol = str(state.get("stablecoin_depeg_symbol") or "stablecoin").upper()
+        reasons.append(f"stablecoin_depeg:{depeg_symbol}:{stable_depeg:.4f}>={DEFAULT_STABLE_DEPEG_THRESHOLD}")
+
     market_risk = _market_risk_score_for_symbol(state, sym)
     if market_risk >= 0.80:
         multiplier *= float(severe_headline_risk_multiplier)
@@ -410,6 +418,8 @@ def _has_adverse_market_flow(state: dict[str, Any]) -> bool:
     for key in ("btc_exchange_inflow_1h", "exchange_btc_inflow_1h"):
         if key in state and _safe_float(state.get(key), 0.0) >= DEFAULT_INFLOW_THRESHOLD_BTC_1H:
             return True
+    if _safe_float(state.get("stablecoin_depeg_score"), 0.0) >= DEFAULT_STABLE_DEPEG_THRESHOLD:
+        return True
     return False
 
 

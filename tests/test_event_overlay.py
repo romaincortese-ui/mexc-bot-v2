@@ -120,6 +120,20 @@ def test_event_state_overlay_combines_active_risks():
     assert "crypto_event_risk:0.60" in d.reasons
 
 
+def test_event_state_overlay_dampens_stablecoin_depeg():
+    state = {
+        "generated_at": BASE.isoformat(),
+        "ttl_seconds": 1800,
+        "stablecoin_depeg_score": 0.012,
+        "stablecoin_depeg_symbol": "USDT",
+    }
+
+    d = evaluate_event_state_overlay(symbol="BTCUSDT", now=BASE, state=state)
+
+    assert d.sizing_multiplier == 0.5
+    assert "stablecoin_depeg:USDT:0.0120>=0.005" in d.reasons
+
+
 def test_event_state_overlay_fails_open_when_stale():
     state = {
         "generated_at": (BASE - timedelta(hours=2)).isoformat(),
@@ -173,6 +187,22 @@ def test_risk_on_threshold_relief_is_suppressed_by_exchange_inflow():
         "generated_at": BASE.isoformat(),
         "ttl_seconds": 1800,
         "btc_exchange_inflow_1h": 8_000,
+        "events": [
+            {"scope": "market", "direction": "risk_on", "severity": 0.80, "title": "ETF approved"}
+        ],
+    }
+
+    boost = evaluate_event_state_opportunity_boost(symbol="BTCUSDT", now=BASE, state=state)
+
+    assert boost.threshold_relief == 0.0
+    assert boost.reasons == ()
+
+
+def test_risk_on_threshold_relief_is_suppressed_by_stablecoin_depeg():
+    state = {
+        "generated_at": BASE.isoformat(),
+        "ttl_seconds": 1800,
+        "stablecoin_depeg_score": 0.009,
         "events": [
             {"scope": "market", "direction": "risk_on", "severity": 0.80, "title": "ETF approved"}
         ],

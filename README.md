@@ -44,6 +44,21 @@ ANTHROPIC_API_KEY=your_anthropic_key
 WEB_SEARCH_ENABLED=true
 ```
 
+Crypto event intelligence can run as a separate Railway service by setting `MEXC_BOT_ROLE=event_intelligence`. It publishes `mexc:crypto_event_intelligence` to Redis for both the spot and futures bots. The default no-key feed set now includes CoinDesk plus SEC/CFTC regulatory feeds; set `CRYPTO_EVENT_CRYPTOPANIC_TOKEN` to add CryptoPanic JSON headlines with explicit instrument metadata. The runner also polls DeFiLlama stablecoin data by default and publishes 24h USDT/USDC supply change plus depeg risk. Useful source env vars:
+
+```bash
+MEXC_BOT_ROLE=event_intelligence
+REDIS_URL=redis://...
+CRYPTO_EVENT_CRYPTOPANIC_TOKEN=...
+CRYPTO_EVENT_CRYPTOPANIC_PLAN=developer
+CRYPTO_EVENT_CRYPTOPANIC_FILTERS=hot,bearish,bullish
+CRYPTO_EVENT_CRYPTOPANIC_CURRENCIES=BTC,ETH,SOL,BNB,XRP,DOGE,ADA,SUI,ENA,HYPE,ZEC,SEI,PEPE
+CRYPTO_EVENT_DEFILLAMA_STABLECOINS_ENABLED=true
+CRYPTO_EVENT_STABLECOIN_SYMBOLS=USDT,USDC
+```
+
+Spot backtests can replay a historical event state file with `BACKTEST_CRYPTO_EVENT_STATE_FILE`. The file can be a single state object or a `timeline`/`states` list with `from`/`until` windows and nested `state` payloads, matching the runtime event overlay for threshold relief and sizing changes.
+
 ### 3. Run locally (paper trading)
 
 ```bash
@@ -91,7 +106,16 @@ MOONSHOT_MAX_VOL_RATIO=100000
 REVERSAL_SYMBOLS=SOLUSDT,DOGEUSDT,ETHUSDT,PEPEUSDT,WIFUSDT
 GRID_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ADAUSDT
 TRINITY_SYMBOLS=SOLUSDT,ETHUSDT,DOGEUSDT,XRPUSDT
+MEXCBOT_CONFIDENCE_ALLOCATION_ENABLED=true
+MEXCBOT_CONFIDENCE_MAX_TOTAL_PCT=0.50
+MEXCBOT_CONFIDENCE_LOW_PCT=0.08
+MEXCBOT_CONFIDENCE_MID_PCT=0.12
+MEXCBOT_CONFIDENCE_HIGH_PCT=0.18
+MEXCBOT_CONFIDENCE_MAX_PCT=0.25
+MEXCBOT_BLOCKED_SIGNAL_LANES=REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION,TRINITY:EMA_CROSSOVER,TRINITY:RANGE_BREAKOUT,PRE_BREAKOUT:ACCUMULATION,PRE_BREAKOUT:BASE_SPRING
 ```
+
+The confidence allocator sizes each accepted opportunity from the live available balance while keeping total open spot capital capped at 50% of equity by default. Scores 0-5 are skipped, 6-7 use the low bucket, 8 the mid bucket, 9 the high bucket, and 10 the max bucket. The default blocked signal lanes keep historically weak entry types from trading while the scanners continue evaluating the full strategy set.
 
 `MOONSHOT_MAX_VOL_RATIO` now matches the monolith semantics again: it scales the maximum eligible 24h quote volume by account size, with a built-in floor to avoid over-filtering small accounts. The moonshot strategy can still use cached Anthropic web-search buzz scoring on a very small number of near-threshold candidates when `WEB_SEARCH_ENABLED=true`, but social input no longer creates its own trend-entry lane. The current profit-oriented default is narrower than earlier moonshot iterations: non-new rebound entries are skipped, momentum breakouts are disabled by default via `MOONSHOT_ENABLE_MOMENTUM=false`, and trend continuation is kept on a tighter maturity leash with `MOONSHOT_TREND_CONTINUATION_MAX_MATURITY=0.45`. If you want to re-open the momentum lane later, keep it capped with `MOONSHOT_MOMENTUM_MIN_RETURN_PCT` and `MOONSHOT_MOMENTUM_MAX_RETURN_PCT` rather than letting it chase extended moves.
 

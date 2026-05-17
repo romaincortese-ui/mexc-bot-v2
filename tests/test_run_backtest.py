@@ -46,6 +46,16 @@ def test_build_run_summary_includes_effective_window_and_runtime_settings():
             "basis": "available_cash",
             "confidence": "score_vs_strategy_threshold",
         },
+        "confidence_allocation": {
+            "enabled": False,
+            "max_total_pct": 0.5,
+            "low_pct": 0.08,
+            "mid_pct": 0.12,
+            "high_pct": 0.18,
+            "max_pct": 0.25,
+            "max_risk_pct": 0.0,
+            "min_stop_pct": 0.015,
+        },
         "strategy_allocations": {
             "SCALPER": 0.25,
             "MOONSHOT_POOL": 0.65,

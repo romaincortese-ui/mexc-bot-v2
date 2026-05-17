@@ -62,6 +62,14 @@ def test_backtest_config_parses_strategy_specific_symbol_universes(monkeypatch: 
 def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEXCBOT_STRATEGIES", raising=False)
     monkeypatch.delenv("TRINITY_ALLOCATION_PCT", raising=False)
+    monkeypatch.delenv("SCALPER_ALLOCATION_PCT", raising=False)
+    monkeypatch.delenv("MOONSHOT_ALLOCATION_PCT", raising=False)
+    monkeypatch.delenv("GRID_ALLOCATION_PCT", raising=False)
+    monkeypatch.delenv("SCALPER_BUDGET_PCT", raising=False)
+    monkeypatch.delenv("MOONSHOT_BUDGET_PCT", raising=False)
+    monkeypatch.delenv("REVERSAL_BUDGET_PCT", raising=False)
+    monkeypatch.delenv("GRID_BUDGET_PCT", raising=False)
+    monkeypatch.delenv("MIN_EXPECTED_NET_PROFIT_USDT", raising=False)
     monkeypatch.delenv("MEXCBOT_BLOCKED_SIGNAL_LANES", raising=False)
 
     config = BacktestConfig.from_env(now=datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
@@ -73,6 +81,10 @@ def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatc
         "SCALPER:TREND",
         "MOONSHOT:NEW_LISTING",
         "MOONSHOT:TREND_CONTINUATION",
+        "TRINITY:EMA_CROSSOVER",
+        "TRINITY:RANGE_BREAKOUT",
+        "PRE_BREAKOUT:ACCUMULATION",
+        "PRE_BREAKOUT:BASE_SPRING",
     ]
     assert config.max_open_positions == 5
     assert config.simple_allocation_min_pct == 0.155

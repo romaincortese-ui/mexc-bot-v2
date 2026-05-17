@@ -25,7 +25,7 @@ def test_score_pre_breakout_from_frame_returns_accumulation_setup(monkeypatch):
     assert result.strategy == "PRE_BREAKOUT"
     assert result.entry_signal == "ACCUMULATION"
     assert result.tp_pct == 0.08
-    assert result.sl_pct > 0
+    assert 0.015 <= float(result.sl_pct or 0.0) <= 0.04
     assert result.metadata["vol_growth"] > 1.0
 
 

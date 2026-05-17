@@ -184,11 +184,23 @@ class LiveConfig:
             "SCALPER:TREND",
             "MOONSHOT:NEW_LISTING",
             "MOONSHOT:TREND_CONTINUATION",
+            "TRINITY:EMA_CROSSOVER",
+            "TRINITY:RANGE_BREAKOUT",
+            "PRE_BREAKOUT:ACCUMULATION",
+            "PRE_BREAKOUT:BASE_SPRING",
         ]
     )
     base_url: str = "https://api.mexc.com"
     simple_allocation_min_pct: float = 0.155
     simple_allocation_max_pct: float = 0.310
+    confidence_allocation_enabled: bool = False
+    confidence_allocation_max_total_pct: float = 0.50
+    confidence_allocation_low_pct: float = 0.08
+    confidence_allocation_mid_pct: float = 0.12
+    confidence_allocation_high_pct: float = 0.18
+    confidence_allocation_max_pct: float = 0.25
+    confidence_allocation_max_risk_pct: float = 0.0
+    confidence_allocation_min_stop_pct: float = 0.015
 
     @classmethod
     def from_env(cls) -> "LiveConfig":
@@ -324,9 +336,17 @@ class LiveConfig:
             ),
             blocked_signal_lanes=env_csv(
                 "MEXCBOT_BLOCKED_SIGNAL_LANES",
-                "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION",
+                "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION,TRINITY:EMA_CROSSOVER,TRINITY:RANGE_BREAKOUT,PRE_BREAKOUT:ACCUMULATION,PRE_BREAKOUT:BASE_SPRING",
             ),
             base_url=env_str("MEXC_BASE_URL", "https://api.mexc.com"),
             simple_allocation_min_pct=env_float("SIMPLE_ALLOCATION_MIN_PCT", 0.155),
             simple_allocation_max_pct=env_float("SIMPLE_ALLOCATION_MAX_PCT", 0.310),
+            confidence_allocation_enabled=env_bool("MEXCBOT_CONFIDENCE_ALLOCATION_ENABLED", False),
+            confidence_allocation_max_total_pct=env_float("MEXCBOT_CONFIDENCE_MAX_TOTAL_PCT", 0.50),
+            confidence_allocation_low_pct=env_float("MEXCBOT_CONFIDENCE_LOW_PCT", 0.08),
+            confidence_allocation_mid_pct=env_float("MEXCBOT_CONFIDENCE_MID_PCT", 0.12),
+            confidence_allocation_high_pct=env_float("MEXCBOT_CONFIDENCE_HIGH_PCT", 0.18),
+            confidence_allocation_max_pct=env_float("MEXCBOT_CONFIDENCE_MAX_PCT", 0.25),
+            confidence_allocation_max_risk_pct=env_float("MEXCBOT_CONFIDENCE_MAX_RISK_PCT", 0.0),
+            confidence_allocation_min_stop_pct=env_float("MEXCBOT_CONFIDENCE_MIN_STOP_PCT", 0.015),
         )

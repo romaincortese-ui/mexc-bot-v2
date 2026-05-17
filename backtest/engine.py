@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 import pandas as pd
@@ -10,13 +13,16 @@ from backtest.data import HistoricalKlineProvider
 from backtest.moonshot_proxy import score_backtest_moonshot_candidates
 from backtest.exchange_simulator import SyntheticExchangeSimulator
 from mexcbot.calibration import apply_opportunity_calibration
+from mexcbot.confidence_allocation import confidence_allocation_plan, write_confidence_metadata
 from mexcbot.depth_sizing import BookLevel, size_against_book
+from mexcbot.event_overlay import evaluate_event_state_opportunity_boost, evaluate_event_state_overlay
 from mexcbot.exits import evaluate_trade_action, initialize_exit_state
 from mexcbot.models import Opportunity
 from mexcbot.runtime import compute_market_regime_multiplier
 from mexcbot.indicators import calc_ema
 from mexcbot.strategies.grid import GRID_INTERVAL, GRID_MIN_SCORE, score_grid_from_frame
 from mexcbot.strategies.moonshot import MOONSHOT_INTERVAL, MOONSHOT_MIN_SCORE, score_moonshot_from_frame
+from mexcbot.strategies.pre_breakout import PRE_BREAKOUT_INTERVAL, PRE_BREAKOUT_MIN_SCORE, score_pre_breakout_from_frame
 from mexcbot.strategies.reversal import REVERSAL_INTERVAL, REVERSAL_MIN_SCORE, score_reversal_from_frame
 from mexcbot.strategies.scalper import SCALPER_INTERVAL, dynamic_scalper_correlation_limit, max_correlation_to_open_positions, resolve_scalper_tp_execution_mode, score_symbol_from_frame
 from mexcbot.strategies.trinity import TRINITY_INTERVAL, TRINITY_MIN_SCORE, score_trinity_from_frame
@@ -38,6 +44,7 @@ BACKTEST_STRATEGY_SPECS: dict[str, tuple[str, int, float, Callable[[str, pd.Data
     "TRINITY": (TRINITY_INTERVAL, 120, TRINITY_MIN_SCORE, score_trinity_from_frame),
     "MOONSHOT": (MOONSHOT_INTERVAL, 24, MOONSHOT_MIN_SCORE, score_moonshot_from_frame),
     "REVERSAL": (REVERSAL_INTERVAL, 120, REVERSAL_MIN_SCORE, score_reversal_from_frame),
+    "PRE_BREAKOUT": (PRE_BREAKOUT_INTERVAL, 60, PRE_BREAKOUT_MIN_SCORE, score_pre_breakout_from_frame),
 }
 
 ADAPTIVE_THRESHOLD_STRATEGIES = {"SCALPER", "MOONSHOT"}
@@ -61,6 +68,27 @@ def _normalise_signal_lane(value: object) -> str:
     return str(value or "").strip().replace("/", ":").upper()
 
 
+def _parse_replay_time(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
 class BacktestEngine:
     def __init__(
         self,
@@ -81,6 +109,8 @@ class BacktestEngine:
         self._moonshot_gate_open = True
         self._synthetic_fng: int = 50
         self._score_cache: dict[tuple[str, int, float], Opportunity | None] = {}
+        self._crypto_event_replay_loaded = False
+        self._crypto_event_replay_payload: object | None = None
         self._exchange_simulator = SyntheticExchangeSimulator(
             defensive_unlock_bars=self.config.synthetic_defensive_unlock_bars,
             close_max_attempts=self.config.synthetic_close_max_attempts,
@@ -423,6 +453,86 @@ class BacktestEngine:
             return self.config.moonshot_min_score
         return self.config.score_threshold
 
+    def _load_crypto_event_replay(self) -> object | None:
+        if self._crypto_event_replay_loaded:
+            return self._crypto_event_replay_payload
+        self._crypto_event_replay_loaded = True
+        path = str(getattr(self.config, "crypto_event_state_file", "") or "").strip()
+        if not path:
+            return None
+        try:
+            self._crypto_event_replay_payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            self._crypto_event_replay_payload = None
+        return self._crypto_event_replay_payload
+
+    def _crypto_event_state_for(self, timestamp: pd.Timestamp) -> dict[str, object] | None:
+        if not getattr(self.config, "crypto_event_overlay_enabled", True):
+            return None
+        payload = self._load_crypto_event_replay()
+        if not isinstance(payload, (dict, list)):
+            return None
+        if isinstance(payload, dict) and not any(key in payload for key in ("timeline", "states", "events_by_time")):
+            return payload
+        items = payload if isinstance(payload, list) else payload.get("timeline") or payload.get("states") or payload.get("events_by_time") or []
+        if not isinstance(items, list):
+            return None
+        current = timestamp.to_pydatetime()
+        current = current.astimezone(timezone.utc) if current.tzinfo else current.replace(tzinfo=timezone.utc)
+        selected: dict[str, object] | None = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            start = _parse_replay_time(item.get("from") or item.get("start") or item.get("generated_at") or item.get("timestamp"))
+            if start is None or start > current:
+                continue
+            end = _parse_replay_time(item.get("until") or item.get("end") or item.get("expires_at"))
+            if end is not None and current >= end:
+                continue
+            raw_state = item.get("state") if isinstance(item.get("state"), dict) else item
+            state = dict(raw_state)
+            state.setdefault("generated_at", start.isoformat())
+            selected = state
+        return selected
+
+    def _event_threshold_for_symbol(self, symbol: str, strategy: str, base_threshold: float, state: dict[str, object] | None, timestamp: pd.Timestamp) -> float:
+        if not getattr(self.config, "crypto_event_overlay_enabled", True) or state is None:
+            return base_threshold
+        decision = evaluate_event_state_opportunity_boost(
+            symbol=symbol,
+            now=timestamp.to_pydatetime(),
+            state=state,
+            stale_after_seconds=int(getattr(self.config, "crypto_event_stale_seconds", 1800)),
+            min_risk_on_score=float(getattr(self.config, "crypto_event_min_risk_on_score", 0.45)),
+            max_threshold_relief=float(getattr(self.config, "crypto_event_threshold_relief", 3.0)),
+            risk_on_multiplier=float(getattr(self.config, "crypto_event_risk_on_multiplier", 1.15)),
+        )
+        if decision.threshold_relief <= 0:
+            return base_threshold
+        threshold = max(0.0, float(base_threshold) - float(decision.threshold_relief))
+        return max(threshold, 0.0)
+
+    def _apply_crypto_event_overlay_to_candidates(self, candidates: list[tuple[Opportunity, str]], state: dict[str, object] | None, timestamp: pd.Timestamp) -> list[tuple[Opportunity, str]]:
+        if not getattr(self.config, "crypto_event_overlay_enabled", True) or state is None:
+            return candidates
+        updated: list[tuple[Opportunity, str]] = []
+        for candidate, data_key in candidates:
+            decision = evaluate_event_state_overlay(
+                symbol=candidate.symbol,
+                now=timestamp.to_pydatetime(),
+                state=state,
+                stale_after_seconds=int(getattr(self.config, "crypto_event_stale_seconds", 1800)),
+                risk_on_multiplier=float(getattr(self.config, "crypto_event_risk_on_multiplier", 1.15)),
+                max_sizing_multiplier=float(getattr(self.config, "crypto_event_max_sizing_multiplier", 1.25)),
+            )
+            if decision.reasons or abs(float(decision.sizing_multiplier) - 1.0) > 1e-9:
+                candidate.metadata["event_overlay_mult"] = round(float(decision.sizing_multiplier), 4)
+                candidate.metadata["event_overlay_reasons"] = list(decision.reasons)
+                if decision.state_age_seconds is not None:
+                    candidate.metadata["event_overlay_age_seconds"] = round(float(decision.state_age_seconds), 1)
+            updated.append((candidate, data_key))
+        return updated
+
     def _threshold_overrides(self) -> dict[str, float]:
         overrides: dict[str, float] = {}
         # Apply extra tightening during extreme fear
@@ -515,6 +625,12 @@ class BacktestEngine:
             total += float(trade.get("remaining_cost_usdt") or trade.get("entry_cost_usdt") or 0.0)
         return total
 
+    def _used_portfolio_capital(self, open_trades: list[dict]) -> float:
+        total = 0.0
+        for trade in open_trades:
+            total += float(trade.get("remaining_cost_usdt") or trade.get("entry_cost_usdt") or 0.0)
+        return total
+
     def _strategy_available_capital(self, strategy: str, *, total_equity: float, open_trades: list[dict]) -> float:
         cap = total_equity * self._strategy_capital_pct(strategy)
         return max(0.0, cap - self._used_strategy_capital(strategy, open_trades))
@@ -541,15 +657,40 @@ class BacktestEngine:
         total_equity: float,
         open_trades: list[dict],
     ) -> float:
-        allocation_pct = self._simple_allocation_pct(opportunity)
-        opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)
-        opportunity.metadata["strategy_budget_pct"] = round(allocation_pct, 6)
-        opportunity.metadata["strategy_available_cap_usdt"] = round(max(0.0, cash_balance), 4)
         context = self._market_context()
         opportunity.metadata["market_context"] = str(context["label"])
         context_budget_mult = max(0.0, min(1.0, float(context["budget_mult"])))
         opportunity.metadata["market_context_budget_mult"] = round(context_budget_mult, 4)
-        allocation = max(0.0, cash_balance) * allocation_pct * context_budget_mult
+        event_mult = max(0.0, min(float(getattr(self.config, "crypto_event_max_sizing_multiplier", 1.25)), float(opportunity.metadata.get("event_overlay_mult", 1.0) or 1.0)))
+        opportunity.metadata["event_sizing_budget_mult"] = round(event_mult, 4)
+        if self.config.confidence_allocation_enabled:
+            stop_pct = opportunity.sl_pct if opportunity.sl_pct is not None else self.config.stop_loss_pct
+            plan = confidence_allocation_plan(
+                raw_score=float(opportunity.score or 0.0),
+                total_equity=total_equity,
+                available_balance=cash_balance,
+                open_capital_usdt=self._used_portfolio_capital(open_trades),
+                stop_loss_pct=stop_pct,
+                max_total_fraction=self.config.confidence_allocation_max_total_pct,
+                low_fraction=self.config.confidence_allocation_low_pct,
+                mid_fraction=self.config.confidence_allocation_mid_pct,
+                high_fraction=self.config.confidence_allocation_high_pct,
+                max_fraction=self.config.confidence_allocation_max_pct,
+                max_risk_fraction=self.config.confidence_allocation_max_risk_pct,
+                min_stop_loss_pct=self.config.confidence_allocation_min_stop_pct,
+                sizing_multiplier=context_budget_mult * event_mult,
+                risk_metadata=opportunity.metadata,
+            )
+            write_confidence_metadata(opportunity.metadata, plan)
+            opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)
+            opportunity.metadata["strategy_budget_pct"] = round(plan.base_fraction, 6)
+            opportunity.metadata["strategy_available_cap_usdt"] = round(max(0.0, cash_balance), 4)
+            return plan.allocation_usdt
+        allocation_pct = self._simple_allocation_pct(opportunity)
+        opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)
+        opportunity.metadata["strategy_budget_pct"] = round(allocation_pct, 6)
+        opportunity.metadata["strategy_available_cap_usdt"] = round(max(0.0, cash_balance), 4)
+        allocation = max(0.0, cash_balance) * allocation_pct * context_budget_mult * event_mult
         if allocation <= 0:
             return 0.0
         return min(max(0.0, cash_balance), allocation)
@@ -865,13 +1006,21 @@ class BacktestEngine:
         data: dict[str, pd.DataFrame],
         timestamp: pd.Timestamp,
         excluded_symbols: set[str],
+        crypto_event_state: dict[str, object] | None = None,
     ) -> list[Opportunity]:
         candidates: list[Opportunity] = []
         for symbol, frame in data.items():
             if symbol in excluded_symbols:
                 continue
             window = self._window_until(frame, timestamp, 60)
-            scored = self.scorer(symbol, window, self.config.score_threshold)
+            threshold = self._event_threshold_for_symbol(
+                symbol,
+                "SCALPER",
+                self.config.score_threshold,
+                crypto_event_state,
+                timestamp,
+            )
+            scored = self.scorer(symbol, window, threshold)
             if scored is not None:
                 candidates.append(scored)
         candidates.sort(key=lambda item: item.score, reverse=True)
@@ -904,6 +1053,7 @@ class BacktestEngine:
         timestamp: pd.Timestamp,
         excluded_symbols: set[str],
         threshold_overrides: dict[str, float] | None = None,
+        crypto_event_state: dict[str, object] | None = None,
     ) -> list[tuple[Opportunity, str]]:
         candidates: list[tuple[Opportunity, str]] = []
         threshold_overrides = threshold_overrides or {}
@@ -921,6 +1071,16 @@ class BacktestEngine:
             effective_threshold = max(
                 float(threshold_overrides.get(dataset.strategy, self._base_threshold(dataset.strategy))),
                 min_score,
+            )
+            effective_threshold = max(
+                min_score,
+                self._event_threshold_for_symbol(
+                    dataset.symbol,
+                    dataset.strategy,
+                    effective_threshold,
+                    crypto_event_state,
+                    timestamp,
+                ),
             )
             cache_key = (dataset.key, end_pos, round(effective_threshold, 6))
             if cache_key in self._score_cache:
@@ -945,6 +1105,14 @@ class BacktestEngine:
                 float(threshold_overrides.get("MOONSHOT", self._base_threshold("MOONSHOT"))),
                 MOONSHOT_MIN_SCORE,
             )
+            if moonshot_datasets:
+                moonshot_threshold = max(
+                    MOONSHOT_MIN_SCORE,
+                    min(
+                        self._event_threshold_for_symbol(symbol, "MOONSHOT", moonshot_threshold, crypto_event_state, timestamp)
+                        for symbol, _data_key, _window in moonshot_datasets
+                    ),
+                )
             for proxied in score_backtest_moonshot_candidates(
                 config=self.config,
                 datasets=moonshot_datasets,
@@ -1243,6 +1411,7 @@ class BacktestEngine:
                             cooldown_until_index[open_trade["symbol"]] = time_index + _cd
 
             excluded_symbols = {trade["symbol"] for trade in open_trades} | closed_this_step | set(cooldown_until_index)
+            crypto_event_state = self._crypto_event_state_for(timestamp)
             if strategy_mode:
                 scored_candidates = self._score_strategy_candidates(
                     datasets,
@@ -1250,10 +1419,20 @@ class BacktestEngine:
                     timestamp,
                     excluded_symbols,
                     threshold_overrides=self._threshold_overrides(),
+                    crypto_event_state=crypto_event_state,
                 )
             else:
-                scored_candidates = [(candidate, candidate.symbol) for candidate in self._score_candidates(data, timestamp, excluded_symbols)]
+                scored_candidates = [
+                    (candidate, candidate.symbol)
+                    for candidate in self._score_candidates(
+                        data,
+                        timestamp,
+                        excluded_symbols,
+                        crypto_event_state=crypto_event_state,
+                    )
+                ]
 
+            scored_candidates = self._apply_crypto_event_overlay_to_candidates(scored_candidates, crypto_event_state, timestamp)
             scored_candidates = self._apply_signal_lane_filter(scored_candidates)
             scored_candidates = self._apply_market_context_filter(scored_candidates)
             scored_candidates = self._apply_signal_performance_filter(
@@ -1325,6 +1504,8 @@ class BacktestEngine:
                     open_trades=open_trades,
                 )
                 if allocation <= 0:
+                    if best.metadata.get("pretrade_block_reason") == "confidence_score_below_minimum":
+                        continue
                     break
                 allocation = self._apply_depth_sizing_cap(
                     best,

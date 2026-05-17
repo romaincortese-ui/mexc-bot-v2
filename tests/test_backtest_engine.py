@@ -145,6 +145,33 @@ def test_backtest_engine_blocks_configured_signal_lane():
     assert trades == []
 
 
+def test_backtest_strategy_registry_includes_pre_breakout():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=70, freq="5min")
+    frame = pd.DataFrame(
+        {
+            "open": [100.0] * 70,
+            "high": [100.2] * 70,
+            "low": [99.8] * 70,
+            "close": [100.0] * 70,
+            "volume": [1000.0] * 70,
+        },
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["DOGEUSDT"],
+        strategies=["PRE_BREAKOUT"],
+    )
+
+    engine = BacktestEngine(config, StubProvider(frame))
+    datasets = engine._strategy_datasets()
+
+    assert len(datasets) == 1
+    assert datasets[0].strategy == "PRE_BREAKOUT"
+    assert datasets[0].symbol == "DOGEUSDT"
+
+
 def test_backtest_engine_blocks_tiny_expected_net_profit():
     index = pd.date_range("2024-01-01T00:00:00Z", periods=70, freq="5min")
     frame = pd.DataFrame(
@@ -185,6 +212,51 @@ def test_backtest_engine_blocks_tiny_expected_net_profit():
     _, trades = engine.run()
 
     assert trades == []
+
+
+def test_backtest_confidence_allocation_uses_risk_and_portfolio_caps():
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=2, freq="5min")
+    frame = pd.DataFrame(
+        {"open": [100.0] * 2, "high": [101.0] * 2, "low": [99.0] * 2, "close": [100.0] * 2, "volume": [1000.0] * 2},
+        index=index,
+    )
+    config = BacktestConfig(
+        start=index[0].to_pydatetime(),
+        end=index[-1].to_pydatetime(),
+        symbols=["BTCUSDT"],
+        confidence_allocation_enabled=True,
+        confidence_allocation_max_total_pct=0.50,
+        confidence_allocation_mid_pct=0.12,
+        confidence_allocation_max_risk_pct=0.003,
+        confidence_allocation_min_stop_pct=0.015,
+    )
+    engine = BacktestEngine(config, StubProvider(frame))
+    candidate = Opportunity(
+        symbol="SOLUSDT",
+        score=84.2,
+        price=100.0,
+        rsi=42.0,
+        rsi_score=5.0,
+        ma_score=20.0,
+        vol_score=20.0,
+        vol_ratio=1.5,
+        entry_signal="CROSSOVER",
+        strategy="SCALPER",
+        sl_pct=0.08,
+    )
+    open_trades = [{"symbol": "ETHUSDT", "strategy": "SCALPER", "remaining_cost_usdt": 230.0}]
+
+    allocation = engine._allocation_usdt_for_candidate(
+        candidate,
+        cash_balance=400.0,
+        total_equity=500.0,
+        open_trades=open_trades,
+    )
+
+    assert round(allocation, 4) == 18.75
+    assert candidate.metadata["allocation_model"] == "spot_confidence_portfolio_cap"
+    assert candidate.metadata["confidence_score_10"] == 8
+    assert candidate.metadata["confidence_cap_reason"] == "risk_cap"
 
 
 def test_backtest_signal_performance_filter_blocks_weak_lane():
@@ -1001,6 +1073,8 @@ def test_backtest_engine_models_partial_maker_entry_fill():
         end=index[-1].to_pydatetime(),
         symbols=["BTCUSDT"],
         trade_budget=50.0,
+        simple_allocation_min_pct=0.05,
+        simple_allocation_max_pct=0.05,
         maker_fill_ratio=0.5,
         reentry_cooldown_bars=100,
     )

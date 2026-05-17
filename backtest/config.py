@@ -109,6 +109,14 @@ class BacktestConfig:
     grid_allocation_pct: float = 0.10
     simple_allocation_min_pct: float = 0.155
     simple_allocation_max_pct: float = 0.310
+    confidence_allocation_enabled: bool = False
+    confidence_allocation_max_total_pct: float = 0.50
+    confidence_allocation_low_pct: float = 0.08
+    confidence_allocation_mid_pct: float = 0.12
+    confidence_allocation_high_pct: float = 0.18
+    confidence_allocation_max_pct: float = 0.25
+    confidence_allocation_max_risk_pct: float = 0.0
+    confidence_allocation_min_stop_pct: float = 0.015
     scalper_budget_pct: float = 0.50
     moonshot_budget_pct: float = 0.03
     reversal_budget_pct: float = 0.85
@@ -160,12 +168,23 @@ class BacktestConfig:
     market_context_crash_budget_mult: float = 0.35
     market_context_bear_block_strategies: list[str] = field(default_factory=list)
     market_context_crash_block_strategies: list[str] = field(default_factory=lambda: ["MOONSHOT", "REVERSAL", "GRID"])
+    crypto_event_overlay_enabled: bool = True
+    crypto_event_state_file: str = ""
+    crypto_event_stale_seconds: int = 1800
+    crypto_event_threshold_relief: float = 3.0
+    crypto_event_min_risk_on_score: float = 0.45
+    crypto_event_risk_on_multiplier: float = 1.15
+    crypto_event_max_sizing_multiplier: float = 1.25
     blocked_signal_lanes: list[str] = field(
         default_factory=lambda: [
             "REVERSAL:DIVERGENCE_HAMMER",
             "SCALPER:TREND",
             "MOONSHOT:NEW_LISTING",
             "MOONSHOT:TREND_CONTINUATION",
+            "TRINITY:EMA_CROSSOVER",
+            "TRINITY:RANGE_BREAKOUT",
+            "PRE_BREAKOUT:ACCUMULATION",
+            "PRE_BREAKOUT:BASE_SPRING",
         ]
     )
 
@@ -187,6 +206,10 @@ class BacktestConfig:
     def from_env(cls, now: datetime | None = None) -> "BacktestConfig":
         interval = env_str("BACKTEST_INTERVAL", "5m")
         start, end = resolve_backtest_window(interval=interval, now=now)
+        crypto_event_state_file = env_str(
+            "BACKTEST_CRYPTO_EVENT_STATE_FILE",
+            env_str("CRYPTO_EVENT_STATE_FILE", ""),
+        )
         return cls(
             start=start,
             end=end,
@@ -242,6 +265,14 @@ class BacktestConfig:
             grid_allocation_pct=env_float("GRID_ALLOCATION_PCT", 0.10),
             simple_allocation_min_pct=env_float("SIMPLE_ALLOCATION_MIN_PCT", 0.155),
             simple_allocation_max_pct=env_float("SIMPLE_ALLOCATION_MAX_PCT", 0.310),
+            confidence_allocation_enabled=env_bool("BACKTEST_CONFIDENCE_ALLOCATION_ENABLED", env_bool("MEXCBOT_CONFIDENCE_ALLOCATION_ENABLED", False)),
+            confidence_allocation_max_total_pct=env_float("BACKTEST_CONFIDENCE_MAX_TOTAL_PCT", env_float("MEXCBOT_CONFIDENCE_MAX_TOTAL_PCT", 0.50)),
+            confidence_allocation_low_pct=env_float("BACKTEST_CONFIDENCE_LOW_PCT", env_float("MEXCBOT_CONFIDENCE_LOW_PCT", 0.08)),
+            confidence_allocation_mid_pct=env_float("BACKTEST_CONFIDENCE_MID_PCT", env_float("MEXCBOT_CONFIDENCE_MID_PCT", 0.12)),
+            confidence_allocation_high_pct=env_float("BACKTEST_CONFIDENCE_HIGH_PCT", env_float("MEXCBOT_CONFIDENCE_HIGH_PCT", 0.18)),
+            confidence_allocation_max_pct=env_float("BACKTEST_CONFIDENCE_MAX_PCT", env_float("MEXCBOT_CONFIDENCE_MAX_PCT", 0.25)),
+            confidence_allocation_max_risk_pct=env_float("BACKTEST_CONFIDENCE_MAX_RISK_PCT", env_float("MEXCBOT_CONFIDENCE_MAX_RISK_PCT", 0.0)),
+            confidence_allocation_min_stop_pct=env_float("BACKTEST_CONFIDENCE_MIN_STOP_PCT", env_float("MEXCBOT_CONFIDENCE_MIN_STOP_PCT", 0.015)),
             scalper_budget_pct=env_float("SCALPER_BUDGET_PCT", 0.50),
             moonshot_budget_pct=env_float("MOONSHOT_BUDGET_PCT", 0.03),
             reversal_budget_pct=env_float("REVERSAL_BUDGET_PCT", 0.85),
@@ -293,8 +324,15 @@ class BacktestConfig:
             market_context_crash_budget_mult=env_float("MARKET_CONTEXT_CRASH_BUDGET_MULT", 0.35),
             market_context_bear_block_strategies=env_csv("MARKET_CONTEXT_BEAR_BLOCK_STRATEGIES", ""),
             market_context_crash_block_strategies=env_csv("MARKET_CONTEXT_CRASH_BLOCK_STRATEGIES", "MOONSHOT,REVERSAL,GRID"),
+            crypto_event_overlay_enabled=env_bool("BACKTEST_CRYPTO_EVENT_OVERLAY_ENABLED", env_bool("USE_CRYPTO_EVENT_OVERLAY", True)),
+            crypto_event_state_file=crypto_event_state_file,
+            crypto_event_stale_seconds=env_int("BACKTEST_CRYPTO_EVENT_STALE_SECONDS", env_int("CRYPTO_EVENT_STALE_SECONDS", 1800)),
+            crypto_event_threshold_relief=env_float("BACKTEST_CRYPTO_EVENT_THRESHOLD_RELIEF", env_float("CRYPTO_EVENT_THRESHOLD_RELIEF", 3.0)),
+            crypto_event_min_risk_on_score=env_float("BACKTEST_CRYPTO_EVENT_MIN_RISK_ON_SCORE", env_float("CRYPTO_EVENT_MIN_RISK_ON_SCORE", 0.45)),
+            crypto_event_risk_on_multiplier=env_float("BACKTEST_CRYPTO_EVENT_RISK_ON_MULTIPLIER", env_float("CRYPTO_EVENT_RISK_ON_MULTIPLIER", 1.15)),
+            crypto_event_max_sizing_multiplier=env_float("BACKTEST_CRYPTO_EVENT_MAX_SIZING_MULTIPLIER", env_float("CRYPTO_EVENT_MAX_SIZING_MULTIPLIER", 1.25)),
             blocked_signal_lanes=env_csv(
                 "MEXCBOT_BLOCKED_SIGNAL_LANES",
-                "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION",
+                "REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION,TRINITY:EMA_CROSSOVER,TRINITY:RANGE_BREAKOUT,PRE_BREAKOUT:ACCUMULATION,PRE_BREAKOUT:BASE_SPRING",
             ),
         )

@@ -44,6 +44,16 @@ def build_run_summary(config: BacktestConfig) -> dict[str, object]:
             "basis": "available_cash",
             "confidence": "score_vs_strategy_threshold",
         },
+        "confidence_allocation": {
+            "enabled": config.confidence_allocation_enabled,
+            "max_total_pct": config.confidence_allocation_max_total_pct,
+            "low_pct": config.confidence_allocation_low_pct,
+            "mid_pct": config.confidence_allocation_mid_pct,
+            "high_pct": config.confidence_allocation_high_pct,
+            "max_pct": config.confidence_allocation_max_pct,
+            "max_risk_pct": config.confidence_allocation_max_risk_pct,
+            "min_stop_pct": config.confidence_allocation_min_stop_pct,
+        },
         "strategy_allocations": {
             "SCALPER": config.scalper_allocation_pct,
             "MOONSHOT_POOL": config.moonshot_allocation_pct,

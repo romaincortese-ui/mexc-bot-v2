@@ -23,6 +23,7 @@ from mexcbot.calibration import (
     summarize_trade_calibration,
     validate_trade_calibration_payload,
 )
+from mexcbot.confidence_allocation import confidence_allocation_plan, write_confidence_metadata
 from mexcbot.config import LiveConfig, env_bool, env_float, env_int
 from mexcbot.daily_review import load_daily_review, validate_daily_review_payload
 from mexcbot.depth_sizing import size_against_book
@@ -1504,6 +1505,16 @@ class LiveBotRuntime:
                 "basis": "available_balance",
                 "confidence": "score_vs_strategy_threshold",
             },
+            "confidence_allocation": {
+                "enabled": self.config.confidence_allocation_enabled,
+                "max_total_pct": self.config.confidence_allocation_max_total_pct,
+                "low_pct": self.config.confidence_allocation_low_pct,
+                "mid_pct": self.config.confidence_allocation_mid_pct,
+                "high_pct": self.config.confidence_allocation_high_pct,
+                "max_pct": self.config.confidence_allocation_max_pct,
+                "max_risk_pct": self.config.confidence_allocation_max_risk_pct,
+                "min_stop_pct": self.config.confidence_allocation_min_stop_pct,
+            },
             "strategy_allocations": {
                 "SCALPER": self.config.scalper_allocation_pct,
                 "MOONSHOT_POOL": self.config.moonshot_allocation_pct,
@@ -2428,6 +2439,8 @@ class LiveBotRuntime:
             "tp_execution_mode": tp_execution_mode,
             "strategy_pool_cap_usdt": _audit_float(opportunity.metadata.get("strategy_pool_cap_usdt"), 4),
             "strategy_budget_pct": _audit_float(opportunity.metadata.get("strategy_budget_pct"), 6),
+            "confidence_score_10": opportunity.metadata.get("confidence_score_10", ""),
+            "confidence_cap_reason": str(opportunity.metadata.get("confidence_cap_reason") or ""),
             "kelly_mult": _audit_float(opportunity.metadata.get("kelly_mult"), 4),
             "calibration_source": str(opportunity.metadata.get("calibration_source") or ""),
         }
@@ -3279,6 +3292,12 @@ class LiveBotRuntime:
             total += float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
         return total
 
+    def _used_portfolio_capital(self) -> float:
+        total = 0.0
+        for trade in self.open_trades:
+            total += float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
+        return total
+
     def _strategy_available_capital(self, strategy: str, *, total_equity: float) -> float:
         cap = total_equity * self._strategy_capital_pct(strategy)
         return max(0.0, cap - self._used_strategy_capital(strategy))
@@ -3773,6 +3792,35 @@ class LiveBotRuntime:
         return pct
 
     def _allocation_usdt_for_opportunity_with_equity(self, opportunity: Opportunity, *, available_balance: float, total_equity: float) -> float:
+        if self.config.confidence_allocation_enabled:
+            context = self._market_context()
+            context_budget_mult = max(0.0, min(1.0, float(context["budget_mult"])))
+            event_mult = max(0.0, min(CRYPTO_EVENT_MAX_SIZING_MULTIPLIER, float(opportunity.metadata.get("event_overlay_mult", 1.0) or 1.0)))
+            stop_pct = opportunity.sl_pct if opportunity.sl_pct is not None else self.config.stop_loss_pct
+            plan = confidence_allocation_plan(
+                raw_score=float(opportunity.score or 0.0),
+                total_equity=total_equity,
+                available_balance=available_balance,
+                open_capital_usdt=self._used_portfolio_capital(),
+                stop_loss_pct=stop_pct,
+                max_total_fraction=self.config.confidence_allocation_max_total_pct,
+                low_fraction=self.config.confidence_allocation_low_pct,
+                mid_fraction=self.config.confidence_allocation_mid_pct,
+                high_fraction=self.config.confidence_allocation_high_pct,
+                max_fraction=self.config.confidence_allocation_max_pct,
+                max_risk_fraction=self.config.confidence_allocation_max_risk_pct,
+                min_stop_loss_pct=self.config.confidence_allocation_min_stop_pct,
+                sizing_multiplier=context_budget_mult * event_mult,
+                risk_metadata=opportunity.metadata,
+            )
+            write_confidence_metadata(opportunity.metadata, plan)
+            opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)
+            opportunity.metadata["strategy_budget_pct"] = round(plan.base_fraction, 6)
+            opportunity.metadata["strategy_available_cap_usdt"] = round(max(0.0, available_balance), 4)
+            opportunity.metadata["market_context"] = str(context["label"])
+            opportunity.metadata["market_context_budget_mult"] = round(context_budget_mult, 4)
+            opportunity.metadata["event_sizing_budget_mult"] = round(event_mult, 4)
+            return plan.allocation_usdt
         allocation_pct = self._simple_allocation_pct(opportunity)
         capped_budget = max(0.0, available_balance) * allocation_pct
         opportunity.metadata["strategy_pool_cap_usdt"] = round(float(total_equity or 0.0), 4)

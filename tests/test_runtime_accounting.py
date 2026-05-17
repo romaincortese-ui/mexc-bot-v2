@@ -452,6 +452,50 @@ def test_open_position_caps_allocation_to_orderbook_depth():
     assert opportunity.metadata["depth_binding_constraint"] == "book_exhausted"
 
 
+def test_confidence_allocation_caps_total_open_capital_and_stop_risk():
+    runtime = LiveBotRuntime(
+        _config(
+            confidence_allocation_enabled=True,
+            confidence_allocation_max_total_pct=0.50,
+            confidence_allocation_mid_pct=0.12,
+            confidence_allocation_max_risk_pct=0.003,
+            confidence_allocation_min_stop_pct=0.015,
+        ),
+        StubClient(),
+    )
+    runtime.open_trades.append(
+        Trade(
+            symbol="ETHUSDT",
+            entry_price=10.0,
+            qty=23.0,
+            tp_price=11.0,
+            sl_price=9.0,
+            opened_at=datetime.now(timezone.utc),
+            order_id="OPEN",
+            score=82.0,
+            entry_signal="CROSSOVER",
+            paper=False,
+            strategy="SCALPER",
+            entry_cost_usdt=230.0,
+            remaining_cost_usdt=230.0,
+        )
+    )
+    opportunity = _opportunity()
+    opportunity.score = 84.2
+    opportunity.sl_pct = 0.08
+
+    allocation = runtime._allocation_usdt_for_opportunity_with_equity(
+        opportunity,
+        available_balance=400.0,
+        total_equity=500.0,
+    )
+
+    assert round(allocation, 4) == 18.75
+    assert opportunity.metadata["allocation_model"] == "spot_confidence_portfolio_cap"
+    assert opportunity.metadata["confidence_score_10"] == 8
+    assert opportunity.metadata["confidence_cap_reason"] == "risk_cap"
+
+
 def test_open_position_reconciles_base_asset_entry_fee_from_my_trades():
     client = StubClient()
     client.buy_order_result = {"orderId": "BUY2", "status": "FILLED", "executedQty": "0", "cummulativeQuoteQty": "0"}
