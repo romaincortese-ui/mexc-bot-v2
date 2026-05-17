@@ -99,6 +99,86 @@ SCALPER_DOA_MAX_LOSS_PCT = env_float("SCALPER_DOA_MAX_LOSS_PCT", 0.005)
 # drop (which is unreachable while negative anyway) -- rotation and other
 # "complicated" exits must not realise losses.
 HARD_SL_FLOOR_PCT = env_float("HARD_SL_FLOOR_PCT", 0.20)
+DYNAMIC_EXIT_TARGETS_ENABLED = env_bool(
+    "MEXCBOT_DYNAMIC_EXIT_TARGETS_ENABLED",
+    env_bool("DYNAMIC_EXIT_TARGETS_ENABLED", True),
+)
+
+
+DYNAMIC_EXIT_TARGET_RULES: dict[str, dict[str, float]] = {
+    "SCALPER": {
+        "be_min": 0.006,
+        "be_max": 0.020,
+        "be_target_mult": 0.22,
+        "be_vol_mult": 1.00,
+        "partial_min": 0.010,
+        "partial_max": 0.036,
+        "partial_target_mult": 0.45,
+        "partial_vol_mult": 1.60,
+        "ratio_min": 0.18,
+        "ratio_max": SCALPER_PARTIAL_TP_RATIO_CAP,
+    },
+    "GRID": {
+        "be_min": 0.006,
+        "be_max": 0.014,
+        "be_target_mult": 0.35,
+        "be_vol_mult": 0.80,
+        "partial_min": 0.006,
+        "partial_max": 0.018,
+        "partial_target_mult": 0.55,
+        "partial_vol_mult": 1.20,
+        "ratio_min": 0.25,
+        "ratio_max": 0.55,
+    },
+    "TRINITY": {
+        "be_min": 0.010,
+        "be_max": 0.024,
+        "be_target_mult": 0.30,
+        "be_vol_mult": 1.05,
+        "partial_min": 0.014,
+        "partial_max": 0.035,
+        "partial_target_mult": 0.50,
+        "partial_vol_mult": 1.35,
+        "ratio_min": 0.25,
+        "ratio_max": 0.55,
+    },
+    "MOONSHOT": {
+        "be_min": 0.012,
+        "be_max": 0.030,
+        "be_target_mult": 0.30,
+        "be_vol_mult": 1.20,
+        "partial_min": 0.016,
+        "partial_max": 0.040,
+        "partial_target_mult": 0.45,
+        "partial_vol_mult": 1.55,
+        "ratio_min": 0.30,
+        "ratio_max": 0.60,
+    },
+    "REVERSAL": {
+        "be_min": 0.012,
+        "be_max": 0.026,
+        "be_target_mult": 0.32,
+        "be_vol_mult": 1.10,
+        "partial_min": 0.016,
+        "partial_max": 0.036,
+        "partial_target_mult": 0.58,
+        "partial_vol_mult": 1.40,
+        "ratio_min": 0.20,
+        "ratio_max": 0.50,
+    },
+    "PRE_BREAKOUT": {
+        "be_min": 0.014,
+        "be_max": 0.030,
+        "be_target_mult": 0.30,
+        "be_vol_mult": 1.00,
+        "partial_min": 0.016,
+        "partial_max": 0.040,
+        "partial_target_mult": 0.48,
+        "partial_vol_mult": 1.35,
+        "ratio_min": 0.30,
+        "ratio_max": 0.60,
+    },
+}
 
 
 DEFAULT_EXIT_PROFILES: dict[str, dict[str, float | int]] = {
@@ -373,6 +453,177 @@ def get_exit_profile(
     return profile
 
 
+def _float_or_none(value: object) -> float | None:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _clamp_float(value: float, lower: float, upper: float) -> float:
+    if upper < lower:
+        return lower
+    return max(lower, min(upper, value))
+
+
+def _metadata_float(trade: Mapping[str, object], key: str) -> float | None:
+    direct = _float_or_none(trade.get(key))
+    if direct is not None:
+        return direct
+    metadata = trade.get("metadata")
+    if isinstance(metadata, Mapping):
+        return _float_or_none(metadata.get(key))
+    return None
+
+
+def _score_10_for_trade(trade: Mapping[str, object]) -> int:
+    metadata = trade.get("metadata")
+    if isinstance(metadata, Mapping):
+        metadata_score = _float_or_none(metadata.get("confidence_score_10"))
+        if metadata_score is not None:
+            return max(0, min(10, int(metadata_score)))
+    raw_score = _float_or_none(trade.get("score")) or 0.0
+    return max(0, min(10, int(raw_score // 10)))
+
+
+def _price_pct_distance(entry_price: float, price: object, *, direction: str) -> float:
+    resolved_price = _float_or_none(price)
+    if entry_price <= 0 or resolved_price is None:
+        return 0.0
+    if direction == "up":
+        return max(0.0, (resolved_price - entry_price) / entry_price)
+    return max(0.0, (entry_price - resolved_price) / entry_price)
+
+
+def _store_dynamic_exit_targets(trade: MutableMapping[str, object], targets: dict[str, object]) -> None:
+    trade["dynamic_exit_targets"] = targets
+    metadata = trade.get("metadata")
+    if isinstance(metadata, dict):
+        metadata["dynamic_exit_targets"] = targets
+
+
+def _profile_with_dynamic_exit_targets(
+    strategy: str,
+    profile: Mapping[str, float | int],
+    trade: MutableMapping[str, object],
+) -> dict[str, float | int]:
+    resolved_profile = dict(profile)
+    existing_targets = trade.get("dynamic_exit_targets")
+    if isinstance(existing_targets, dict):
+        if bool(existing_targets.get("enabled")):
+            for key in ("breakeven_activation_pct", "partial_tp_trigger_pct", "partial_tp_ratio"):
+                value = _float_or_none(existing_targets.get(key))
+                if value is not None:
+                    resolved_profile[key] = value
+        return resolved_profile
+
+    if not DYNAMIC_EXIT_TARGETS_ENABLED:
+        return resolved_profile
+
+    strategy_name = strategy.upper()
+    rules = DYNAMIC_EXIT_TARGET_RULES.get(strategy_name, DYNAMIC_EXIT_TARGET_RULES["SCALPER"])
+    entry_price = _float_or_none(trade.get("entry_price")) or 0.0
+    if entry_price <= 0:
+        return resolved_profile
+
+    target_pct = _price_pct_distance(entry_price, trade.get("tp_price"), direction="up")
+    if target_pct <= 0:
+        target_pct = _float_or_none(resolved_profile.get("partial_tp_trigger_pct")) or 0.0
+
+    atr_pct = _metadata_float(trade, "atr_pct")
+    avg_candle_pct = _metadata_float(trade, "avg_candle_pct")
+    trail_pct = _metadata_float(trade, "trail_pct")
+    volatility_pct = max(
+        atr_pct or 0.0,
+        avg_candle_pct or 0.0,
+        (trail_pct or 0.0) * 0.50,
+    )
+    if target_pct <= 0 or volatility_pct <= 0:
+        _store_dynamic_exit_targets(
+            trade,
+            {"enabled": False, "reason": "missing_target_or_volatility_context"},
+        )
+        return resolved_profile
+
+    stop_pct = _price_pct_distance(entry_price, trade.get("sl_price"), direction="down")
+    if stop_pct <= 0:
+        stop_pct = max(volatility_pct * 2.0, target_pct * 0.35)
+
+    base_breakeven = _float_or_none(resolved_profile.get("breakeven_activation_pct")) or 0.0
+    base_partial_trigger = _float_or_none(resolved_profile.get("partial_tp_trigger_pct")) or 0.0
+    base_partial_ratio = _float_or_none(resolved_profile.get("partial_tp_ratio")) or 0.0
+    score_10 = _score_10_for_trade(trade)
+
+    partial_floor = min(float(rules["partial_min"]), max(0.001, target_pct * 0.35))
+    partial_cap = max(partial_floor, min(float(rules["partial_max"]), target_pct * 0.90))
+    raw_partial_trigger = max(
+        base_partial_trigger * 0.75,
+        target_pct * float(rules["partial_target_mult"]),
+        volatility_pct * float(rules["partial_vol_mult"]),
+    )
+    partial_trigger = _clamp_float(raw_partial_trigger, partial_floor, partial_cap)
+
+    score_breakeven_mult = _clamp_float(1.0 + (score_10 - 8) * 0.025, 0.90, 1.08)
+    raw_breakeven = max(
+        base_breakeven * 0.85,
+        target_pct * float(rules["be_target_mult"]),
+        volatility_pct * float(rules["be_vol_mult"]),
+    ) * score_breakeven_mult
+    breakeven_floor = min(float(rules["be_min"]), partial_trigger * 0.70)
+    breakeven_cap = max(
+        breakeven_floor,
+        min(float(rules["be_max"]), target_pct * 0.55, partial_trigger * 0.82),
+    )
+    breakeven_activation = _clamp_float(raw_breakeven, breakeven_floor, breakeven_cap)
+
+    if base_partial_ratio <= 0:
+        partial_ratio = 0.0
+    else:
+        reward_risk = target_pct / stop_pct if stop_pct > 0 else 1.5
+        score_ratio_adjust = (7.0 - score_10) * 0.025
+        if reward_risk < 1.35:
+            rr_adjust = 0.07
+        elif reward_risk >= 2.25:
+            rr_adjust = -0.05
+        else:
+            rr_adjust = 0.0
+        volatility_ratio = volatility_pct / target_pct if target_pct > 0 else 0.0
+        volatility_adjust = _clamp_float((volatility_ratio - 0.25) * 0.10, -0.03, 0.06)
+        partial_ratio = _clamp_float(
+            base_partial_ratio + score_ratio_adjust + rr_adjust + volatility_adjust,
+            float(rules["ratio_min"]),
+            float(rules["ratio_max"]),
+        )
+        if strategy_name == "SCALPER":
+            partial_ratio = min(partial_ratio, SCALPER_PARTIAL_TP_RATIO_CAP)
+
+    targets = {
+        "enabled": True,
+        "breakeven_activation_pct": round(breakeven_activation, 6),
+        "partial_tp_trigger_pct": round(partial_trigger, 6),
+        "partial_tp_ratio": round(partial_ratio, 4),
+        "target_pct": round(target_pct, 6),
+        "stop_pct": round(stop_pct, 6),
+        "volatility_pct": round(volatility_pct, 6),
+        "score_10": score_10,
+    }
+    _store_dynamic_exit_targets(trade, targets)
+    resolved_profile["breakeven_activation_pct"] = float(targets["breakeven_activation_pct"])
+    resolved_profile["partial_tp_trigger_pct"] = float(targets["partial_tp_trigger_pct"])
+    resolved_profile["partial_tp_ratio"] = float(targets["partial_tp_ratio"])
+    return resolved_profile
+
+
+def _get_trade_exit_profile(
+    strategy: str,
+    trade: MutableMapping[str, object],
+    entry_signal: str | None = None,
+) -> dict[str, float | int]:
+    profile = get_exit_profile(strategy, trade.get("exit_profile_override"), entry_signal=entry_signal)
+    return _profile_with_dynamic_exit_targets(strategy, profile, trade)
+
+
 def initialize_exit_state(
     trade: MutableMapping[str, object],
     *,
@@ -382,7 +633,7 @@ def initialize_exit_state(
 ) -> MutableMapping[str, object]:
     strategy_name = (strategy or str(trade.get("strategy") or "SCALPER")).upper()
     entry_signal = str(trade.get("entry_signal") or "")
-    profile = get_exit_profile(strategy_name, trade.get("exit_profile_override"), entry_signal=entry_signal)
+    profile = _get_trade_exit_profile(strategy_name, trade, entry_signal=entry_signal)
     entry_price = float(trade["entry_price"])
     trade["strategy"] = strategy_name
     trade["highest_price"] = float(trade.get("highest_price") or entry_price)
@@ -391,7 +642,12 @@ def initialize_exit_state(
     trade["trail_active"] = bool(trade.get("trail_active", False))
     trade["trail_stop_price"] = trade.get("trail_stop_price")
     trade["partial_tp_done"] = bool(trade.get("partial_tp_done", False))
-    trade["partial_tp_ratio"] = float(trade.get("partial_tp_ratio") or profile.get("partial_tp_ratio", 0.0))
+    dynamic_targets = trade.get("dynamic_exit_targets")
+    dynamic_targets_enabled = isinstance(dynamic_targets, dict) and bool(dynamic_targets.get("enabled"))
+    if dynamic_targets_enabled and not bool(trade.get("partial_tp_done", False)):
+        trade["partial_tp_ratio"] = float(profile.get("partial_tp_ratio", 0.0) or 0.0)
+    else:
+        trade["partial_tp_ratio"] = float(trade.get("partial_tp_ratio") or profile.get("partial_tp_ratio", 0.0))
     partial_tp_price = trade.get("partial_tp_price")
     partial_tp_trigger_pct = float(profile.get("partial_tp_trigger_pct", 0.0))
     if partial_tp_price is None and partial_tp_trigger_pct > 0:
@@ -617,7 +873,7 @@ def evaluate_trade_action(
     initialize_exit_state(trade)
     strategy = str(trade.get("strategy") or "SCALPER").upper()
     entry_signal = str(trade.get("entry_signal") or "")
-    profile = get_exit_profile(strategy, trade.get("exit_profile_override"), entry_signal=entry_signal)
+    profile = _get_trade_exit_profile(strategy, trade, entry_signal=entry_signal)
     entry_price = float(trade["entry_price"])
     tp_price = float(trade["tp_price"])
     sl_price = float(trade["sl_price"])

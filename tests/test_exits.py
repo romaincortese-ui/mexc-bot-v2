@@ -133,6 +133,56 @@ def test_default_exit_profiles_satisfy_peak_drop_invariants():
     assert _validate_exit_profile_invariants() == []
 
 
+def test_dynamic_exit_targets_widen_for_high_confidence_scalper_runner():
+    opened_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    trade = initialize_exit_state(
+        {
+            "symbol": "BTCUSDT",
+            "strategy": "SCALPER",
+            "score": 91.0,
+            "entry_price": 100.0,
+            "tp_price": 108.0,
+            "sl_price": 96.0,
+            "atr_pct": 0.012,
+            "avg_candle_pct": 0.006,
+            "opened_at": opened_at,
+        },
+        strategy="SCALPER",
+        opened_at=opened_at,
+    )
+
+    targets = trade["dynamic_exit_targets"]
+    assert targets["enabled"] is True
+    assert targets["breakeven_activation_pct"] > 0.006
+    assert targets["partial_tp_trigger_pct"] > 0.018
+    assert abs(trade["partial_tp_price"] - 103.6) < 1e-9
+    assert trade["partial_tp_ratio"] < 0.30
+
+
+def test_dynamic_exit_targets_derisk_short_target_grid_trade_earlier():
+    opened_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    trade = initialize_exit_state(
+        {
+            "symbol": "BTCUSDT",
+            "strategy": "GRID",
+            "score": 62.0,
+            "entry_price": 100.0,
+            "tp_price": 101.2,
+            "sl_price": 99.0,
+            "atr_pct": 0.004,
+            "opened_at": opened_at,
+        },
+        strategy="GRID",
+        opened_at=opened_at,
+    )
+
+    targets = trade["dynamic_exit_targets"]
+    assert targets["enabled"] is True
+    assert 0.006 < targets["partial_tp_trigger_pct"] < 0.008
+    assert trade["partial_tp_price"] < 100.8
+    assert trade["partial_tp_ratio"] > 0.30
+
+
 def test_grid_partial_tp_activates_floor_chase_early():
     trade = _base_trade("GRID")
     trade["tp_price"] = 103.0

@@ -245,6 +245,7 @@ def _trade_state_payload(trade: Trade) -> dict[str, object]:
         "hard_floor_price": trade.hard_floor_price,
         "max_hold_minutes": trade.max_hold_minutes,
         "exit_profile_override": trade.exit_profile_override,
+        "dynamic_exit_targets": trade.metadata.get("dynamic_exit_targets"),
         "atr_pct": trade.atr_pct,
         "avg_candle_pct": trade.metadata.get("avg_candle_pct"),
         "trail_pct": trade.metadata.get("trail_pct"),
@@ -4542,6 +4543,8 @@ class LiveBotRuntime:
         trade.partial_tp_ratio = state.get("partial_tp_ratio", trade.partial_tp_ratio)
         trade.hard_floor_price = state.get("hard_floor_price", trade.hard_floor_price)
         trade.atr_pct = float(state.get("atr_pct") or trade.atr_pct or 0.0) or None
+        if state.get("dynamic_exit_targets") is not None:
+            trade.metadata["dynamic_exit_targets"] = state.get("dynamic_exit_targets")
         if state.get("last_new_high_at") is not None:
             trade.metadata["last_new_high_at"] = state.get("last_new_high_at")
         pct = (price - trade.entry_price) / trade.entry_price * 100.0
