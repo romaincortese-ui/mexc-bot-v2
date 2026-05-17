@@ -62,6 +62,21 @@ def resolve_backtest_window(interval: str, now: datetime | None = None) -> tuple
     return start, end
 
 
+def _env_symbol_set(*names: str) -> set[str]:
+    symbols: set[str] = set()
+    for name in names:
+        raw = env_str(name, "")
+        symbols.update(symbol.strip().upper() for symbol in raw.replace(",", " ").split() if symbol.strip())
+    return symbols
+
+
+def _symbols_without_env_exclusions(symbols: list[str], *exclusion_env_names: str) -> list[str]:
+    excluded = _env_symbol_set(*exclusion_env_names)
+    if not excluded:
+        return symbols
+    return [symbol for symbol in symbols if symbol.upper() not in excluded]
+
+
 @dataclass(slots=True)
 class BacktestConfig:
     start: datetime
@@ -215,9 +230,14 @@ class BacktestConfig:
             end=end,
             symbols=env_csv("BACKTEST_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT"),
             strategies=env_csv("MEXCBOT_STRATEGIES", "SCALPER,GRID,MOONSHOT,REVERSAL"),
-            scalper_symbols=env_csv(
-                "BACKTEST_SCALPER_SYMBOLS",
-                "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT",
+            scalper_symbols=_symbols_without_env_exclusions(
+                env_csv(
+                    "BACKTEST_SCALPER_SYMBOLS",
+                    env_str("SCALPER_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT"),
+                ),
+                "BACKTEST_SCALPER_EXCLUDED_SYMBOLS",
+                "SCALPER_EXCLUDED_SYMBOLS",
+                "SCALPER_BLOCKED_SYMBOLS",
             ),
             grid_symbols=env_csv("BACKTEST_GRID_SYMBOLS", env_str("GRID_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ADAUSDT")),
             trinity_symbols=env_csv("BACKTEST_TRINITY_SYMBOLS", env_str("TRINITY_SYMBOLS", "BTCUSDT,SOLUSDT,ETHUSDT")),

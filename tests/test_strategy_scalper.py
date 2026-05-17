@@ -16,6 +16,9 @@ def _reset_scalper_env(monkeypatch) -> None:
     monkeypatch.delenv("SCALPER_VOLUME_UNIVERSE_LIMIT", raising=False)
     monkeypatch.delenv("SCALPER_CANDIDATE_LIMIT", raising=False)
     monkeypatch.delenv("SCALPER_SURGE_SIZE", raising=False)
+    monkeypatch.delenv("SCALPER_SYMBOLS", raising=False)
+    monkeypatch.delenv("SCALPER_EXCLUDED_SYMBOLS", raising=False)
+    monkeypatch.delenv("SCALPER_BLOCKED_SYMBOLS", raising=False)
 
 
 def test_score_symbol_from_frame_returns_opportunity_for_strong_setup(monkeypatch):
@@ -305,6 +308,30 @@ def test_candidate_symbols_accepts_ratio_style_min_abs_change():
 
     assert "BTCUSDT" in symbols
     assert "LOWMOVEUSDT" not in symbols
+
+
+def test_candidate_symbols_respects_live_symbol_scope(monkeypatch):
+    _reset_scalper_env(monkeypatch)
+    monkeypatch.setenv("SCALPER_SYMBOLS", "BTCUSDT,DOGEUSDT,ETHUSDT,LINKUSDT")
+    monkeypatch.setenv("SCALPER_EXCLUDED_SYMBOLS", "ETHUSDT")
+    tickers = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT", "DOGEUSDT", "ETHUSDT", "LINKUSDT", "SOLUSDT"],
+            "quoteVolume": [10_000_000.0, 8_000_000.0, 9_000_000.0, 7_000_000.0, 6_000_000.0],
+            "priceChangePercent": [1.0, 1.4, 1.2, 1.1, 1.3],
+            "lastPrice": [1.0] * 5,
+        }
+    )
+    config = _ScalperStubConfig()
+    config.universe_limit = 5
+    config.candidate_limit = 5
+    config.min_abs_change_pct = 0.5
+
+    symbols = _candidate_symbols(tickers, config)
+
+    assert set(symbols) == {"BTCUSDT", "DOGEUSDT", "LINKUSDT"}
+    assert "ETHUSDT" not in symbols
+    assert "SOLUSDT" not in symbols
 
 
 def test_find_scalper_opportunity_includes_surge_candidates_beyond_volume_cutoff(monkeypatch):

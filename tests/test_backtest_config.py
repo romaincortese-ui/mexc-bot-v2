@@ -59,6 +59,16 @@ def test_backtest_config_parses_strategy_specific_symbol_universes(monkeypatch: 
     assert config.symbols_for_strategy("GRID") == ["BTCUSDT", "ETHUSDT"]
 
 
+def test_backtest_config_applies_scalper_symbol_exclusions(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SCALPER_SYMBOLS", "BTCUSDT,ETHUSDT,DOGEUSDT,LINKUSDT")
+    monkeypatch.setenv("SCALPER_EXCLUDED_SYMBOLS", "ETHUSDT")
+    monkeypatch.setenv("SCALPER_BLOCKED_SYMBOLS", "LINKUSDT")
+
+    config = BacktestConfig.from_env(now=datetime(2026, 4, 4, 12, 0, tzinfo=timezone.utc))
+
+    assert config.symbols_for_strategy("SCALPER") == ["BTCUSDT", "DOGEUSDT"]
+
+
 def test_backtest_config_defaults_disable_trinity_and_block_weak_lane(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MEXCBOT_STRATEGIES", raising=False)
     monkeypatch.delenv("TRINITY_ALLOCATION_PCT", raising=False)

@@ -530,7 +530,18 @@ def _candidate_symbols(tickers: pd.DataFrame, config: LiveConfig) -> list[str]:
     volume_symbols = filtered.sort_values("quoteVolume", ascending=False).head(volume_limit)["symbol"].tolist()
     surge_symbols = filtered.sort_values("abs_change", ascending=False).head(surge_limit)["symbol"].tolist()
     combined = list(dict.fromkeys(surge_symbols + volume_symbols))
+    allowed_symbols = _env_symbol_set("SCALPER_SYMBOLS")
+    blocked_symbols = _env_symbol_set("SCALPER_EXCLUDED_SYMBOLS") | _env_symbol_set("SCALPER_BLOCKED_SYMBOLS")
+    if allowed_symbols:
+        combined = [symbol for symbol in combined if symbol.upper() in allowed_symbols]
+    if blocked_symbols:
+        combined = [symbol for symbol in combined if symbol.upper() not in blocked_symbols]
     return combined[:candidate_limit]
+
+
+def _env_symbol_set(name: str) -> set[str]:
+    raw = env_str(name, "")
+    return {symbol.strip().upper() for symbol in raw.replace(",", " ").split() if symbol.strip()}
 
 
 def _recent_returns(frame: pd.DataFrame, lookback: int = 20) -> pd.Series:

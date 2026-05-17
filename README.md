@@ -71,6 +71,8 @@ You can choose which extracted strategies run:
 
 ```bash
 MEXCBOT_STRATEGIES=SCALPER,GRID,TRINITY,MOONSHOT,REVERSAL,PRE_BREAKOUT
+SCALPER_SYMBOLS=BTCUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT
+SCALPER_EXCLUDED_SYMBOLS=ETHUSDT
 MAX_OPEN_POSITIONS=3
 SCALPER_ALLOCATION_PCT=0.25
 MOONSHOT_ALLOCATION_PCT=0.45
@@ -115,7 +117,7 @@ MEXCBOT_CONFIDENCE_MAX_PCT=0.25
 MEXCBOT_BLOCKED_SIGNAL_LANES=REVERSAL:DIVERGENCE_HAMMER,SCALPER:TREND,MOONSHOT:NEW_LISTING,MOONSHOT:TREND_CONTINUATION,TRINITY:EMA_CROSSOVER,TRINITY:RANGE_BREAKOUT,PRE_BREAKOUT:ACCUMULATION,PRE_BREAKOUT:BASE_SPRING
 ```
 
-The confidence allocator sizes each accepted opportunity from the live available balance while keeping total open spot capital capped at 50% of equity by default. Scores 0-5 are skipped, 6-7 use the low bucket, 8 the mid bucket, 9 the high bucket, and 10 the max bucket. The default blocked signal lanes keep historically weak entry types from trading while the scanners continue evaluating the full strategy set.
+The confidence allocator sizes each accepted opportunity from the live available balance while keeping total open spot capital capped at 50% of equity by default. Scores 0-5 are skipped, 6-7 use the low bucket, 8 the mid bucket, 9 the high bucket, and 10 the max bucket. The default blocked signal lanes keep historically weak entry types from trading while the scanners continue evaluating the full strategy set. `SCALPER_SYMBOLS` narrows the live scalper universe to a comma-separated allowlist, while `SCALPER_EXCLUDED_SYMBOLS` or `SCALPER_BLOCKED_SYMBOLS` can remove specific symbols from that universe.
 
 `MOONSHOT_MAX_VOL_RATIO` now matches the monolith semantics again: it scales the maximum eligible 24h quote volume by account size, with a built-in floor to avoid over-filtering small accounts. The moonshot strategy can still use cached Anthropic web-search buzz scoring on a very small number of near-threshold candidates when `WEB_SEARCH_ENABLED=true`, but social input no longer creates its own trend-entry lane. The current profit-oriented default is narrower than earlier moonshot iterations: non-new rebound entries are skipped, momentum breakouts are disabled by default via `MOONSHOT_ENABLE_MOMENTUM=false`, and trend continuation is kept on a tighter maturity leash with `MOONSHOT_TREND_CONTINUATION_MAX_MATURITY=0.45`. If you want to re-open the momentum lane later, keep it capped with `MOONSHOT_MOMENTUM_MIN_RETURN_PCT` and `MOONSHOT_MOMENTUM_MAX_RETURN_PCT` rather than letting it chase extended moves.
 
