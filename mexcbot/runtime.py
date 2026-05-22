@@ -2047,11 +2047,15 @@ class LiveBotRuntime:
             return "\n".join(lines)
         for trade in self.open_trades:
             pct = self._trade_pct(trade)
-            pct_text = f" {pct:+.2f}%" if pct is not None else ""
+            pct_text = f" {pct:+.2f}% of cost" if pct is not None else ""
+            price = float(trade.last_price or trade.entry_price or 0.0)
+            unrealized = (price - trade.entry_price) * trade.qty if price > 0 else 0.0
+            risk_to_stop = self._risk_to_stop_usdt(trade)
+            risk_text = f" | Risk@SL ${risk_to_stop:.2f}" if risk_to_stop > 0 else ""
             sl_value = trade.trail_stop_price or trade.hard_floor_price or trade.sl_price
             lines.append(
                 f"{self._strategy_icon(trade.strategy)} {trade.symbol} [{trade.strategy}]"
-                f"{pct_text} | TP {trade.tp_price:.6f} | SL {sl_value:.6f}"
+                f"{pct_text} (${unrealized:+.2f}) | TP {trade.tp_price:.6f} | SL {sl_value:.6f}{risk_text}"
             )
         lines.append("━━━━━━━━━━━━━━━")
         lines.append(f"<i>{self._commands_hint()}</i>")
@@ -2073,9 +2077,11 @@ class LiveBotRuntime:
             unrealized = (price - trade.entry_price) * trade.qty
             open_pnl += unrealized
             pct = self._trade_pct(trade)
-            pct_text = f" {pct:+.1f}%" if pct is not None else ""
+            pct_text = f" {pct:+.1f}% of cost" if pct is not None else ""
+            risk_to_stop = self._risk_to_stop_usdt(trade)
+            risk_text = f" | Risk@SL ${risk_to_stop:.2f}" if risk_to_stop > 0 else ""
             open_lines.append(
-                f"  {self._strategy_icon(trade.strategy)} {trade.strategy}: {trade.symbol}{pct_text} (${unrealized:+.2f})"
+                f"  {self._strategy_icon(trade.strategy)} {trade.strategy}: {trade.symbol}{pct_text} (${unrealized:+.2f}){risk_text}"
             )
 
         lines = [
@@ -2131,7 +2137,7 @@ class LiveBotRuntime:
             stats["unrealized_pct_sum"] = float(stats["unrealized_pct_sum"]) + unrealized_pct
             detail_lines.append(
                 f"  {self._strategy_icon(strategy)} {strategy}: {trade.symbol} "
-                f"{unrealized_pct:+.2f}% (${unrealized_usdt:+.2f})"
+                f"{unrealized_pct:+.2f}% of cost (${unrealized_usdt:+.2f}) | Risk@SL ${self._risk_to_stop_usdt(trade):.2f}"
             )
         return detail_lines, per_strategy, total_unrealized
 
@@ -2532,9 +2538,12 @@ class LiveBotRuntime:
         score_line = f"Signal {trade.entry_signal} | Score {trade.score:.2f}"
         if trade.metadata.get("kelly_mult"):
             score_line += f" | Kelly {float(trade.metadata['kelly_mult']):.1f}x"
+        cost = float(trade.remaining_cost_usdt or trade.entry_cost_usdt or (trade.entry_price * trade.qty) or 0.0)
+        risk_to_stop = self._risk_to_stop_usdt(trade)
         self._notify(
             f"{self._strategy_icon(trade.strategy)} <b>Opened {trade.strategy}</b> {trade.symbol}\n"
             f"Entry {trade.entry_price:.6f} | Qty {trade.qty:.6f}\n"
+            f"Cost ${cost:.2f} | Risk@SL ${risk_to_stop:.2f}\n"
             f"{score_line}\n"
             f"TP {trade.tp_price:.6f} | SL {trade.sl_price:.6f}"
         )
