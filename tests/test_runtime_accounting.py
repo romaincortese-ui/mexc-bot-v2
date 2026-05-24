@@ -390,6 +390,25 @@ def test_open_and_close_emit_structured_trade_audit_lines(caplog):
     assert closed["net_exit_price"] == 9.4905
 
 
+def test_early_timeout_uses_defensive_market_close_path():
+    client = StubClient()
+    runtime = LiveBotRuntime(_config(), client)
+    trade = runtime.open_position(_opportunity(), allocation_usdt=100.0)
+    assert trade is not None
+
+    client.order_calls.clear()
+    client.chase_limit_calls.clear()
+    client.cancel_all_calls.clear()
+
+    closed = runtime.close_position(trade, "EARLY_TIMEOUT")
+
+    assert closed is not None
+    assert client.cancel_all_calls == ["DOGEUSDT"]
+    assert client.chase_limit_calls == []
+    assert client.order_calls[-1] == ("DOGEUSDT", "SELL", 10.0, "MARKET")
+    assert closed["exit_reason"] == "EARLY_TIMEOUT"
+
+
 def test_full_close_blocks_same_symbol_reentry_but_allows_other_symbols():
     runtime = LiveBotRuntime(_config(same_symbol_reentry_cooldown_seconds=3600), StubClient())
     trade = runtime.open_position(_opportunity(symbol="DOGEUSDT"), allocation_usdt=100.0)
